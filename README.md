@@ -8,7 +8,7 @@ Vaern is an agent-native JavaScript and TypeScript runtime. It is being built so
 
 ## Status
 
-v0.0.0, the initial package. `@vaernjs/vaern` installs a `vaern` command with a working entry point that answers `--version`, `--help` and `doctor`. This version contains no native runtime, so `vaern run` is not available.
+v0.0.1. The `@vaernjs/vaern` package installs a `vaern` command that answers `--version`, `--help` and `doctor`, and ships with its README and documentation. This version contains no native runtime, so `vaern run` is not available.
 
 ## Install
 
@@ -16,6 +16,14 @@ v0.0.0, the initial package. `@vaernjs/vaern` installs a `vaern` command with a 
 npm install -g @vaernjs/vaern
 npx @vaernjs/vaern --version
 ```
+
+## Usage
+
+| Command | Output |
+|---|---|
+| `vaern --version` | The package version. |
+| `vaern --help` | A usage line and the development plan. |
+| `vaern doctor` | Install diagnostics: platform, the platform package it looks for, the Node.js version and whether a native binary was found. |
 
 ## Repository layout
 

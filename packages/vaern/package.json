@@ -1,6 +1,6 @@
 {
   "name": "@vaernjs/vaern",
-  "version": "0.0.0",
+  "version": "0.0.1",
   "description": "Vaern — an agent-native JavaScript & TypeScript runtime with capability sandboxing, deterministic replay and sovereignty enforcement.",
   "keywords": [
     "runtime",
