@@ -1,0 +1,26 @@
+# Dependencies and package output
+node_modules/
+*.tgz
+.DS_Store
+dist/
+target/
+vendor/
+
+# Secrets and certificates
+.env*
+!.env.example
+*.pem
+*.key
+
+# Internal creator files (live in devlogix-internal)
+docs/internal/
+DECISIONS.md
+*strategy*.md
+*notes-to-start*.md
+*naming-research*.md
+*naming-round*.py
+verify*.py
+check_names.py
+
+# Platform binaries
+packages/vaern-*/bin/vaern*

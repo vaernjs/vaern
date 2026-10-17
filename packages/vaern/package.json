@@ -1,0 +1,63 @@
+{
+  "name": "@vaernjs/vaern",
+  "version": "0.0.1",
+  "description": "Vaern — an agent-native JavaScript & TypeScript runtime with capability sandboxing, deterministic replay and sovereignty enforcement.",
+  "keywords": [
+    "runtime",
+    "javascript",
+    "typescript",
+    "agent",
+    "agents",
+    "mcp",
+    "sandbox",
+    "cli",
+    "vaern",
+    "devlogix"
+  ],
+  "license": "MIT",
+  "author": {
+    "name": "DEVLOGIX TECHNOLOGY (PRIVATE) LIMITED"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vaernjs/vaern.git",
+    "directory": "packages/vaern"
+  },
+  "bugs": {
+    "url": "https://github.com/vaernjs/vaern/issues"
+  },
+  "type": "commonjs",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "vaern": "bin/vaern.cjs"
+  },
+  "files": [
+    "bin/",
+    "index.js",
+    "index.d.ts",
+    "scripts/postinstall.cjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/postinstall.cjs",
+    "prepublishOnly": "node ../../scripts/check-publish.mjs"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/",
+    "tag": "latest"
+  }
+}
