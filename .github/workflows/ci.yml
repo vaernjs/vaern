@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  validate:
+    name: Validate & Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Validate pre-publish gate
+        run: node scripts/check-publish.mjs
+
+      - name: Validate public repository gate
+        run: node scripts/check-public.mjs
+
+      - name: Test npm pack (dry-run)
+        run: |
+          cd packages/vaern
+          npm pack --dry-run
+
+      - name: Smoke test JS fallback CLI shim
+        run: |
+          node packages/vaern/bin/vaern.cjs --version
+          node packages/vaern/bin/vaern.cjs doctor
+          node packages/vaern/bin/vaern.cjs --help

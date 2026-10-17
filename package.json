@@ -1,0 +1,24 @@
+{
+  "name": "vaern",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Vaern — an agent-native JavaScript & TypeScript runtime. A DevLogix project.",
+  "license": "MIT",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "check": "node scripts/check-publish.mjs",
+    "check:public": "node scripts/check-public.mjs",
+    "bump": "node scripts/bump-all.mjs",
+    "pack:dry": "npm pack --workspaces --dry-run"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "npm": ">=10.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vaernjs/vaern.git"
+  }
+}
