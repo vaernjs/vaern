@@ -8,28 +8,44 @@ Vaern is an agent-native JavaScript and TypeScript runtime. It is being built so
 
 ## Status
 
-v0.0.2. Adds the `homepage` field to the package metadata and hardens the public repository gate. The `vaern` command answers `--version`, `--help` and `doctor`. This version contains no native runtime, so `vaern run` is not available.
+v0.0.3, the first native runtime. `vaern run <file>` executes JavaScript and TypeScript on an embedded QuickJS-ng engine, with TypeScript types stripped by SWC at load time, and provides relative ES module imports, `console`, `setTimeout`, `setInterval`, `queueMicrotask`, `fetch`, an HTTP `serve()` from `vaern:http`, `process.argv`, `process.env` and `process.exit()`. The npm package for this version carries the JavaScript CLI only, so the native binary is built from source. Not in this version: capability sandboxing (`vaern.toml`), `agent()` and `tool()`, and `node:*` modules.
 
 ## Install
 
 ```bash
-npm install -g @vaernjs/vaern
-npx @vaernjs/vaern --version
+git clone https://github.com/vaernjs/vaern.git && cd vaern
+cargo build --release
+./target/release/vaern --version
 ```
 
-## Usage
+`npm install -g @vaernjs/vaern` installs the JavaScript CLI. It runs the native binary when `VAERN_BINARY` points at one, and otherwise answers `--version`, `--help` and `doctor` only.
 
-| Command | Output |
-|---|---|
-| `vaern --version` | The package version. |
-| `vaern --help` | A usage line and the development plan. |
-| `vaern doctor` | Install diagnostics: platform, the platform package it looks for, the Node.js version and whether a native binary was found. |
+## Example
+
+```ts
+// latest.ts
+interface Manifest {
+  name: string;
+  version: string;
+}
+
+const res = await fetch("https://registry.npmjs.org/@vaernjs/vaern/latest");
+const pkg = (await res.json()) as Manifest;
+console.log(`${pkg.name} ${pkg.version}, HTTP ${res.status}`);
+```
+
+```bash
+vaern run latest.ts
+```
 
 ## Repository layout
 
+- `crates/vaern-core`: Engine: runtime, TypeScript type stripping, module loader, `fetch`, HTTP server.
+- `crates/vaern-cli`: The `vaern` command-line binary.
 - `packages/vaern`: Distribution package published to npm as `@vaernjs/vaern`.
+- `tests/e2e`: End-to-end fixtures run through the binary.
 - `scripts/`: Release validation, pre-publish gates, and version management utilities.
-- `.github/workflows/`: Continuous integration pipeline.
+- `.github/workflows/`: Continuous integration and the npm release pipeline.
 
 ## Licence
 

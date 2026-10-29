@@ -27,3 +27,7 @@ check_names.py
 
 # Platform binaries
 packages/vaern-*/bin/vaern*
+
+# Binary copied in by scripts/test-sandbox.mjs
+tests/sandbox_run/vaern
+tests/sandbox_run/vaern.exe

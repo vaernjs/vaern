@@ -1,27 +1,42 @@
 # vaern
 
-An agent-native JavaScript and TypeScript runtime. It is being built so that capability sandboxing, replayable runs and sovereignty enforcement live in the engine instead of in libraries.
+An agent-native JavaScript and TypeScript runtime. Vaern runs TypeScript directly, with `fetch` and an HTTP server built in, on an embedded QuickJS-ng engine driven by Rust and Tokio. It is being built so that capability sandboxing, replayable runs and sovereignty enforcement live in the engine instead of in libraries.
 
 A DevLogix project, licensed MIT.
 
 ## Status
 
-v0.0.2. Adds the `homepage` field to the package metadata. The `vaern` command answers `--version`, `--help` and `doctor`. This version contains no native runtime, so `vaern run` is not available.
+v0.0.3, the first native runtime. `vaern run <file>` executes JavaScript and TypeScript with types stripped at load time, and provides relative ES module imports, `console`, `setTimeout`, `setInterval`, `queueMicrotask`, `fetch`, `serve()` from `vaern:http`, `process.argv`, `process.env` and `process.exit()`. This npm package carries the JavaScript CLI only, so the native binary is built from source. Not in this version: capability sandboxing (`vaern.toml`), `agent()` and `tool()`, and `node:*` modules.
 
 ## Install
 
 ```bash
-npm install -g @vaernjs/vaern      # global CLI
-npx @vaernjs/vaern --version       # without installing
+npm install -g @vaernjs/vaern
+git clone https://github.com/vaernjs/vaern.git && cd vaern
+cargo build --release
+export VAERN_BINARY="$PWD/target/release/vaern"
+vaern --version
 ```
 
-## What the CLI does today
+With `VAERN_BINARY` set, the `vaern` command runs the native binary. Without it, the command answers `--version`, `--help` and `doctor` only.
 
-| Command | Output |
-|---|---|
-| `vaern --version` | The package version. |
-| `vaern --help` | A usage line and the development plan. |
-| `vaern doctor` | Install diagnostics: platform, the platform package it looks for, the Node.js version and whether a native binary was found. |
+## Example
+
+```ts
+// latest.ts
+interface Manifest {
+  name: string;
+  version: string;
+}
+
+const res = await fetch("https://registry.npmjs.org/@vaernjs/vaern/latest");
+const pkg = (await res.json()) as Manifest;
+console.log(`${pkg.name} ${pkg.version}, HTTP ${res.status}`);
+```
+
+```bash
+vaern run latest.ts
+```
 
 ## Programmatic use
 
@@ -30,14 +45,6 @@ const { binaryPath, hasNativeBinary, vaern } = require("@vaernjs/vaern");
 
 if (hasNativeBinary()) vaern(["run", "app.ts"]);
 ```
-
-`hasNativeBinary()` returns `false` in this version.
-
-## Repository layout
-
-- `packages/vaern`: this package.
-- `scripts/`: release validation and pre-publish gates.
-- `.github/workflows/`: continuous integration.
 
 ## Licence
 
@@ -56,7 +63,7 @@ See [`LICENSE`](./LICENSE).
 
 ```bash
 git clone https://github.com/vaernjs/vaern.git && cd vaern
-npm install
+cargo build --release
 npm run check          # pre-publish validation
 npm run pack:dry       # inspect exactly what would be published
 ```

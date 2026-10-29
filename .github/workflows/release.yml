@@ -1,0 +1,239 @@
+name: Release
+
+# Publishes the npm family for a version tag. Platform packages go first so
+# the main package never points at binaries that do not exist yet.
+#
+# Pushing a tag releases that tag. workflow_dispatch releases an existing tag
+# whose own tree predates this workflow; the jobs always check out the tag, so
+# the published files come from the tagged commit either way.
+#
+# Authentication is npm trusted publishing (OIDC). The npm trusted publisher
+# is bound to this file name with no environment; renaming the file or adding
+# an environment breaks that binding.
+#
+# A trusted publisher can only be attached to a package that already exists,
+# so the first publish of a new package name uses the NPM_TOKEN secret, a
+# granular token that bypasses 2FA. Packages already on the registry never
+# see the token. Once every package has its trusted publisher, delete the
+# secret; a new package then fails with an annotation instead of publishing.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, without the leading v (e.g. 0.0.3). The tag v<version> must exist."
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  resolve:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - id: version
+        env:
+          REQUESTED: ${{ inputs.version || github.ref_name }}
+        run: |
+          version="${REQUESTED#v}"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error title=Invalid version::'$REQUESTED' is not a version such as 0.0.3 or v0.0.3"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.package }}
+    needs: resolve
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Linux builds run on 22.04 so the binaries need only glibc 2.35.
+          - package: vaern-linux-x64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            exe: vaern
+            runs_natively: true
+          - package: vaern-linux-arm64
+            os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            exe: vaern
+            runs_natively: true
+          - package: vaern-darwin-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            exe: vaern
+            runs_natively: true
+          # Cross-compiled on the arm64 runner; it cannot execute the result.
+          - package: vaern-darwin-x64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            exe: vaern
+            runs_natively: false
+          - package: vaern-win32-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            exe: vaern.exe
+            runs_natively: true
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/v${{ needs.resolve.outputs.version }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Check binary version matches the release
+        if: matrix.runs_natively
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/${{ matrix.exe }}"
+          expected="vaern $VERSION"
+          actual="$("$bin" --version)"
+          if [ "$actual" != "$expected" ]; then
+            echo "binary reports '$actual', expected '$expected'" >&2
+            exit 1
+          fi
+          "$bin" run tests/e2e/hello.ts
+
+      - name: Check binary architecture
+        if: ${{ !matrix.runs_natively }}
+        run: |
+          lipo -archs "target/${{ matrix.target }}/release/${{ matrix.exe }}" | grep -qx x86_64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.package }}
+          path: target/${{ matrix.target }}/release/${{ matrix.exe }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish to npm
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/v${{ needs.resolve.outputs.version }}
+
+      # No registry-url: setup-node would write an _authToken line to .npmrc,
+      # which npm would try before OIDC.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Check package version matches the release
+        run: |
+          actual="$(node -p "require('./packages/vaern/package.json').version")"
+          if [ "$actual" != "$VERSION" ]; then
+            echo "::error title=Version mismatch::packages/vaern is at $actual in v$VERSION, expected $VERSION"
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      # Trees from before the platform packages have none; the glob then stays
+      # literal and the guard skips it, leaving only the main package.
+      - name: Place binaries into platform packages
+        run: |
+          for dir in packages/vaern-*/; do
+            [ -d "$dir" ] || continue
+            pkg="$(basename "$dir")"
+            mkdir -p "$dir/bin"
+            cp artifacts/"$pkg"/* "$dir/bin/"
+            chmod +x "$dir"/bin/*
+            node -e '
+              const p = require("./" + process.argv[1] + "/package.json");
+              const fs = require("node:fs");
+              for (const f of p.files) {
+                if (!fs.existsSync(process.argv[1] + "/" + f)) {
+                  console.error(`${p.name}: missing ${f}`);
+                  process.exit(1);
+                }
+              }' "$dir"
+          done
+
+      # Trusted publishing (OIDC) needs npm 11.5.1 or newer.
+      - name: Update npm
+        run: npm install -g npm@^11.5.1 && npm --version
+
+      - name: Validate pre-publish gate
+        run: node scripts/check-publish.mjs
+
+      # A version that is already on the registry is skipped, so a release
+      # that failed part-way can be re-run without reusing a version. npm
+      # errors are raised as annotations, which are readable without signing
+      # in.
+      - name: Publish packages
+        env:
+          NPM_BOOTSTRAP_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          # Single quotes keep the token out of the file; npm expands the
+          # variable when it reads the config.
+          bootstrap_npmrc="$RUNNER_TEMP/bootstrap.npmrc"
+          printf '%s\n' '//registry.npmjs.org/:_authToken=${NPM_BOOTSTRAP_TOKEN}' > "$bootstrap_npmrc"
+
+          publish() {
+            dir="$1"
+            name="$(node -p "require('./$dir/package.json').name")"
+            version="$(node -p "require('./$dir/package.json').version")"
+            if npm view "$name@$version" version >/dev/null 2>&1; then
+              echo "$name@$version is already published, skipping"
+              return 0
+            fi
+            userconfig="$HOME/.npmrc"
+            if ! npm view "$name" name >/dev/null 2>&1; then
+              if [ -z "$NPM_BOOTSTRAP_TOKEN" ]; then
+                echo "::error title=No first-publish token for $name::$name is not on the registry yet, and trusted publishing cannot create a package. Set the NPM_TOKEN secret to a granular token that bypasses 2FA, re-run, then add a trusted publisher for $name."
+                return 1
+              fi
+              echo "$name is new on the registry, publishing with NPM_TOKEN"
+              userconfig="$bootstrap_npmrc"
+            fi
+            if ! (cd "$dir" && NPM_CONFIG_USERCONFIG="$userconfig" npm publish --provenance --access public) > publish.log 2>&1; then
+              cat publish.log
+              summary="$(grep -E 'npm (error|ERR!)' publish.log | head -n 20 | sed ':a;N;$!ba;s/\n/%0A/g')"
+              echo "::error title=npm publish failed for $name@$version::${summary:-see log}"
+              return 1
+            fi
+            cat publish.log
+          }
+          # Platform packages first, so the main package never points at
+          # binaries that do not exist yet.
+          for dir in packages/vaern-*/; do
+            [ -d "$dir" ] || continue
+            publish "${dir%/}"
+          done
+          publish packages/vaern
