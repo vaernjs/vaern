@@ -8,7 +8,7 @@ Vaern is an agent-native JavaScript and TypeScript runtime. It is being built so
 
 ## Status
 
-v0.0.1. The `@vaernjs/vaern` package installs a `vaern` command that answers `--version`, `--help` and `doctor`, and ships with its README and documentation. This version contains no native runtime, so `vaern run` is not available.
+v0.0.2. Adds the `homepage` field to the package metadata and hardens the public repository gate. The `vaern` command answers `--version`, `--help` and `doctor`. This version contains no native runtime, so `vaern run` is not available.
 
 ## Install
 

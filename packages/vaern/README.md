@@ -6,7 +6,7 @@ A DevLogix project, licensed MIT.
 
 ## Status
 
-v0.0.1. This package installs the `vaern` command, which answers `--version`, `--help` and `doctor`, and ships with its README and documentation. This version contains no native runtime, so `vaern run` is not available.
+v0.0.2. Adds the `homepage` field to the package metadata. The `vaern` command answers `--version`, `--help` and `doctor`. This version contains no native runtime, so `vaern run` is not available.
 
 ## Install
 

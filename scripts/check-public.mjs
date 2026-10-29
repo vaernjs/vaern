@@ -136,8 +136,15 @@ for (const file of trackedFiles) {
   // Skip self and check-publish pattern lists from false positive matching
   const isCheckScript = file === selfPath || file === "scripts/check-publish.mjs";
 
+  // Rust unit tests live in an inline `#[cfg(test)]` module at the end of the
+  // file, so everything from that attribute onward counts as test code.
+  const testStart = file.endsWith(".rs")
+    ? lines.findIndex((l) => /^\s*#\[cfg\(test\)\]/.test(l))
+    : -1;
+
   lines.forEach((line, index) => {
     const lineNum = index + 1;
+    const inTestModule = testStart !== -1 && index >= testStart;
 
     // A. Emoji check
     if (emojiRegex.test(line)) {
@@ -166,7 +173,7 @@ for (const file of trackedFiles) {
       if (/#!?\[allow\(/.test(line)) {
         errors.push(`${file}:${lineNum}: code violation: #[allow(...)] found`);
       }
-      if (!file.includes("test") && /\b(unwrap|expect)\(/.test(line)) {
+      if (!file.includes("test") && !inTestModule && /\b(unwrap|expect)\(/.test(line)) {
         errors.push(`${file}:${lineNum}: code violation: unwrap/expect outside tests`);
       }
       if (/\b(todo!|unimplemented!|dbg!)/.test(line)) {

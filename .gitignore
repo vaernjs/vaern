@@ -13,6 +13,9 @@ vendor/
 *.key
 
 # Internal creator files (live in devlogix-internal)
+CHANGELOG.md
+docs/train-state.md
+scripts/train-state.mjs
 docs/internal/
 DECISIONS.md
 *strategy*.md
