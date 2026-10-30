@@ -58,10 +58,23 @@ struct SharedState {
     server_stream_senders:
         HashMap<u64, tokio::sync::mpsc::Sender<std::result::Result<bytes::Bytes, std::io::Error>>>,
     server_req_tx: std::sync::mpsc::Sender<ServerIncomingRequest>,
-    /// First promise rejection that nothing handled. The event loop turns it
-    /// into an error so a throwing script cannot exit with status 0.
+    /// First unhandled promise rejection or uncaught timer exception. The event
+    /// loop turns it into an error so a throwing script cannot exit with status 0.
     unhandled_error: Option<String>,
+    /// Rejected promises with no handler yet, keyed by promise identity, in
+    /// rejection order. A handler attached later removes only its own entry.
+    pending_rejections: Vec<(u64, String)>,
     server_close_tx: std::sync::mpsc::Sender<u32>,
+}
+
+/// Identity key for a promise. `Value` hashes its tag and raw bits, so equal
+/// keys mean the same object while it is alive. No reference is retained,
+/// which keeps the tracker from extending object lifetimes across the FFI.
+fn promise_identity(promise: &Value<'_>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    promise.hash(&mut hasher);
+    hasher.finish()
 }
 
 struct VaernModuleResolver {
@@ -162,6 +175,60 @@ fn describe_rejection(reason: &Value<'_>) -> String {
     "unhandled promise rejection with a non-error value".to_string()
 }
 
+/// Chunks buffered between the JS stream pump and the hyper connection.
+const STREAM_CHUNK_CAPACITY: usize = 32;
+
+/// How long the pump waits for buffer space before treating the client as stalled.
+const STREAM_CHUNK_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Hands one response chunk to the connection, waiting for buffer space.
+///
+/// Waiting gives the pump backpressure: a burst larger than the buffer is
+/// delivered in full instead of dropping chunks. The wait happens on the JS
+/// thread through `block_on`, which is safe because the connection drains on
+/// the Tokio worker threads, never on this one.
+fn send_stream_chunk(
+    handle: &tokio::runtime::Handle,
+    tx: &tokio::sync::mpsc::Sender<std::result::Result<bytes::Bytes, std::io::Error>>,
+    req_id: u64,
+    chunk: bytes::Bytes,
+    wait: Duration,
+) -> Result<()> {
+    // The timer must be created inside `block_on`, which enters the runtime
+    // context; constructing it on the JS thread panics with no reactor.
+    let sent = handle.block_on(async { tokio::time::timeout(wait, tx.send(Ok(chunk))).await });
+    match sent {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(VaernError::ServerStream {
+            req_id,
+            message: "the client closed the connection before the body was complete".to_string(),
+            action: "Stop writing to this response; the remaining chunks cannot be delivered"
+                .to_string(),
+        }),
+        Err(_) => {
+            // Abort the body rather than let the connection end cleanly, so the
+            // client sees a failed transfer instead of a silently short one.
+            let tx = tx.clone();
+            handle.spawn(async move {
+                let aborted = std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "response stream stalled; body aborted",
+                );
+                let _ = tx.send(Err(aborted)).await;
+            });
+            Err(VaernError::ServerStream {
+                req_id,
+                message: format!(
+                    "the client read nothing for {wait:?} while {STREAM_CHUNK_CAPACITY} chunks were buffered"
+                ),
+                action:
+                    "Check that the client consumes the response body, or send fewer, larger chunks"
+                        .to_string(),
+            })
+        }
+    }
+}
+
 /// Native runtime implementation powered by QuickJS-ng.
 pub struct QuickJsRuntime {
     options: RuntimeOptions,
@@ -213,6 +280,7 @@ impl QuickJsRuntime {
             server_req_tx,
             server_close_tx,
             unhandled_error: None,
+            pending_rejections: Vec::new(),
         }));
         let transpiler = SwcTranspiler;
 
@@ -252,20 +320,33 @@ impl QuickJsRuntime {
         let state = Rc::clone(&self.state);
         let argv = self.options.argv.clone();
 
-        // A rejection with no handler means the script failed. Record the
-        // first one; the event loop reports it and the CLI exits non-zero.
-        // Installed outside `Context::with` because that call holds the
-        // runtime lock the setter needs.
+        // A rejection still without a handler once microtasks drain means the
+        // script failed; the event loop reports it and the CLI exits non-zero.
+        // Handledness is tracked per promise so that handling one rejection
+        // cannot clear another. Installed outside `Context::with` because that
+        // call holds the runtime lock the setter needs.
         let state_rejection = Rc::clone(&state);
         self.qjs_runtime
             .set_host_promise_rejection_tracker(Some(Box::new(
-                move |_ctx, _promise, reason, is_handled| {
+                move |_ctx, promise, reason, is_handled| {
+                    let key = promise_identity(&promise);
                     let mut s = state_rejection.borrow_mut();
                     if is_handled {
-                        s.unhandled_error = None;
-                    } else if s.unhandled_error.is_none() {
-                        s.unhandled_error = Some(describe_rejection(&reason));
+                        s.pending_rejections.retain(|(k, _)| *k != key);
+                        return;
                     }
+                    // A promise is rejected at most once, so a key that is
+                    // already pending belongs to an earlier promise that was
+                    // collected unhandled and whose address was reused. That
+                    // rejection can never be handled now: make it fatal.
+                    if let Some(pos) = s.pending_rejections.iter().position(|(k, _)| *k == key) {
+                        let (_, earlier) = s.pending_rejections.remove(pos);
+                        if s.unhandled_error.is_none() {
+                            s.unhandled_error = Some(earlier);
+                        }
+                    }
+                    s.pending_rejections
+                        .push((key, describe_rejection(&reason)));
                 },
             )));
 
@@ -303,6 +384,24 @@ impl QuickJsRuntime {
                     reason: format!("failed to register exit bridge: {err}"),
                 })?;
 
+            // Exceptions thrown by host-invoked callbacks (timers) have no JS
+            // caller to propagate to. Recording them here makes the event loop
+            // stop with that error instead of exiting 0.
+            let state_uncaught = Rc::clone(&state);
+            let report_uncaught_fn = Function::new(ctx.clone(), move |err: Value<'_>| {
+                let mut s = state_uncaught.borrow_mut();
+                if s.unhandled_error.is_none() {
+                    s.unhandled_error = Some(describe_rejection(&err));
+                }
+            })
+            .map_err(|err| VaernError::EngineInit {
+                reason: format!("failed to create uncaught error bridge: {err}"),
+            })?;
+            globals
+                .set("__vaern_report_uncaught", report_uncaught_fn)
+                .map_err(|err| VaernError::EngineInit {
+                    reason: format!("failed to register uncaught error bridge: {err}"),
+                })?;
 
             // Native timer register bridge
             let state_reg = Rc::clone(&state);
@@ -639,7 +738,7 @@ impl QuickJsRuntime {
                         }
                     }
 
-                    let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel(32);
+                    let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel(STREAM_CHUNK_CAPACITY);
                     state_stream_start.borrow_mut().server_stream_senders.insert(req_id_u64, chunk_tx);
 
                     let response = ServerResponse {
@@ -667,6 +766,7 @@ impl QuickJsRuntime {
 
             // Native server stream chunk bridge
             let state_stream_chunk = Rc::clone(&state);
+            let tokio_handle_chunk = tokio_handle.clone();
             let server_stream_chunk_fn = Function::new(
                 ctx.clone(),
                 move |req_id: f64, chunk_val: Value<'_>, is_done: bool| -> rquickjs::Result<()> {
@@ -680,10 +780,16 @@ impl QuickJsRuntime {
                         }
                     }
 
+                    // Cloned so no RefCell borrow is held while this thread waits.
+                    let sender = state_stream_chunk.borrow().server_stream_senders.get(&req_id_u64).cloned();
                     if !chunk_bytes.is_empty()
-                        && let Some(tx) = state_stream_chunk.borrow().server_stream_senders.get(&req_id_u64)
+                        && let Some(tx) = sender
                     {
-                        let _ = tx.try_send(Ok(bytes::Bytes::from(chunk_bytes)));
+                        let chunk = bytes::Bytes::from(chunk_bytes);
+                        if let Err(err) = send_stream_chunk(&tokio_handle_chunk, &tx, req_id_u64, chunk, STREAM_CHUNK_SEND_TIMEOUT) {
+                            state_stream_chunk.borrow_mut().server_stream_senders.remove(&req_id_u64);
+                            return Err(rquickjs::Exception::throw_message(chunk_val.ctx(), &err.to_string()));
+                        }
                     }
 
                     if is_done {
@@ -734,17 +840,13 @@ impl QuickJsRuntime {
                 globalThis.__vaern_trigger_timer = (id) => {
                     const t = __timers.get(id);
                     if (!t) return;
+                    if (!t.interval) {
+                        __timers.delete(id);
+                    }
                     try {
                         t.cb(...t.args);
                     } catch (e) {
-                        if (e && e.stack) {
-                            console.error(e.stack);
-                        } else {
-                            console.error(e);
-                        }
-                    }
-                    if (!t.interval) {
-                        __timers.delete(id);
+                        __vaern_report_uncaught(e);
                     }
                 };
 
@@ -1733,7 +1835,17 @@ impl QuickJsRuntime {
                 }
             }
 
-            if let Some(message) = self.state.borrow_mut().unhandled_error.take() {
+            let fatal = {
+                let mut s = self.state.borrow_mut();
+                match s.unhandled_error.take() {
+                    Some(message) => Some(message),
+                    None if !s.pending_rejections.is_empty() => {
+                        Some(s.pending_rejections.remove(0).1)
+                    }
+                    None => None,
+                }
+            };
+            if let Some(message) = fatal {
                 return Err(VaernError::Execution {
                     file: file.to_string(),
                     message,
@@ -1793,6 +1905,15 @@ impl QuickJsRuntime {
                             let _ = f.call::<_, ()>((id,));
                         }
                     });
+
+                    // An uncaught timer exception ends the run before any
+                    // other expired timer fires, as it would in Node.
+                    if let Some(message) = self.state.borrow_mut().unhandled_error.take() {
+                        return Err(VaernError::Execution {
+                            file: file.to_string(),
+                            message,
+                        });
+                    }
                 }
             } else {
                 let max_sleep = if has_pending_fetches || has_active_servers {
@@ -2004,6 +2125,32 @@ mod tests {
     }
 
     #[test]
+    fn test_handling_one_rejection_keeps_another_unhandled() {
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        let code = r#"
+            Promise.reject(new Error('A unhandled'));
+            const b = Promise.reject(new Error('B handled'));
+            b.catch(() => {});
+        "#;
+        let err = runtime.eval("two_rejections.js", code).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("Error: A unhandled"), "{text}");
+        assert!(!text.contains("B handled"), "{text}");
+    }
+
+    #[test]
+    fn test_late_handler_in_same_tick_is_not_an_error() {
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        let code = r#"
+            const a = Promise.reject(new Error('a'));
+            const b = Promise.reject(new Error('b'));
+            b.catch(() => {});
+            a.catch(() => {});
+        "#;
+        assert_eq!(runtime.eval("late_handlers.js", code).unwrap(), 0);
+    }
+
+    #[test]
     fn test_process_env_reads_host_environment() {
         let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
         // Cargo sets CARGO_PKG_NAME for every test process.
@@ -2013,17 +2160,15 @@ mod tests {
 
     #[test]
     fn test_process_argv() {
+        // Mirrors what the CLI passes: `[exec, script, ...args]`, without the
+        // `run` subcommand, as in Node.
         let options = RuntimeOptions {
-            argv: vec![
-                "vaern".into(),
-                "run".into(),
-                "file.ts".into(),
-                "--flag".into(),
-            ],
+            argv: vec!["vaern".into(), "file.ts".into(), "--flag".into()],
         };
         let mut runtime = QuickJsRuntime::new(options).unwrap();
         let code = r#"
-            if (process.argv.length !== 4 || process.argv[3] !== '--flag') {
+            const [exec, script, flag] = process.argv;
+            if (process.argv.length !== 3 || exec !== 'vaern' || script !== 'file.ts' || flag !== '--flag') {
                 process.exitCode = 1;
             }
         "#;
@@ -2045,6 +2190,145 @@ mod tests {
         "#;
         let exit_code = runtime.eval("timer.js", code).unwrap();
         assert_eq!(exit_code, 7);
+    }
+
+    #[test]
+    fn test_throwing_timer_is_an_error() {
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        let code = r#"
+            setTimeout(() => { throw new Error('timer boom'); }, 1);
+            setTimeout(() => { process.exitCode = 0; }, 50);
+        "#;
+        let err = runtime.eval("timer_throw.js", code).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("Error: timer boom"), "{text}");
+        assert!(text.contains("timer_throw.js:2:"), "{text}");
+    }
+
+    #[test]
+    fn test_throwing_interval_is_an_error() {
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        let code = "setInterval(() => { throw 'tick failed'; }, 1);";
+        let err = runtime.eval("interval_throw.js", code).unwrap_err();
+        assert!(err.to_string().contains("uncaught value: tick failed"));
+    }
+
+    type ChunkChannel = (
+        tokio::sync::mpsc::Sender<std::result::Result<bytes::Bytes, std::io::Error>>,
+        tokio::sync::mpsc::Receiver<std::result::Result<bytes::Bytes, std::io::Error>>,
+    );
+
+    fn stream_test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_stream_chunks_wait_for_a_stalled_consumer() {
+        let rt = stream_test_runtime();
+        let (tx, mut rx): ChunkChannel = tokio::sync::mpsc::channel(STREAM_CHUNK_CAPACITY);
+        let total = STREAM_CHUNK_CAPACITY * 4;
+        // The consumer starts late, so the buffer is full long before it reads.
+        let reader = rt.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut received = 0;
+            while let Some(Ok(chunk)) = rx.recv().await {
+                assert_eq!(chunk.as_ref(), &[received as u8]);
+                received += 1;
+            }
+            received
+        });
+        for i in 0..total {
+            let chunk = bytes::Bytes::from(vec![i as u8]);
+            send_stream_chunk(rt.handle(), &tx, 1, chunk, Duration::from_secs(5)).unwrap();
+        }
+        drop(tx);
+        assert_eq!(rt.block_on(reader).unwrap(), total);
+    }
+
+    #[test]
+    fn test_stream_chunk_to_closed_connection_is_an_error() {
+        let rt = stream_test_runtime();
+        let (tx, rx): ChunkChannel = tokio::sync::mpsc::channel(STREAM_CHUNK_CAPACITY);
+        drop(rx);
+        let err = send_stream_chunk(
+            rt.handle(),
+            &tx,
+            7,
+            bytes::Bytes::from_static(b"x"),
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        match err {
+            VaernError::ServerStream {
+                req_id, message, ..
+            } => {
+                assert_eq!(req_id, 7);
+                assert!(message.contains("closed the connection"), "{message}");
+            }
+            other => panic!("expected ServerStream, got {other}"),
+        }
+    }
+
+    #[test]
+    fn test_stream_chunk_to_stalled_client_times_out_and_aborts_body() {
+        let rt = stream_test_runtime();
+        let (tx, mut rx): ChunkChannel = tokio::sync::mpsc::channel(1);
+        tx.try_send(Ok(bytes::Bytes::from_static(b"full"))).unwrap();
+        let err = send_stream_chunk(
+            rt.handle(),
+            &tx,
+            9,
+            bytes::Bytes::from_static(b"x"),
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, VaernError::ServerStream { req_id: 9, .. }),
+            "{err}"
+        );
+        // The connection must end with an error frame, not a clean short body.
+        let frames = rt.block_on(async {
+            let first = rx.recv().await;
+            let second = rx.recv().await;
+            (first, second)
+        });
+        assert!(matches!(frames.0, Some(Ok(_))));
+        assert!(matches!(frames.1, Some(Err(_))));
+    }
+
+    #[test]
+    fn test_stream_burst_larger_than_buffer_is_delivered_in_full() {
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        // 512 chunks enqueued synchronously reach the bridge in one microtask
+        // drain, sixteen times the channel capacity.
+        let code = r#"
+            import { serve } from "vaern:http";
+            const CHUNKS = 512;
+            const CHUNK = "x".repeat(1023) + "\n";
+            const server = serve(() => {
+                const stream = new ReadableStream({
+                    start(controller) {
+                        for (let i = 0; i < CHUNKS; i++) {
+                            controller.enqueue(new TextEncoder().encode(CHUNK));
+                        }
+                        controller.close();
+                    },
+                });
+                return new Response(stream);
+            }, { port: 8997, hostname: "127.0.0.1" });
+            const res = await fetch("http://127.0.0.1:8997/burst");
+            const body = await res.text();
+            await server.close();
+            if (body.length !== CHUNKS * CHUNK.length) {
+                console.error(`received ${body.length} bytes`);
+                process.exitCode = 1;
+            }
+        "#;
+        assert_eq!(runtime.eval("burst.ts", code).unwrap(), 0);
     }
 
     #[test]

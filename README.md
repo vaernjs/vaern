@@ -8,17 +8,20 @@ Vaern is an agent-native JavaScript and TypeScript runtime. It is being built so
 
 ## Status
 
-v0.0.3, the first native runtime. `vaern run <file>` executes JavaScript and TypeScript on an embedded QuickJS-ng engine, with TypeScript types stripped by SWC at load time, and provides relative ES module imports, `console`, `setTimeout`, `setInterval`, `queueMicrotask`, `fetch`, an HTTP `serve()` from `vaern:http`, `process.argv`, `process.env` and `process.exit()`. The npm package for this version carries the JavaScript CLI only, so the native binary is built from source. Not in this version: capability sandboxing (`vaern.toml`), `agent()` and `tool()`, and `node:*` modules.
+v0.0.4, an early native runtime. `@vaernjs/vaern` on npm ships the `vaern` binary for Linux, macOS and Windows.
+It runs JavaScript and TypeScript files with `console`, timers, `fetch`, an HTTP `serve()`, `process.argv`, `process.env` and `process.exit()`.
+TypeScript enums, namespaces and decorators are rejected with a `file:line:col` error, because they emit runtime code that type stripping cannot produce.
+Not implemented yet: `node:*` modules, capability sandboxing (`vaern.toml`), `agent()` and `tool()`.
 
 ## Install
 
 ```bash
-git clone https://github.com/vaernjs/vaern.git && cd vaern
-cargo build --release
-./target/release/vaern --version
+npm install -g @vaernjs/vaern
+npx @vaernjs/vaern --version
 ```
 
-`npm install -g @vaernjs/vaern` installs the JavaScript CLI. It runs the native binary when `VAERN_BINARY` points at one, and otherwise answers `--version`, `--help` and `doctor` only.
+npm installs a prebuilt binary for your platform through optional dependencies: Linux x64 and arm64, macOS x64 and arm64, Windows x64.
+Other platforms, or installs that skip optional dependencies, fall back to a diagnostics CLI (`vaern doctor`).
 
 ## Example
 
@@ -43,7 +46,8 @@ vaern run latest.ts
 - `crates/vaern-core`: Engine: runtime, TypeScript type stripping, module loader, `fetch`, HTTP server.
 - `crates/vaern-cli`: The `vaern` command-line binary.
 - `packages/vaern`: Distribution package published to npm as `@vaernjs/vaern`.
-- `tests/e2e`: End-to-end fixtures run through the binary.
+- `packages/vaern-<os>-<arch>`: Platform packages `@vaernjs/vaern-<os>-<arch>` that carry the native binary, built and published by CI.
+- `tests/e2e`, `examples`, `bench`: End-to-end fixtures, runnable examples and benchmarks.
 - `scripts/`: Release validation, pre-publish gates, and version management utilities.
 - `.github/workflows/`: Continuous integration and the npm release pipeline.
 

@@ -1,22 +1,21 @@
 {
   "name": "@vaernjs/vaern",
-  "version": "0.0.3",
-  "description": "Vaern — an agent-native JavaScript & TypeScript runtime with capability sandboxing, deterministic replay and sovereignty enforcement.",
+  "version": "0.0.4",
+  "description": "Vaern — an agent-native JavaScript & TypeScript runtime. Runs TypeScript directly, with fetch and an HTTP server built in.",
   "keywords": [
     "runtime",
     "javascript",
     "typescript",
     "agent",
     "agents",
-    "mcp",
-    "sandbox",
     "cli",
     "vaern",
     "devlogix"
   ],
   "license": "MIT",
   "author": {
-    "name": "DEVLOGIX TECHNOLOGY (PRIVATE) LIMITED"
+    "name": "DEVLOGIX TECHNOLOGY (PRIVATE) LIMITED",
+    "url": "https://devlogix.com.pk"
   },
   "repository": {
     "type": "git",
@@ -50,6 +49,13 @@
   "scripts": {
     "postinstall": "node scripts/postinstall.cjs",
     "prepublishOnly": "node ../../scripts/check-publish.mjs"
+  },
+  "optionalDependencies": {
+    "@vaernjs/vaern-linux-x64": "0.0.4",
+    "@vaernjs/vaern-linux-arm64": "0.0.4",
+    "@vaernjs/vaern-darwin-arm64": "0.0.4",
+    "@vaernjs/vaern-darwin-x64": "0.0.4",
+    "@vaernjs/vaern-win32-x64": "0.0.4"
   },
   "engines": {
     "node": ">=18.0.0"

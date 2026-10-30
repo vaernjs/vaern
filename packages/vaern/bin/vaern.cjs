@@ -6,18 +6,18 @@
  *
  * Two modes, chosen at runtime:
  *
- *   NATIVE     A platform package (vaern-<os>-<arch>) shipped a real binary.
+ *   NATIVE     A platform package (@vaernjs/vaern-<os>-<arch>) shipped a real binary.
  *              We exec it and get out of the way, forwarding stdio, signals
- *              and the exit code. This is the normal path from v0.1.0.
+ *              and the exit code. This is the normal path from v0.0.4.
  *
- *   FALLBACK   No binary for this platform yet (the v0.0.x placeholder
- *              releases, an unsupported platform, or `npm i --no-optional`).
+ *   FALLBACK   No binary for this platform (an unsupported platform, or
+ *              optional dependencies skipped with `npm i --omit=optional`).
  *              We serve a small built-in CLI so the command never dies with
  *              "command not found".
  *
  * Resolution order for the native binary:
  *   1. $VAERN_BINARY               (explicit override — used by CI and by `cargo run` during dev)
- *   2. vaern-<os>-<arch> package   (the normal npm install path)
+ *   2. @vaernjs/vaern-<os>-<arch>   (the normal npm install path)
  *   3. ../vendor/vaern             (repo-local build dropped in by `just build`)
  *   4. FALLBACK
  *
@@ -36,7 +36,7 @@ const require_ = createRequire(__filename);
 const pkg = require_("../package.json");
 
 const EXE = process.platform === "win32" ? ".exe" : "";
-const PLATFORM_PKG = `vaern-${process.platform}-${process.arch}`;
+const PLATFORM_PKG = `@vaernjs/vaern-${process.platform}-${process.arch}`;
 
 /* ------------------------------------------------------------------ */
 /* native binary resolution                                            */
@@ -138,24 +138,23 @@ function execNative(binary, args) {
 /* ------------------------------------------------------------------ */
 
 const BANNER = `vaern ${pkg.version} — an agent-native JavaScript & TypeScript runtime
-A DevLogix project · licensed MIT
+VaernJS https://vaernjs.tech · a DevLogix project https://devlogix.com.pk · licensed MIT
 `;
 
 const ROADMAP = `
-vaern is in active development.
+  M1  vaern run hello.ts — TypeScript, fetch, timers, console, HTTP server (shipping in 0.0.x)
+  M2  capability enforcer + vaern.toml (deny by default)
+  M3  agent(), tool(), MCP client/server, budgets, effect journal, vaern replay
+  M4  sovereignty: residency guard, hash-chained audit, PK-PKI signing, ur-PK i18n
+  M5  honest public benchmarks, docs, first external production users
 
-  M1  weeks 3-6     vaern run hello.ts — TypeScript, fetch, timers, console, HTTP server
-  M2  weeks 7-10    capability enforcer + vaern.toml (deny by default)
-  M3  weeks 11-14   agent(), tool(), MCP client/server, budgets, effect journal, vaern replay
-  M4  weeks 15-20   sovereignty: residency guard, hash-chained audit, PK-PKI signing, ur-PK i18n
-  M5  weeks 21-26   honest public benchmarks, docs, first external production users
-
-Manifesto:   https://github.com/vaernjs/vaern
+Website:     https://vaernjs.tech
+DevLogix:    https://devlogix.com.pk
 Repository:  ${pkg.repository ? String(pkg.repository.url).replace(/^git\+/, "") : "https://github.com/vaernjs/vaern"}
 Issues:      ${pkg.bugs ? pkg.bugs.url : ""}
 
-This placeholder release exists to reserve the name on npm and to give the CLI
-a working entry point. The native runtime binary lands in M1 (v0.1.0).
+The native runtime ships in the platform package ${PLATFORM_PKG}. This message
+means it is not installed. Run \`vaern doctor\` for details.
 `;
 
 function fallback(args) {
@@ -178,11 +177,13 @@ function fallback(args) {
 platform:        ${process.platform}-${process.arch}
 expected package: ${PLATFORM_PKG}
 node:            ${process.version}
-native binary:   NOT PRESENT (placeholder release)
+native binary:   NOT FOUND
 $VAERN_BINARY:   ${process.env.VAERN_BINARY || "(unset)"}
 
-Nothing is wrong. The native binary ships in v0.1.0 (milestone M1).
-Until then, install is expected to fall back to this message.
+Native binaries are published for linux-x64, linux-arm64, darwin-x64,
+darwin-arm64 and win32-x64. If your platform is listed, optional dependencies
+were probably skipped: reinstall without --omit=optional / --no-optional, or
+point $VAERN_BINARY at a vaern binary.
 `);
     process.exit(0);
   }
@@ -191,8 +192,8 @@ Until then, install is expected to fall back to this message.
     `${BANNER}
 vaern: unknown command '${a}'
 
-The native runtime binary is not available for ${process.platform}-${process.arch}
-in this release. Expected platform package: ${PLATFORM_PKG}.
+The native runtime binary is not installed for ${process.platform}-${process.arch}.
+Expected platform package: ${PLATFORM_PKG}.
 
 Try:   vaern doctor      show install diagnostics
        vaern roadmap     what is being built and when

@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: ["main"]
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   validate:
     name: Validate & Smoke Test
@@ -16,6 +19,17 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # check-public.mjs requires the repository hooks path, which a fresh
+      # checkout does not set.
+      - name: Use repository git hooks
+        run: git config core.hooksPath .githooks
 
       - name: Validate pre-publish gate
         run: node scripts/check-publish.mjs
@@ -28,8 +42,62 @@ jobs:
           cd packages/vaern
           npm pack --dry-run
 
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --all
+
+      - name: Build native binary
+        run: cargo build --release
+
+      - name: Test sandbox fixtures
+        run: node scripts/test-sandbox.mjs
+
+      - name: Test example programs
+        run: node scripts/test-examples.mjs
+
+      # Run from a copy outside the repository. In place, the shim finds the
+      # release build in target/ and delegates to it, so the fallback CLI under
+      # test would never run.
       - name: Smoke test JS fallback CLI shim
         run: |
-          node packages/vaern/bin/vaern.cjs --version
-          node packages/vaern/bin/vaern.cjs doctor
-          node packages/vaern/bin/vaern.cjs --help
+          shim="$RUNNER_TEMP/shim"
+          mkdir -p "$shim"
+          git archive HEAD packages/vaern | tar -x -C "$shim"
+          node "$shim/packages/vaern/bin/vaern.cjs" --version
+          node "$shim/packages/vaern/bin/vaern.cjs" doctor
+          node "$shim/packages/vaern/bin/vaern.cjs" --help
+
+  platforms:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --all
+
+      - name: Build native binary
+        run: cargo build --release
+
+      - name: Test sandbox fixtures
+        run: node scripts/test-sandbox.mjs
+
+      - name: Test example programs
+        run: node scripts/test-examples.mjs

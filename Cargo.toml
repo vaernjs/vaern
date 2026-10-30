@@ -4,3 +4,7 @@ members = [
     "crates/vaern-cli",
 ]
 resolver = "2"
+
+[profile.release]
+# Shipped binaries carry no symbol tables; the size budget is for the stripped binary.
+strip = true

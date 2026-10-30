@@ -1,0 +1,36 @@
+{
+  "name": "@vaernjs/vaern-darwin-arm64",
+  "version": "0.0.4",
+  "description": "The macOS arm64 binary for @vaernjs/vaern, the agent-native JavaScript & TypeScript runtime.",
+  "license": "MIT",
+  "author": {
+    "name": "DEVLOGIX TECHNOLOGY (PRIVATE) LIMITED",
+    "url": "https://devlogix.com.pk"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vaernjs/vaern.git",
+    "directory": "packages/vaern-darwin-arm64"
+  },
+  "homepage": "https://vaernjs.tech",
+  "bugs": {
+    "url": "https://github.com/vaernjs/vaern/issues"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "bin/vaern",
+    "README.md",
+    "LICENSE"
+  ],
+  "preferUnplugged": true,
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/",
+    "tag": "latest"
+  }
+}

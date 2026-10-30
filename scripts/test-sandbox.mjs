@@ -29,10 +29,10 @@ fs.chmodSync(binary, 0o755);
 
 const cases = [
   {
-    name: "--version reports 0.0.3",
+    name: "--version reports 0.0.4",
     args: ["--version"],
     code: 0,
-    stdout: "vaern 0.0.3\n",
+    stdout: "vaern 0.0.4\n",
   },
   {
     name: "hello.ts strips types and prints",
@@ -72,6 +72,14 @@ const cases = [
     args: ["run", "throws.js"],
     code: 1,
     stderrIncludes: ["Error: boom", "throws.js:1:"],
+    stderrExcludes: ["panicked"],
+  },
+  {
+    name: "timer_throws.js fails when a timer callback throws",
+    args: ["run", "timer_throws.js"],
+    code: 1,
+    stdout: "",
+    stderrIncludes: ["Error: timer boom", "timer_throws.js:2:"],
     stderrExcludes: ["panicked"],
   },
 ];

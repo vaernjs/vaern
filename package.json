@@ -5,11 +5,12 @@
   "description": "Vaern — an agent-native JavaScript & TypeScript runtime. A DevLogix project.",
   "license": "MIT",
   "workspaces": [
-    "packages/*"
+    "packages/vaern"
   ],
   "scripts": {
     "check": "node scripts/check-publish.mjs",
     "check:public": "node scripts/check-public.mjs",
+    "test:examples": "node scripts/test-examples.mjs",
     "bump": "node scripts/bump-all.mjs",
     "pack:dry": "npm pack --workspaces --dry-run"
   },

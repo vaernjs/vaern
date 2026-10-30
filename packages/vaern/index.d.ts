@@ -1,9 +1,9 @@
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 
-/** Package version, e.g. "0.0.1". */
+/** Package version, e.g. "0.0.4". */
 export declare const version: string;
 
-/** Name of the platform package that carries the binary for this host, e.g. "vaern-linux-x64". */
+/** Name of the platform package that carries the binary for this host, e.g. "@vaernjs/vaern-linux-x64". */
 export declare const platformPackage: string;
 
 /** Absolute path to the native vaern binary, or null when this release has none. */

@@ -2,8 +2,8 @@
 //!
 //! This module owns stripping TypeScript types (interfaces, type aliases, generics,
 //! `as` expressions, type annotations) to emit valid standard ECMAScript code.
-//! It intentionally rejects unsupported constructs in M1a (decorators, namespaces)
-//! with descriptive syntax errors.
+//! It intentionally rejects constructs that cannot be erased without changing runtime
+//! behaviour (enums, const enums, namespaces, decorators) with descriptive errors.
 
 use crate::error::{Result, VaernError};
 use swc_common::{FileName, GLOBALS, Globals, Mark, SourceMap, Spanned, sync::Lrc};
@@ -48,7 +48,7 @@ impl Transpiler for SwcTranspiler {
 
             let mut parser = Parser::new_from(lexer);
 
-            let mut module = parser.parse_module().map_err(|err| {
+            let module = parser.parse_module().map_err(|err| {
                 let loc = cm.lookup_char_pos(err.span().lo());
                 VaernError::Syntax {
                     file: filename.to_string(),
@@ -58,7 +58,7 @@ impl Transpiler for SwcTranspiler {
                 }
             })?;
 
-            // Validate unsupported features in M1a (namespaces, decorators)
+            // Reject non-erasable syntax (enums, namespaces, decorators) before stripping
             let mut validator = UnsupportedValidator {
                 cm: &cm,
                 filename: filename.to_string(),
@@ -68,18 +68,6 @@ impl Transpiler for SwcTranspiler {
             if let Some(err) = validator.error {
                 return Err(err);
             }
-
-            // Erase TypeScript enums (remove enum declarations from AST)
-            module.body.retain(|item| {
-                !matches!(
-                    item,
-                    ModuleItem::Stmt(Stmt::Decl(Decl::TsEnum(_)))
-                        | ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(ExportDecl {
-                            decl: Decl::TsEnum(_),
-                            ..
-                        }))
-                )
-            });
 
             // Apply pure TypeScript type-stripping
             let unresolved_mark = Mark::new();
@@ -125,6 +113,30 @@ struct UnsupportedValidator<'a> {
 }
 
 impl<'a> Visit for UnsupportedValidator<'a> {
+    // Enums declare runtime bindings. Dropping them would move the failure to a
+    // distant `ReferenceError` at first use, so they are rejected at their source.
+    fn visit_ts_enum_decl(&mut self, decl: &TsEnumDecl) {
+        if self.error.is_none() {
+            let loc = self.cm.lookup_char_pos(decl.span.lo);
+            let (feature, construct) = if decl.is_const {
+                ("const enum", "const enums")
+            } else {
+                ("enum", "enums")
+            };
+            self.error = Some(VaernError::UnsupportedFeature {
+                file: self.filename.clone(),
+                line: loc.line,
+                col: loc.col_display + 1,
+                feature: feature.to_string(),
+                message: format!(
+                    "TypeScript {construct} emit runtime values and cannot be erased; replace '{}' with a const object such as `const {} = {{ A: 0 }} as const`",
+                    decl.id.sym, decl.id.sym
+                ),
+            });
+        }
+        decl.visit_children_with(self);
+    }
+
     fn visit_ts_module_decl(&mut self, decl: &TsModuleDecl) {
         if self.error.is_none() {
             let loc = self.cm.lookup_char_pos(decl.span.lo);
@@ -179,12 +191,56 @@ mod tests {
     }
 
     #[test]
-    fn test_erase_enum() {
+    fn test_reject_enum() {
         let transpiler = SwcTranspiler;
-        let ts = "enum Color { Red, Green, Blue }\nconst c = 1;";
-        let js = transpiler.transpile("enum.ts", ts).unwrap();
-        assert!(!js.contains("Color"));
-        assert!(js.contains("const c = 1;"));
+        let ts = "const c = 1;\nenum Color { Red, Green, Blue }";
+        let err = transpiler.transpile("enum.ts", ts).unwrap_err();
+        match err {
+            VaernError::UnsupportedFeature {
+                feature,
+                line,
+                col,
+                message,
+                ..
+            } => {
+                assert_eq!(feature, "enum");
+                assert_eq!(line, 2);
+                assert_eq!(col, 1);
+                assert!(message.contains("Color"));
+            }
+            _ => panic!("expected UnsupportedFeature for enum"),
+        }
+    }
+
+    #[test]
+    fn test_reject_const_enum() {
+        let transpiler = SwcTranspiler;
+        let ts = "export const enum Dir { Up, Down }";
+        let err = transpiler.transpile("const_enum.ts", ts).unwrap_err();
+        match err {
+            VaernError::UnsupportedFeature { feature, line, .. } => {
+                assert_eq!(feature, "const enum");
+                assert_eq!(line, 1);
+            }
+            _ => panic!("expected UnsupportedFeature for const enum"),
+        }
+    }
+
+    #[test]
+    fn test_reject_nested_enum() {
+        let transpiler = SwcTranspiler;
+        let ts = "function f() {\n  enum Inner { A }\n  return Inner.A;\n}";
+        let err = transpiler.transpile("nested_enum.ts", ts).unwrap_err();
+        match err {
+            VaernError::UnsupportedFeature {
+                feature, line, col, ..
+            } => {
+                assert_eq!(feature, "enum");
+                assert_eq!(line, 2);
+                assert_eq!(col, 3);
+            }
+            _ => panic!("expected UnsupportedFeature for nested enum"),
+        }
     }
 
     #[test]

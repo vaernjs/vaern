@@ -30,7 +30,7 @@ fn text(bytes: &[u8]) -> String {
 fn version_reports_release_number() -> TestResult {
     let out = vaern(&["--version"])?;
     assert_eq!(out.status.code(), Some(0));
-    assert_eq!(text(&out.stdout).trim(), "vaern 0.0.3");
+    assert_eq!(text(&out.stdout).trim(), "vaern 0.0.4");
     Ok(())
 }
 
@@ -84,6 +84,18 @@ fn uncaught_exception_reports_location_and_fails() -> TestResult {
     let stderr = text(&out.stderr);
     assert!(stderr.contains("Error: boom"), "{stderr}");
     assert!(stderr.contains("throws.js:1:"), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn throwing_timer_callback_fails() -> TestResult {
+    let out = vaern(&["run", "timer_throws.js"])?;
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(text(&out.stdout), "");
+    let stderr = text(&out.stderr);
+    assert!(stderr.contains("Error: timer boom"), "{stderr}");
+    assert!(stderr.contains("timer_throws.js:2:"), "{stderr}");
     assert!(!stderr.contains("panicked"), "{stderr}");
     Ok(())
 }

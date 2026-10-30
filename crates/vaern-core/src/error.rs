@@ -80,6 +80,14 @@ pub enum VaernError {
         message: String,
         action: String,
     },
+
+    /// A streamed HTTP response chunk could not be handed to the connection.
+    #[error("response stream for server request {req_id} failed: {message}. {action}")]
+    ServerStream {
+        req_id: u64,
+        message: String,
+        action: String,
+    },
 }
 
 /// Convenience result type alias for Vaern core operations.

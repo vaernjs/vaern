@@ -1,0 +1,21 @@
+[
+  {
+    "title": "HTTP Server",
+    "filename": "echo-server.ts",
+    "explanation": "Standard Request and Response handlers with streaming bodies and zero configuration.",
+    "code": "import { serve } from \"vaern:http\";\n\nserve(async (req: Request) => {\n  return new Response(`Echo: ${req.method} ${req.url}\\n`, {\n    status: 200,\n    headers: { \"Content-Type\": \"text/plain\" },\n  });\n}, { port: 8000, hostname: \"127.0.0.1\" });"
+  },
+  {
+    "title": "HTTP Client",
+    "filename": "fetch-json.ts",
+    "explanation": "Web-standard fetch with Rustls TLS, typed abort signals, and strict timeouts.",
+    "code": "const response = await fetch(\"https://api.example.com/data.json\", {\n  signal: AbortSignal.timeout(5000),\n});\nconst data = await response.json();\nconsole.log(data);"
+  },
+  {
+    "title": "TypeScript Execution",
+    "filename": "hello.ts",
+    "explanation": "Direct execution of TypeScript source files; types are stripped at load time with no build step.",
+    "code": "interface Greeting {\n  message: string;\n  timestamp: number;\n}\n\nconst greeting: Greeting = {\n  message: \"Hello from Vaern\",\n  timestamp: Date.now(),\n};\n\nconsole.log(`${greeting.message} at ${new Date(greeting.timestamp).toISOString()}`);"
+  }
+]
+

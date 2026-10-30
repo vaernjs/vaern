@@ -33,7 +33,7 @@ function main() {
   if (process.platform === "win32") return done("windows — keeping the JS shim");
 
   const require_ = createRequire(__filename);
-  const platformPkg = `vaern-${process.platform}-${process.arch}`;
+  const platformPkg = `@vaernjs/vaern-${process.platform}-${process.arch}`;
 
   let binary;
   try {

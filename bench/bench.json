@@ -1,0 +1,50 @@
+{
+  "system": {
+    "os": "Microsoft Windows 11 Pro (x86_64)",
+    "cpu": "11th Gen Intel(R) Core(TM) i7-11850H @ 2.50GHz (8 cores, 16 threads)",
+    "ram": "16 GB RAM"
+  },
+  "benchmarks": [
+    {
+      "name": "Startup & greeting",
+      "command": "vaern run examples/hello.ts",
+      "reproduce": "hyperfine --warmup 3 'target/release/vaern run examples/hello.ts'",
+      "date": "2026-10-29",
+      "coldStart": "27.1 ms",
+      "warmStart": "18.0 ms",
+      "rss": "16.2 MB",
+      "status": "Win vs Node (68.3 ms)"
+    },
+    {
+      "name": "HTTPS Fetch & parse",
+      "command": "vaern run examples/fetch-json.ts",
+      "reproduce": "hyperfine --warmup 3 'target/release/vaern run examples/fetch-json.ts'",
+      "date": "2026-10-29",
+      "coldStart": "41.5 ms",
+      "warmStart": "26.8 ms",
+      "rss": "24.1 MB",
+      "status": "Baseline"
+    },
+    {
+      "name": "Arithmetic loop (1M)",
+      "command": "vaern run bench/compute-loop.ts",
+      "reproduce": "hyperfine --warmup 3 'target/release/vaern run bench/compute-loop.ts' 'node bench/compute-loop.ts'",
+      "date": "2026-10-29",
+      "coldStart": "38.0 ms",
+      "warmStart": "28.5 ms",
+      "rss": "18.5 MB",
+      "status": "Loss vs Node (9.8 ms warm)"
+    },
+    {
+      "name": "Parallel HTTP (100 req)",
+      "command": "vaern run tests/e2e/serve_concurrent.ts",
+      "reproduce": "target/release/vaern run tests/e2e/serve_concurrent.ts",
+      "date": "2026-10-29",
+      "coldStart": "58.2 ms",
+      "warmStart": "44.0 ms",
+      "rss": "28.6 MB",
+      "status": "Baseline (p99 < 50ms)"
+    }
+  ]
+}
+

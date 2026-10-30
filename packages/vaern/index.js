@@ -16,9 +16,9 @@ const require_ = createRequire(__filename);
 const pkg = require_("./package.json");
 
 const EXE = process.platform === "win32" ? ".exe" : "";
-const PLATFORM_PKG = `vaern-${process.platform}-${process.arch}`;
+const PLATFORM_PKG = `@vaernjs/vaern-${process.platform}-${process.arch}`;
 
-/** Package name that should carry the binary for this platform, e.g. `vaern-linux-x64`. */
+/** Package name that should carry the binary for this platform, e.g. `@vaernjs/vaern-linux-x64`. */
 const platformPackage = PLATFORM_PKG;
 
 /** Absolute path to the native binary, or null if this release has none. */

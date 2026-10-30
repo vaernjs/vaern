@@ -4,6 +4,7 @@
  *
  * Catches the mistakes a two-person team makes at 1am:
  *   - version drift between the main package and platform packages
+ *   - platform package names outside the @vaernjs scope
  *   - missing LICENSE / README
  *   - publishing from a dirty git tree
  *   - publishing over an existing version
@@ -65,9 +66,17 @@ const platformPkgs = fs
   .readdirSync(pkgsDir)
   .filter((d) => d.startsWith("vaern-") && fs.statSync(path.join(pkgsDir, d)).isDirectory());
 
+// Platform packages publish under the @vaernjs scope. An unscoped name lands
+// in the top-level namespace, where neither the scoped publish token nor the
+// trusted publishers have rights, and the release fails at the registry.
+const SCOPE = "@vaernjs/";
+
 for (const d of platformPkgs) {
   const p = readJson(path.join(pkgsDir, d, "package.json"));
   if (!p) continue;
+  if (p.name !== `${SCOPE}${d}`) {
+    errors.push(`packages/${d}/package.json name is "${p.name}", expected "${SCOPE}${d}"`);
+  }
   if (p.version !== main.version) {
     errors.push(`${d} is at ${p.version} but vaern is at ${main.version} — versions must be in lockstep`);
   }
@@ -79,8 +88,12 @@ for (const [name, range] of Object.entries(opt)) {
   if (range !== main.version) {
     errors.push(`optionalDependencies["${name}"] = ${range}, expected exactly ${main.version}`);
   }
-  if (!fs.existsSync(path.join(pkgsDir, name))) {
-    errors.push(`optionalDependencies["${name}"] has no packages/${name}/ directory`);
+  if (!name.startsWith(SCOPE)) {
+    errors.push(`optionalDependencies["${name}"] is unscoped, expected "${SCOPE}${name}"`);
+  }
+  const dir = name.startsWith(SCOPE) ? name.slice(SCOPE.length) : name;
+  if (!fs.existsSync(path.join(pkgsDir, dir))) {
+    errors.push(`optionalDependencies["${name}"] has no packages/${dir}/ directory`);
   }
 }
 
