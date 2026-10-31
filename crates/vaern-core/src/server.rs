@@ -51,6 +51,13 @@ pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default time a client has to send the full request body.
 pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Bytes of an oversized body the server reads and discards before answering
+/// 413. Closing a socket with unread input makes the kernel send RST, which
+/// reaches a client still writing its body before the 413 does. Draining a
+/// bounded amount lets ordinary clients read the rejection; a body larger
+/// than the cap plus this allowance is cut off without draining.
+pub const MAX_DRAIN_BYTES: usize = 8 * 1024 * 1024;
+
 /// Bounds applied to every request a server accepts.
 #[derive(Debug, Clone, Copy)]
 pub struct ServerLimits {
@@ -73,12 +80,9 @@ type ResponseBody = BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
 
 /// Plain-text response for requests rejected before they reach JavaScript.
 fn rejection(status: StatusCode, message: &str) -> Response<ResponseBody> {
-    let body = Full::new(Bytes::from(format!(
-        "{message}
-"
-    )))
-    .map_err(|never| -> Box<dyn std::error::Error + Send + Sync> { match never {} })
-    .boxed();
+    let body = Full::new(Bytes::from(format!("{message}\n")))
+        .map_err(|never| -> Box<dyn std::error::Error + Send + Sync> { match never {} })
+        .boxed();
     let mut res = Response::new(body);
     *res.status_mut() = status;
     res
@@ -86,35 +90,72 @@ fn rejection(status: StatusCode, message: &str) -> Response<ResponseBody> {
 
 /// Reads a request body within `limits`, or returns the status and message
 /// to reject it with.
+///
+/// Once the body is known to exceed the cap, nothing more is buffered: the
+/// rest is read and discarded up to `MAX_DRAIN_BYTES` so the client can read
+/// the 413 (see `MAX_DRAIN_BYTES`). The drain shares the body read deadline.
 async fn read_body(
-    body: Incoming,
+    mut body: Incoming,
     limits: &ServerLimits,
 ) -> std::result::Result<Vec<u8>, (StatusCode, String)> {
-    let limited = http_body_util::Limited::new(body, limits.max_body_bytes);
-    match tokio::time::timeout(limits.body_read_timeout, limited.collect()).await {
-        Ok(Ok(collected)) => Ok(collected.to_bytes().to_vec()),
-        Ok(Err(err))
-            if err
-                .downcast_ref::<http_body_util::LengthLimitError>()
-                .is_some() =>
-        {
-            Err((
-                StatusCode::PAYLOAD_TOO_LARGE,
-                format!("request body exceeds {} bytes", limits.max_body_bytes),
-            ))
+    let too_large = || {
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("request body exceeds {} bytes", limits.max_body_bytes),
+        )
+    };
+    let drain_ceiling = limits.max_body_bytes.saturating_add(MAX_DRAIN_BYTES);
+
+    // A declared Content-Length decides the outcome before any byte arrives.
+    let declared = hyper::body::Body::size_hint(&body).exact();
+    let declared = declared.and_then(|len| usize::try_from(len).ok());
+    let mut oversized = match declared {
+        Some(len) if len > drain_ceiling => return Err(too_large()),
+        Some(len) => len > limits.max_body_bytes,
+        None => false,
+    };
+
+    let deadline = tokio::time::Instant::now() + limits.body_read_timeout;
+    let mut buf = Vec::new();
+    let mut received = 0usize;
+    loop {
+        let frame = match tokio::time::timeout_at(deadline, body.frame()).await {
+            Ok(Some(Ok(frame))) => frame,
+            Ok(None) => break,
+            Ok(Some(Err(_))) | Err(_) if oversized => return Err(too_large()),
+            Ok(Some(Err(err))) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("failed to read request body: {err}"),
+                ));
+            }
+            Err(_) => {
+                return Err((
+                    StatusCode::REQUEST_TIMEOUT,
+                    format!(
+                        "request body not received within {} ms",
+                        limits.body_read_timeout.as_millis()
+                    ),
+                ));
+            }
+        };
+        // Trailers carry no body bytes.
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        received = received.saturating_add(data.len());
+        if received > drain_ceiling {
+            return Err(too_large());
         }
-        Ok(Err(err)) => Err((
-            StatusCode::BAD_REQUEST,
-            format!("failed to read request body: {err}"),
-        )),
-        Err(_) => Err((
-            StatusCode::REQUEST_TIMEOUT,
-            format!(
-                "request body not received within {} ms",
-                limits.body_read_timeout.as_millis()
-            ),
-        )),
+        if received > limits.max_body_bytes {
+            oversized = true;
+            buf = Vec::new();
+        }
+        if !oversized {
+            buf.extend_from_slice(&data);
+        }
     }
+    if oversized { Err(too_large()) } else { Ok(buf) }
 }
 
 /// Incoming HTTP request bridged from Tokio Hyper listener to QuickJS runtime.
@@ -498,6 +539,31 @@ mod tests {
                 .to_vec();
         req.extend(std::iter::repeat_n(b'x', 4096));
         let res = exchange(addr, &req, Duration::from_secs(3)).await;
+        assert!(res.starts_with("HTTP/1.1 413"), "{res}");
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+    }
+
+    /// A client that keeps sending an oversized body must still read the 413.
+    /// Closing a socket with unread input makes the kernel answer with RST,
+    /// which on macOS and Linux reaches the client before the response does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_client_still_sending_receives_413() {
+        let (_server, addr, dispatched) = start_counting_server(short_limits()).await;
+        let body_len = 1024 * 1024;
+        let mut req = format!(
+            "POST / HTTP/1.1\r\nHost: t\r\nConnection: close\r\nContent-Length: {body_len}\r\n\r\n"
+        )
+        .into_bytes();
+        req.extend(std::iter::repeat_n(b'x', body_len));
+
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        let written = stream.write_all(&req).await;
+        let mut buf = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut buf)).await;
+        let res = String::from_utf8_lossy(&buf).into_owned();
+
+        assert!(written.is_ok(), "body write failed: {written:?}");
+        assert!(matches!(read, Ok(Ok(_))), "response read failed: {read:?}");
         assert!(res.starts_with("HTTP/1.1 413"), "{res}");
         assert_eq!(dispatched.load(Ordering::SeqCst), 0);
     }
