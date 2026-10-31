@@ -94,6 +94,14 @@ const cases = [
     code: 0,
     stdout: "status 413, handler ran 0 times\n",
   },
+  {
+    name: "heap_limit.js stops at the heap limit with a located error",
+    args: ["run", "heap_limit.js"],
+    code: 1,
+    stdout: "",
+    stderrIncludes: ["InternalError: out of memory", "heap_limit.js:3:"],
+    stderrExcludes: ["panicked"],
+  },
 ];
 
 const norm = (s) => s.replaceAll("\r\n", "\n");

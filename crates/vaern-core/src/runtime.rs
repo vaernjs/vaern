@@ -173,6 +173,12 @@ fn describe_rejection(reason: &Value<'_>) -> String {
 /// Chunks buffered between the JS stream pump and the hyper connection.
 const STREAM_CHUNK_CAPACITY: usize = 32;
 
+/// Ceiling on the QuickJS heap. A script that allocates past it gets an
+/// out-of-memory error it can report, instead of growing until the host
+/// kills the process. Generous for scripts; a per-run limit comes with the
+/// policy file.
+const HEAP_LIMIT_BYTES: usize = 256 * 1024 * 1024;
+
 /// How long the pump waits for buffer space before treating the client as stalled.
 const STREAM_CHUNK_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -245,6 +251,7 @@ impl QuickJsRuntime {
         let qjs_runtime = QjsRuntime::new().map_err(|err| VaernError::EngineInit {
             reason: format!("failed to initialize QuickJS runtime: {err}"),
         })?;
+        qjs_runtime.set_memory_limit(HEAP_LIMIT_BYTES);
 
         let context = Context::full(&qjs_runtime).map_err(|err| VaernError::EngineInit {
             reason: format!("failed to initialize QuickJS context: {err}"),
@@ -2409,6 +2416,21 @@ mod tests {
         "#;
         let exit_code = runtime.eval("req_double_read.js", code).unwrap();
         assert_eq!(exit_code, 0);
+    }
+
+    #[test]
+    fn test_heap_limit_stops_runaway_allocation() {
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        // 384 MiB of live buffers, past the 256 MiB heap limit.
+        let code = r#"
+            const held = [];
+            for (let i = 0; i < 384; i++) held.push(new Uint8Array(1024 * 1024));
+            console.log("allocated", held.length);
+        "#;
+        let err = runtime.eval("hog.js", code).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("out of memory"), "{text}");
+        assert!(text.contains("hog.js"), "{text}");
     }
 
     #[test]
