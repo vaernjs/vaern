@@ -5,6 +5,7 @@
 //! and driving the event loop to completion using Tokio.
 
 use crate::error::{Result, VaernError};
+use crate::event::{EventReceiver, EventSender, FetchCompletion, LoopEvent};
 use crate::module_loader::{FsModuleLoader, ModuleLoader};
 use crate::server::{HttpServer, ServerIncomingRequest, ServerResponse, ServerResponseBody};
 use crate::transpile::{SwcTranspiler, Transpiler};
@@ -18,6 +19,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
 /// Configuration options for initializing a Vaern runtime instance.
@@ -42,29 +44,22 @@ struct TimerRecord {
     interval: Option<Duration>,
 }
 
-struct FetchCompletion {
-    req_id: u32,
-    result: Result<crate::fetch::FetchResponse>,
-}
-
 struct SharedState {
     timers: HashMap<u32, TimerRecord>,
     abort_senders: HashMap<u32, tokio::sync::broadcast::Sender<()>>,
     pending_fetches: usize,
-    completion_tx: std::sync::mpsc::Sender<FetchCompletion>,
+    events_tx: EventSender,
     active_servers: usize,
     server_handles: HashMap<u32, Arc<HttpServer>>,
     server_resp_senders: HashMap<u64, tokio::sync::oneshot::Sender<ServerResponse>>,
     server_stream_senders:
         HashMap<u64, tokio::sync::mpsc::Sender<std::result::Result<bytes::Bytes, std::io::Error>>>,
-    server_req_tx: std::sync::mpsc::Sender<ServerIncomingRequest>,
     /// First unhandled promise rejection or uncaught timer exception. The event
     /// loop turns it into an error so a throwing script cannot exit with status 0.
     unhandled_error: Option<String>,
     /// Rejected promises with no handler yet, keyed by promise identity, in
     /// rejection order. A handler attached later removes only its own entry.
     pending_rejections: Vec<(u64, String)>,
-    server_close_tx: std::sync::mpsc::Sender<u32>,
 }
 
 /// Identity key for a promise. `Value` hashes its tag and raw bits, so equal
@@ -236,9 +231,10 @@ pub struct QuickJsRuntime {
     context: Context,
     state: Rc<RefCell<SharedState>>,
     transpiler: SwcTranspiler,
-    completion_rx: std::sync::mpsc::Receiver<FetchCompletion>,
-    server_req_rx: std::sync::mpsc::Receiver<ServerIncomingRequest>,
-    server_close_rx: std::sync::mpsc::Receiver<u32>,
+    events_rx: EventReceiver,
+    /// Times the event loop parked waiting for work. Tests use it to prove an
+    /// idle runtime does not wake on a fixed tick.
+    parks: std::cell::Cell<u64>,
     active_servers_list: Arc<tokio::sync::Mutex<Vec<Arc<HttpServer>>>>,
     _tokio_rt: tokio::runtime::Runtime,
 }
@@ -263,22 +259,18 @@ impl QuickJsRuntime {
             })?;
         let tokio_handle = tokio_rt.handle().clone();
 
-        let (completion_tx, completion_rx) = std::sync::mpsc::channel();
-        let (server_req_tx, server_req_rx) = std::sync::mpsc::channel();
-        let (server_close_tx, server_close_rx) = std::sync::mpsc::channel();
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
         let active_servers_list = Arc::new(tokio::sync::Mutex::new(Vec::<Arc<HttpServer>>::new()));
 
         let state = Rc::new(RefCell::new(SharedState {
             timers: HashMap::new(),
             abort_senders: HashMap::new(),
             pending_fetches: 0,
-            completion_tx,
+            events_tx,
             active_servers: 0,
             server_handles: HashMap::new(),
             server_resp_senders: HashMap::new(),
             server_stream_senders: HashMap::new(),
-            server_req_tx,
-            server_close_tx,
             unhandled_error: None,
             pending_rejections: Vec::new(),
         }));
@@ -305,9 +297,8 @@ impl QuickJsRuntime {
             context,
             state,
             transpiler,
-            completion_rx,
-            server_req_rx,
-            server_close_rx,
+            events_rx,
+            parks: std::cell::Cell::new(0),
             active_servers_list,
             _tokio_rt: tokio_rt,
         };
@@ -513,12 +504,12 @@ impl QuickJsRuntime {
                         None
                     };
 
-                    let tx = state_fetch.borrow().completion_tx.clone();
+                    let tx = state_fetch.borrow().events_tx.clone();
                     state_fetch.borrow_mut().pending_fetches += 1;
 
                     tokio_handle_fetch.spawn(async move {
                         let result = crate::fetch::execute_fetch(&url, options, abort_rx).await;
-                        let _ = tx.send(FetchCompletion { req_id, result });
+                        let _ = tx.send(LoopEvent::FetchDone(FetchCompletion { req_id, result }));
                     });
 
                     Ok(())
@@ -584,7 +575,7 @@ impl QuickJsRuntime {
                     let bound_port = local_addr.port();
                     let bound_host = hostname.clone();
 
-                    let req_tx = state_srv.borrow().server_req_tx.clone();
+                    let req_tx = state_srv.borrow().events_tx.clone();
                     let server = Arc::new(HttpServer::start(
                         server_id,
                         bound_host.clone(),
@@ -627,7 +618,7 @@ impl QuickJsRuntime {
                     let (server_opt, tx) = {
                         let mut s = state_close.borrow_mut();
                         let srv = s.server_handles.remove(&server_id);
-                        (srv, s.server_close_tx.clone())
+                        (srv, s.events_tx.clone())
                     };
 
                     if let Some(server) = server_opt {
@@ -638,10 +629,10 @@ impl QuickJsRuntime {
                                 let mut lock = list_clone.lock().await;
                                 lock.retain(|s| s.server_id != server_id);
                             }
-                            let _ = tx.send(server_id);
+                            let _ = tx.send(LoopEvent::ServerClosed(server_id));
                         });
                     } else {
-                        let _ = tx.send(server_id);
+                        let _ = tx.send(LoopEvent::ServerClosed(server_id));
                     }
                     Ok(())
                 },
@@ -1796,23 +1787,16 @@ impl QuickJsRuntime {
         });
     }
 
-    fn run_event_loop(&self, file: &str) -> Result<i32> {
-        loop {
-            // Process any incoming HTTP server requests
-            while let Ok(req) = self.server_req_rx.try_recv() {
-                self.dispatch_server_request(req);
-            }
-
-            // Process any pending fetch completion results
-            while let Ok(completion) = self.completion_rx.try_recv() {
+    fn handle_event(&self, event: LoopEvent) {
+        match event {
+            LoopEvent::ServerRequest(req) => self.dispatch_server_request(req),
+            LoopEvent::FetchDone(completion) => {
                 if self.state.borrow().pending_fetches > 0 {
                     self.state.borrow_mut().pending_fetches -= 1;
                 }
                 self.dispatch_fetch_completion(completion);
             }
-
-            // Process any server close events
-            while let Ok(closed_server_id) = self.server_close_rx.try_recv() {
+            LoopEvent::ServerClosed(closed_server_id) => {
                 if self.state.borrow().active_servers > 0 {
                     self.state.borrow_mut().active_servers -= 1;
                 }
@@ -1823,6 +1807,14 @@ impl QuickJsRuntime {
                         let _ = f.call::<_, ()>((closed_server_id,));
                     }
                 });
+            }
+        }
+    }
+
+    fn run_event_loop(&self, file: &str) -> Result<i32> {
+        loop {
+            while let Ok(event) = self.events_rx.try_recv() {
+                self.handle_event(event);
             }
 
             // Drain all pending microtasks
@@ -1916,32 +1908,29 @@ impl QuickJsRuntime {
                     }
                 }
             } else {
-                let max_sleep = if has_pending_fetches || has_active_servers {
-                    Duration::from_millis(1)
-                } else {
-                    Duration::from_millis(50)
-                };
-
-                let sleep_duration = match min_deadline {
-                    Some(earliest) => {
-                        let now = Instant::now();
-                        if earliest > now {
-                            (earliest - now).min(max_sleep)
-                        } else {
-                            Duration::from_millis(0)
+                // Park until a Tokio task sends work or the nearest timer is
+                // due. Every fetch, server request and server close arrives as
+                // an event, so nothing can complete unseen while parked.
+                self.parks.set(self.parks.get() + 1);
+                let event = match min_deadline {
+                    Some(deadline) => {
+                        let wait = deadline.saturating_duration_since(Instant::now());
+                        match self.events_rx.recv_timeout(wait) {
+                            Ok(event) => Some(event),
+                            Err(RecvTimeoutError::Timeout) => None,
+                            Err(RecvTimeoutError::Disconnected) => break,
                         }
                     }
-                    None => {
-                        if has_pending_fetches || has_active_servers {
-                            max_sleep
-                        } else {
-                            break;
+                    None if has_pending_fetches || has_active_servers => {
+                        match self.events_rx.recv() {
+                            Ok(event) => Some(event),
+                            Err(_) => break,
                         }
                     }
+                    None => break,
                 };
-
-                if sleep_duration > Duration::from_millis(0) {
-                    std::thread::sleep(sleep_duration);
+                if let Some(event) = event {
+                    self.handle_event(event);
                 }
             }
         }
@@ -2419,6 +2408,42 @@ mod tests {
         "#;
         let exit_code = runtime.eval("req_double_read.js", code).unwrap();
         assert_eq!(exit_code, 0);
+    }
+
+    #[test]
+    fn test_idle_server_parks_until_work_arrives() {
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        let code = r#"
+            import { serve } from "vaern:http";
+            const server = serve(() => new Response("ok"), { port: 0, hostname: "127.0.0.1" });
+            setTimeout(() => server.close(), 300);
+        "#;
+        let exit_code = runtime.eval("idle_server.ts", code).unwrap();
+        assert_eq!(exit_code, 0);
+        // A loop that ticks while a server is open wakes hundreds of times in
+        // 300 ms. Parking on the event channel wakes for the timer and the
+        // close event only.
+        let parks = runtime.parks.get();
+        assert!(
+            parks < 10,
+            "event loop parked {parks} times for 300 ms of idle server"
+        );
+    }
+
+    #[test]
+    fn test_timer_wait_is_one_park() {
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        let started = Instant::now();
+        let exit_code = runtime
+            .eval("one_timer.js", "setTimeout(() => {}, 200);")
+            .unwrap();
+        assert_eq!(exit_code, 0);
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        let parks = runtime.parks.get();
+        assert!(
+            parks <= 2,
+            "event loop parked {parks} times for one 200 ms timer"
+        );
     }
 
     #[test]

@@ -143,7 +143,7 @@ impl HttpServer {
         hostname: String,
         port: u16,
         listener: TcpListener,
-        request_tx: std::sync::mpsc::Sender<ServerIncomingRequest>,
+        request_tx: crate::event::EventSender,
         tokio_handle: tokio::runtime::Handle,
     ) -> Self {
         let shutdown_notify = Arc::new(tokio::sync::Notify::new());
@@ -220,7 +220,7 @@ impl HttpServer {
                                         resp_sender: resp_tx,
                                     };
 
-                                    if req_tx.send(incoming).is_err() {
+                                    if req_tx.send(crate::event::LoopEvent::ServerRequest(incoming)).is_err() {
                                         in_flight_req.fetch_sub(1, Ordering::SeqCst);
                                         let unavailable = Response::builder()
                                             .status(StatusCode::SERVICE_UNAVAILABLE)

@@ -6,6 +6,7 @@
 //! - [`ModuleLoader`]: Trait resolving and loading relative local ES modules from disk.
 
 pub mod error;
+pub mod event;
 pub mod fetch;
 pub mod module_loader;
 pub mod runtime;
