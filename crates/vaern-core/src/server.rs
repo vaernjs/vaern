@@ -2,6 +2,11 @@
 //!
 //! Owns TCP listening, connection serving with Hyper, bridging requests to the
 //! JavaScript runtime, in-flight request tracking, and graceful shutdown draining.
+//!
+//! Every connection is bounded before a request reaches JavaScript: headers
+//! and bodies must arrive within a deadline and bodies are capped in size, so
+//! a slow or oversized client costs a rejection response rather than memory
+//! or a stuck connection.
 
 use crate::error::{Result, VaernError};
 use bytes::Bytes;
@@ -11,7 +16,7 @@ use hyper::body::Incoming;
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
@@ -35,6 +40,81 @@ pub fn validate_hostname(hostname: &str, port: u16) -> Result<IpAddr> {
         action: "verify the hostname is 'localhost' or a valid IP address (e.g. 127.0.0.1)"
             .to_string(),
     })
+}
+
+/// Largest request body accepted by default (1 MiB).
+pub const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+
+/// Default time a client has to send the full request headers.
+pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default time a client has to send the full request body.
+pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bounds applied to every request a server accepts.
+#[derive(Debug, Clone, Copy)]
+pub struct ServerLimits {
+    pub max_body_bytes: usize,
+    pub header_read_timeout: Duration,
+    pub body_read_timeout: Duration,
+}
+
+impl Default for ServerLimits {
+    fn default() -> Self {
+        Self {
+            max_body_bytes: MAX_REQUEST_BODY_BYTES,
+            header_read_timeout: HEADER_READ_TIMEOUT,
+            body_read_timeout: BODY_READ_TIMEOUT,
+        }
+    }
+}
+
+type ResponseBody = BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
+
+/// Plain-text response for requests rejected before they reach JavaScript.
+fn rejection(status: StatusCode, message: &str) -> Response<ResponseBody> {
+    let body = Full::new(Bytes::from(format!(
+        "{message}
+"
+    )))
+    .map_err(|never| -> Box<dyn std::error::Error + Send + Sync> { match never {} })
+    .boxed();
+    let mut res = Response::new(body);
+    *res.status_mut() = status;
+    res
+}
+
+/// Reads a request body within `limits`, or returns the status and message
+/// to reject it with.
+async fn read_body(
+    body: Incoming,
+    limits: &ServerLimits,
+) -> std::result::Result<Vec<u8>, (StatusCode, String)> {
+    let limited = http_body_util::Limited::new(body, limits.max_body_bytes);
+    match tokio::time::timeout(limits.body_read_timeout, limited.collect()).await {
+        Ok(Ok(collected)) => Ok(collected.to_bytes().to_vec()),
+        Ok(Err(err))
+            if err
+                .downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some() =>
+        {
+            Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("request body exceeds {} bytes", limits.max_body_bytes),
+            ))
+        }
+        Ok(Err(err)) => Err((
+            StatusCode::BAD_REQUEST,
+            format!("failed to read request body: {err}"),
+        )),
+        Err(_) => Err((
+            StatusCode::REQUEST_TIMEOUT,
+            format!(
+                "request body not received within {} ms",
+                limits.body_read_timeout.as_millis()
+            ),
+        )),
+    }
 }
 
 /// Incoming HTTP request bridged from Tokio Hyper listener to QuickJS runtime.
@@ -145,6 +225,7 @@ impl HttpServer {
         listener: TcpListener,
         request_tx: crate::event::EventSender,
         tokio_handle: tokio::runtime::Handle,
+        limits: ServerLimits,
     ) -> Self {
         let shutdown_notify = Arc::new(tokio::sync::Notify::new());
         let in_flight = Arc::new(AtomicUsize::new(0));
@@ -190,6 +271,9 @@ impl HttpServer {
                                 let req_hostname = conn_hostname.clone();
 
                                 async move {
+                                    // Count the request before its body arrives, so
+                                    // close() also drains uploads still in progress.
+                                    in_flight_req.fetch_add(1, Ordering::SeqCst);
                                     let method = req.method().to_string();
                                     let uri = req.uri().to_string();
 
@@ -200,13 +284,15 @@ impl HttpServer {
                                         }
                                     }
 
-                                    let body_bytes = match req.into_body().collect().await {
-                                        Ok(collected) => collected.to_bytes().to_vec(),
-                                        Err(_) => Vec::new(),
+                                    let body_bytes = match read_body(req.into_body(), &limits).await {
+                                        Ok(bytes) => bytes,
+                                        Err((status, message)) => {
+                                            in_flight_req.fetch_sub(1, Ordering::SeqCst);
+                                            return Ok::<_, Infallible>(rejection(status, &message));
+                                        }
                                     };
 
                                     let (resp_tx, resp_rx) = oneshot::channel();
-                                    in_flight_req.fetch_add(1, Ordering::SeqCst);
 
                                     let incoming = ServerIncomingRequest {
                                         server_id,
@@ -285,9 +371,13 @@ impl HttpServer {
                                 }
                             });
 
-                            let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
-                                .serve_connection(io, service)
-                                .await;
+                            let mut builder =
+                                hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+                            builder
+                                .http1()
+                                .timer(TokioTimer::new())
+                                .header_read_timeout(limits.header_read_timeout);
+                            let _ = builder.serve_connection(io, service).await;
                         });
                     }
                 }
@@ -302,6 +392,11 @@ impl HttpServer {
             in_flight,
             is_closed,
         }
+    }
+
+    /// Requests counted by the drain window: received, not yet answered.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
     }
 
     /// Stops accepting new connections and drains in-flight requests with a 5-second cap.
@@ -324,6 +419,144 @@ impl HttpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    /// Starts a server whose handler answers 200 with the body length, and
+    /// returns a count of requests that reached the handler.
+    async fn start_counting_server(
+        limits: ServerLimits,
+    ) -> (HttpServer, SocketAddr, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let server = HttpServer::start(
+            1,
+            "127.0.0.1".to_string(),
+            addr.port(),
+            listener,
+            tx,
+            tokio::runtime::Handle::current(),
+            limits,
+        );
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let counter = dispatched.clone();
+        std::thread::spawn(move || {
+            while let Ok(event) = rx.recv() {
+                if let crate::event::LoopEvent::ServerRequest(req) = event {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let _ = req.resp_sender.send(ServerResponse {
+                        status: 200,
+                        status_text: "OK".to_string(),
+                        headers: Vec::new(),
+                        body: ServerResponseBody::Full(
+                            format!("len={}", req.body.len()).into_bytes(),
+                        ),
+                    });
+                }
+            }
+        });
+        (server, addr, dispatched)
+    }
+
+    /// Writes `request`, then reads until the server closes or `wait` passes.
+    async fn exchange(addr: SocketAddr, request: &[u8], wait: Duration) -> String {
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(request).await.expect("write request");
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(wait, stream.read_to_end(&mut buf)).await;
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    fn short_limits() -> ServerLimits {
+        ServerLimits {
+            max_body_bytes: 1024,
+            header_read_timeout: Duration::from_millis(200),
+            body_read_timeout: Duration::from_millis(200),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_small_body_reaches_handler() {
+        let (_server, addr, dispatched) = start_counting_server(short_limits()).await;
+        let res = exchange(
+            addr,
+            b"POST / HTTP/1.1\r\nHost: t\r\nConnection: close\r\nContent-Length: 5\r\n\r\nhello",
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(res.starts_with("HTTP/1.1 200"), "{res}");
+        assert!(res.ends_with("len=5"), "{res}");
+        assert_eq!(dispatched.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_oversized_body_is_rejected_with_413() {
+        let (_server, addr, dispatched) = start_counting_server(short_limits()).await;
+        let mut req =
+            b"POST / HTTP/1.1\r\nHost: t\r\nConnection: close\r\nContent-Length: 4096\r\n\r\n"
+                .to_vec();
+        req.extend(std::iter::repeat_n(b'x', 4096));
+        let res = exchange(addr, &req, Duration::from_secs(3)).await;
+        assert!(res.starts_with("HTTP/1.1 413"), "{res}");
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_malformed_body_is_rejected_with_400() {
+        let (_server, addr, dispatched) = start_counting_server(short_limits()).await;
+        let res = exchange(
+            addr,
+            b"POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n",
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(res.starts_with("HTTP/1.1 400"), "{res}");
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_stalled_body_is_rejected_with_408() {
+        let (_server, addr, dispatched) = start_counting_server(short_limits()).await;
+        let res = exchange(
+            addr,
+            b"POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 10\r\n\r\nab",
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(res.starts_with("HTTP/1.1 408"), "{res}");
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_stalled_headers_close_the_connection() {
+        let (_server, addr, dispatched) = start_counting_server(short_limits()).await;
+        let started = Instant::now();
+        let _ = exchange(
+            addr,
+            b"GET / HTTP/1.1\r\nHost: t\r\n",
+            Duration::from_secs(3),
+        )
+        .await;
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_secs(2),
+            "connection held open for {waited:?}"
+        );
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_request_is_in_flight_while_its_body_arrives() {
+        let (server, addr, _dispatched) = start_counting_server(ServerLimits::default()).await;
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream
+            .write_all(b"POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 10\r\n\r\nab")
+            .await
+            .expect("write request");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(server.in_flight(), 1);
+    }
 
     #[test]
     fn test_server_hostname_validation() {

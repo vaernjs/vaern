@@ -583,6 +583,7 @@ impl QuickJsRuntime {
                         listener,
                         req_tx,
                         tokio_handle_srv.clone(),
+                        crate::server::ServerLimits::default(),
                     ));
 
                     state_srv.borrow_mut().active_servers += 1;

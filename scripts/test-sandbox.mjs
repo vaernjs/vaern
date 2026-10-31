@@ -88,6 +88,12 @@ const cases = [
     code: 0,
     stdout: "rejected\n",
   },
+  {
+    name: "body_cap.ts answers an oversized body with 413 before the handler",
+    args: ["run", "body_cap.ts"],
+    code: 0,
+    stdout: "status 413, handler ran 0 times\n",
+  },
 ];
 
 const norm = (s) => s.replaceAll("\r\n", "\n");
