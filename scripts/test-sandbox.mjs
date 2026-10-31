@@ -82,6 +82,12 @@ const cases = [
     stderrIncludes: ["Error: timer boom", "timer_throws.js:2:"],
     stderrExcludes: ["panicked"],
   },
+  {
+    name: "no_test_tls.ts finds no built-in TLS test server",
+    args: ["run", "no_test_tls.ts"],
+    code: 0,
+    stdout: "rejected\n",
+  },
 ];
 
 const norm = (s) => s.replaceAll("\r\n", "\n");

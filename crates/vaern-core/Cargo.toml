@@ -24,9 +24,11 @@ bytes = "1.10"
 url = "2.5"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "webpki-tokio"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "0.26"
-rcgen = { version = "0.13", features = ["pem", "ring"] }
+
+# Loopback HTTPS test server, compiled only for tests and the test-tls feature
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
+rcgen = { version = "0.13", features = ["pem", "ring"], optional = true }
 
 # TypeScript parsing and type stripping
 swc_common = "26.0"
@@ -36,6 +38,13 @@ swc_ecma_visit = "29.0"
 swc_ecma_transforms_typescript = "56.0"
 swc_ecma_codegen = "32.0"
 
+[features]
+# Builds the loopback HTTPS test server on 127.0.0.1:8443 and lets fetch trust
+# its certificate. Never enabled for release binaries.
+test-tls = ["dep:tokio-rustls", "dep:rcgen"]
+
 [dev-dependencies]
 tempfile = "3.17"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rcgen = { version = "0.13", features = ["pem", "ring"] }
 

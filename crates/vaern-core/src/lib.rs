@@ -10,6 +10,8 @@ pub mod fetch;
 pub mod module_loader;
 pub mod runtime;
 pub mod server;
+#[cfg(any(test, feature = "test-tls"))]
+pub mod test_tls;
 pub mod transpile;
 
 pub use error::{Result, VaernError};
