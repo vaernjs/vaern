@@ -1,6 +1,6 @@
 {
   "name": "@vaernjs/vaern",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "description": "Vaern — an agent-native JavaScript & TypeScript runtime. Runs TypeScript directly, with fetch and an HTTP server built in.",
   "keywords": [
     "runtime",
@@ -51,11 +51,11 @@
     "prepublishOnly": "node ../../scripts/check-publish.mjs"
   },
   "optionalDependencies": {
-    "@vaernjs/vaern-linux-x64": "0.0.4",
-    "@vaernjs/vaern-linux-arm64": "0.0.4",
-    "@vaernjs/vaern-darwin-arm64": "0.0.4",
-    "@vaernjs/vaern-darwin-x64": "0.0.4",
-    "@vaernjs/vaern-win32-x64": "0.0.4"
+    "@vaernjs/vaern-linux-x64": "0.0.5",
+    "@vaernjs/vaern-linux-arm64": "0.0.5",
+    "@vaernjs/vaern-darwin-arm64": "0.0.5",
+    "@vaernjs/vaern-darwin-x64": "0.0.5",
+    "@vaernjs/vaern-win32-x64": "0.0.5"
   },
   "engines": {
     "node": ">=18.0.0"

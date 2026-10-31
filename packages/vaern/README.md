@@ -6,7 +6,7 @@
 
 ---
 
-> ### Status: v0.0.4, early native runtime
+> ### Status: v0.0.5, early native runtime
 >
 > This release ships the native `vaern` binary for Linux, macOS and Windows.
 > The API surface is small and will change before v1.0.

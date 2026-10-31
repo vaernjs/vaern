@@ -1,6 +1,6 @@
 [package]
 name = "vaern-cli"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2024"
 license = "MIT"
 description = "Command-line interface for the Vaern agent-native JavaScript/TypeScript runtime."

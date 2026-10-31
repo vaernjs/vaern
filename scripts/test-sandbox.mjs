@@ -29,10 +29,10 @@ fs.chmodSync(binary, 0o755);
 
 const cases = [
   {
-    name: "--version reports 0.0.4",
+    name: "--version reports 0.0.5",
     args: ["--version"],
     code: 0,
-    stdout: "vaern 0.0.4\n",
+    stdout: "vaern 0.0.5\n",
   },
   {
     name: "hello.ts strips types and prints",

@@ -1,50 +1,65 @@
 {
+  "version": "0.0.5",
+  "baseline": "0.0.4",
+  "date": "2026-10-31",
   "system": {
     "os": "Microsoft Windows 11 Pro (x86_64)",
     "cpu": "11th Gen Intel(R) Core(TM) i7-11850H @ 2.50GHz (8 cores, 16 threads)",
     "ram": "16 GB RAM"
   },
+  "method": "hyperfine -N, 3 warmups, 20 runs (10 for compute-heavy); wall time is mean ± σ. Peak RSS is the largest PeakWorkingSetSize of 5 runs. Both versions are release builds measured in the same session.",
+  "binarySize": {
+    "budget": 15728640,
+    "0.0.4": 16304640,
+    "0.0.5": 15851008,
+    "status": "Over budget by 122368 bytes"
+  },
   "benchmarks": [
     {
-      "name": "Startup & greeting",
+      "name": "Startup and greeting",
       "command": "vaern run examples/hello.ts",
-      "reproduce": "hyperfine --warmup 3 'target/release/vaern run examples/hello.ts'",
-      "date": "2026-10-29",
-      "coldStart": "27.1 ms",
-      "warmStart": "18.0 ms",
-      "rss": "16.2 MB",
-      "status": "Win vs Node (68.3 ms)"
+      "reproduce": "hyperfine -N --warmup 3 --runs 20 'target/release/vaern run examples/hello.ts' 'node -e 0'",
+      "wall": { "0.0.5": "11.6 ms ± 1.7", "0.0.4": "14.5 ms ± 1.4", "node -e 0": "39.8 ms ± 1.8" },
+      "peakRss": { "0.0.5": "8.0 MB", "0.0.4": "8.0 MB" },
+      "status": "Win vs Node process start"
     },
     {
-      "name": "HTTPS Fetch & parse",
+      "name": "Loopback fetch and JSON parse",
       "command": "vaern run examples/fetch-json.ts",
-      "reproduce": "hyperfine --warmup 3 'target/release/vaern run examples/fetch-json.ts'",
-      "date": "2026-10-29",
-      "coldStart": "41.5 ms",
-      "warmStart": "26.8 ms",
-      "rss": "24.1 MB",
-      "status": "Baseline"
+      "reproduce": "hyperfine -N --warmup 3 --runs 20 'target/release/vaern run examples/fetch-json.ts'",
+      "wall": { "0.0.5": "14.4 ms ± 3.4", "0.0.4": "33.7 ms ± 10.8" },
+      "peakRss": { "0.0.5": "10.3 MB", "0.0.4": "11.0 MB" },
+      "status": "2.3x faster than 0.0.4; the event loop wakes on completion instead of polling"
     },
     {
       "name": "Arithmetic loop (1M)",
       "command": "vaern run bench/compute-loop.ts",
-      "reproduce": "hyperfine --warmup 3 'target/release/vaern run bench/compute-loop.ts' 'node bench/compute-loop.ts'",
-      "date": "2026-10-29",
-      "coldStart": "38.0 ms",
-      "warmStart": "28.5 ms",
-      "rss": "18.5 MB",
-      "status": "Loss vs Node (9.8 ms warm)"
+      "reproduce": "hyperfine -N --warmup 3 --runs 20 'target/release/vaern run bench/compute-loop.ts' 'node bench/compute-loop.ts'",
+      "wall": { "0.0.5": "40.0 ms ± 2.3", "0.0.4": "45.8 ms ± 2.9", "node": "107.9 ms ± 17.5" },
+      "peakRss": { "0.0.5": "8.4 MB", "0.0.4": "8.4 MB" },
+      "status": "Win vs Node; Node startup dominates at this size"
     },
     {
-      "name": "Parallel HTTP (100 req)",
+      "name": "Arithmetic loop (50M)",
+      "command": "vaern run bench/compute-heavy.ts",
+      "reproduce": "hyperfine -N --warmup 2 --runs 10 'target/release/vaern run bench/compute-heavy.ts' 'node bench/compute-heavy.ts'",
+      "wall": { "0.0.5": "1.347 s ± 0.047", "0.0.4": "1.410 s ± 0.065", "node": "0.245 s ± 0.005" },
+      "status": "Loss vs Node, 5.5x slower; QuickJS interprets bytecode and V8 compiles the loop"
+    },
+    {
+      "name": "Parallel HTTP (100 requests)",
       "command": "vaern run tests/e2e/serve_concurrent.ts",
-      "reproduce": "target/release/vaern run tests/e2e/serve_concurrent.ts",
-      "date": "2026-10-29",
-      "coldStart": "58.2 ms",
-      "warmStart": "44.0 ms",
-      "rss": "28.6 MB",
-      "status": "Baseline (p99 < 50ms)"
+      "reproduce": "hyperfine -N --warmup 3 --runs 20 'target/release/vaern run tests/e2e/serve_concurrent.ts'",
+      "wall": { "0.0.5": "47.6 ms ± 0.8", "0.0.4": "50.2 ms ± 2.2" },
+      "peakRss": { "0.0.5": "19.7 MB", "0.0.4": "20.7 MB" },
+      "status": "Within noise of 0.0.4"
+    },
+    {
+      "name": "Idle HTTP server CPU (3 s window)",
+      "command": "vaern run bench/idle-server.ts",
+      "reproduce": "node bench/idle-cpu.mjs <0.0.4 binary> target/release/vaern",
+      "cpu": { "0.0.5": "0.0 ms (0.00% of one core)", "0.0.4": "78.1 ms (2.60% of one core)" },
+      "status": "Idle server no longer burns CPU; Windows reports CPU time in 15.6 ms steps"
     }
   ]
 }
-

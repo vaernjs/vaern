@@ -1,6 +1,6 @@
 {
   "name": "@vaernjs/vaern-linux-arm64",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "description": "The Linux arm64 binary for @vaernjs/vaern, the agent-native JavaScript & TypeScript runtime.",
   "license": "MIT",
   "author": {

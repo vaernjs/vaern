@@ -30,7 +30,7 @@ fn text(bytes: &[u8]) -> String {
 fn version_reports_release_number() -> TestResult {
     let out = vaern(&["--version"])?;
     assert_eq!(out.status.code(), Some(0));
-    assert_eq!(text(&out.stdout).trim(), "vaern 0.0.4");
+    assert_eq!(text(&out.stdout).trim(), "vaern 0.0.5");
     Ok(())
 }
 

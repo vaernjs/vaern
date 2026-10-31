@@ -1,6 +1,6 @@
 {
   "name": "@vaernjs/vaern-win32-x64",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "description": "The Windows x86_64 binary for @vaernjs/vaern, the agent-native JavaScript & TypeScript runtime.",
   "license": "MIT",
   "author": {
