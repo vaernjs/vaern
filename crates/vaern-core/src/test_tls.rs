@@ -186,7 +186,7 @@ async fn route(
             .body(Full::new(Bytes::from("ok")).boxed());
     }
 
-    if path_and_query.starts_with("/redirect") {
+    if path_and_query.starts_with("/redirect?") {
         let query = req.uri().query().unwrap_or("");
         let count: usize = query
             .strip_prefix("count=")
@@ -209,6 +209,56 @@ async fn route(
                 .status(StatusCode::OK)
                 .body(Full::new(Bytes::from("redirect destination")).boxed());
         }
+    }
+
+    // /redirect-to?status=307&location=<url> answers with that redirect.
+    if path_and_query.starts_with("/redirect-to") {
+        let parsed = Url::parse(&format!("https://{TEST_SERVER_ADDR}{path_and_query}")).ok();
+        let param = |name: &str| {
+            parsed.as_ref().and_then(|u| {
+                u.query_pairs()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, v)| v.into_owned())
+            })
+        };
+        let status = param("status")
+            .and_then(|s| s.parse::<u16>().ok())
+            .and_then(|s| StatusCode::from_u16(s).ok())
+            .unwrap_or(StatusCode::FOUND);
+        return hyper::Response::builder()
+            .status(status)
+            .header(
+                LOCATION,
+                param("location").unwrap_or_else(|| "/test".into()),
+            )
+            .body(Empty::new().boxed());
+    }
+
+    // /echo-request reports what arrived, so redirect tests can see which
+    // method, credentials and body survived each hop.
+    if path_and_query.starts_with("/echo-request") {
+        let method = req.method().to_string();
+        let header = |name: &str| {
+            req.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string()
+        };
+        let (auth, cookie, content_type) = (
+            header("authorization"),
+            header("cookie"),
+            header("content-type"),
+        );
+        let body = match req.into_body().collect().await {
+            Ok(collected) => String::from_utf8_lossy(&collected.to_bytes()).into_owned(),
+            Err(_) => String::new(),
+        };
+        let report =
+            format!("{method} auth={auth} cookie={cookie} content-type={content_type} body={body}");
+        return hyper::Response::builder()
+            .status(StatusCode::OK)
+            .body(Full::new(Bytes::from(report)).boxed());
     }
 
     if path_and_query.starts_with("/delay") {

@@ -163,6 +163,7 @@ async fn execute_fetch_with(
         })?;
 
     let mut body_bytes = options.body;
+    let mut headers = options.headers;
     let mut redirect_count = 0;
 
     loop {
@@ -178,7 +179,7 @@ async fn execute_fetch_with(
 
         let mut req_builder = Request::builder().method(method.clone()).uri(uri);
 
-        for (key, val) in &options.headers {
+        for (key, val) in &headers {
             if let (Ok(hname), Ok(hval)) = (HeaderName::from_str(key), HeaderValue::from_str(val)) {
                 req_builder = req_builder.header(hname, hval);
             }
@@ -271,22 +272,38 @@ async fn execute_fetch_with(
                     action: "verify remote server redirect headers".to_string(),
                 })?;
 
-                current_url = current_url.join(loc_str).map_err(|err| VaernError::Fetch {
+                let next_url = current_url.join(loc_str).map_err(|err| VaernError::Fetch {
                     stage: "read".to_string(),
                     url: current_url.to_string(),
                     message: format!("failed to resolve redirect location '{loc_str}': {err}"),
                     action: "check remote server Location header value".to_string(),
                 })?;
 
-                // RFC 9110: 303 always switches to GET; 301/302 typically switch POST to GET
-                if status == StatusCode::SEE_OTHER
-                    || ((status == StatusCode::MOVED_PERMANENTLY || status == StatusCode::FOUND)
-                        && method == Method::POST)
-                {
-                    method = Method::GET;
-                    body_bytes = None;
+                // Following an https -> http redirect would resend the request,
+                // and whatever it carries, in plain text.
+                if current_url.scheme() == "https" && next_url.scheme() == "http" {
+                    return Err(VaernError::Fetch {
+                        stage: "connect".to_string(),
+                        url: current_url.to_string(),
+                        message: format!(
+                            "redirect hop {redirect_count} to {next_url} would downgrade https to plain http"
+                        ),
+                        action: "fetch the http URL directly if plain HTTP is intended, or fix the server's Location header".to_string(),
+                    });
                 }
 
+                // Credentials belong to the origin they were written for.
+                if next_url.origin() != current_url.origin() {
+                    headers.retain(|(name, _)| !is_credential_header(name));
+                }
+
+                if redirect_switches_to_get(status, &method) {
+                    method = Method::GET;
+                    body_bytes = None;
+                    headers.retain(|(name, _)| !is_request_body_header(name));
+                }
+
+                current_url = next_url;
                 continue;
             }
         }
@@ -348,6 +365,34 @@ async fn execute_fetch_with(
             body: body_bytes_result,
         });
     }
+}
+
+/// RFC 9110 section 15.4: 303 turns every method except HEAD into GET, 301
+/// and 302 turn POST into GET, and 307 and 308 keep the method and body.
+fn redirect_switches_to_get(status: StatusCode, method: &Method) -> bool {
+    match status {
+        StatusCode::SEE_OTHER => *method != Method::GET && *method != Method::HEAD,
+        StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND => *method == Method::POST,
+        _ => false,
+    }
+}
+
+/// Headers that carry credentials and must not cross to another origin.
+fn is_credential_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("cookie")
+}
+
+/// Headers that describe a request body, dropped together with the body.
+fn is_request_body_header(name: &str) -> bool {
+    [
+        "content-type",
+        "content-length",
+        "content-encoding",
+        "content-language",
+        "content-location",
+    ]
+    .iter()
+    .any(|h| name.eq_ignore_ascii_case(h))
 }
 
 #[cfg(test)]
@@ -423,6 +468,109 @@ mod tests {
                 assert!(message.contains("maximum redirect limit"));
             }
             _ => panic!("expected redirect cap error"),
+        }
+    }
+
+    /// Sends `method` through a `status` redirect to `location` and returns
+    /// what the final hop reported.
+    async fn redirect_report(
+        method: &str,
+        status: u16,
+        location: &str,
+        body: Option<&str>,
+    ) -> Result<String> {
+        let target = format!(
+            "https://127.0.0.1:8443/redirect-to?status={status}&location={}",
+            url::form_urlencoded::byte_serialize(location.as_bytes()).collect::<String>()
+        );
+        let options = FetchOptions {
+            method: method.to_string(),
+            headers: vec![
+                ("Authorization".to_string(), "Bearer secret".to_string()),
+                ("Cookie".to_string(), "session=abc".to_string()),
+                ("Content-Type".to_string(), "text/plain".to_string()),
+            ],
+            body: body.map(|b| b.as_bytes().to_vec()),
+            ..Default::default()
+        };
+        let res = execute_fetch(&target, options, None).await?;
+        Ok(String::from_utf8_lossy(&res.body).into_owned())
+    }
+
+    #[tokio::test]
+    async fn test_cross_origin_redirect_strips_credentials() {
+        let Ok(report) =
+            redirect_report("GET", 302, "https://localhost:8443/echo-request", None).await
+        else {
+            panic!("cross-origin redirect failed");
+        };
+        assert!(report.contains("auth= "), "{report}");
+        assert!(report.contains("cookie= "), "{report}");
+    }
+
+    #[tokio::test]
+    async fn test_same_origin_redirect_keeps_credentials() {
+        let Ok(report) = redirect_report("GET", 302, "/echo-request", None).await else {
+            panic!("same-origin redirect failed");
+        };
+        assert!(report.contains("auth=Bearer secret"), "{report}");
+        assert!(report.contains("cookie=session=abc"), "{report}");
+    }
+
+    #[tokio::test]
+    async fn test_303_turns_any_method_into_get_without_body() {
+        let Ok(report) = redirect_report("PUT", 303, "/echo-request", Some("payload")).await else {
+            panic!("303 redirect failed");
+        };
+        assert!(report.starts_with("GET "), "{report}");
+        assert!(report.contains("content-type= "), "{report}");
+        assert!(report.ends_with("body="), "{report}");
+    }
+
+    #[tokio::test]
+    async fn test_302_turns_post_into_get_and_keeps_other_methods() {
+        let Ok(post) = redirect_report("POST", 302, "/echo-request", Some("payload")).await else {
+            panic!("302 POST redirect failed");
+        };
+        assert!(
+            post.starts_with("GET ") && post.ends_with("body="),
+            "{post}"
+        );
+
+        let Ok(delete) = redirect_report("DELETE", 301, "/echo-request", None).await else {
+            panic!("301 DELETE redirect failed");
+        };
+        assert!(delete.starts_with("DELETE "), "{delete}");
+    }
+
+    #[tokio::test]
+    async fn test_307_and_308_keep_method_and_body() {
+        for status in [307, 308] {
+            let Ok(report) =
+                redirect_report("POST", status, "/echo-request", Some("payload")).await
+            else {
+                panic!("{status} redirect failed");
+            };
+            assert!(report.starts_with("POST "), "{status}: {report}");
+            assert!(report.ends_with("body=payload"), "{status}: {report}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_https_to_http_redirect_is_blocked() {
+        match redirect_report("GET", 302, "http://127.0.0.1:9/plain", None).await {
+            Err(VaernError::Fetch {
+                stage,
+                url,
+                message,
+                ..
+            }) => {
+                assert_eq!(stage, "connect");
+                assert!(url.starts_with("https://127.0.0.1:8443/"), "{url}");
+                assert!(message.contains("http://127.0.0.1:9/plain"), "{message}");
+                assert!(message.contains("downgrade"), "{message}");
+            }
+            other => panic!("expected a typed downgrade error, got {other:?}"),
         }
     }
 
