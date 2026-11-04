@@ -39,6 +39,10 @@ swc_ecma_visit = "29.0"
 swc_ecma_transforms_typescript = "56.0"
 swc_ecma_codegen = "32.0"
 
+# package.json for node_modules resolution; already built for swc. Key order
+# is preserved because exports conditions are matched in declaration order.
+serde_json = { version = "1.0", features = ["preserve_order"] }
+
 [features]
 # Builds the loopback HTTPS test server on 127.0.0.1:8443 and lets fetch trust
 # its certificate. Never enabled for release binaries.

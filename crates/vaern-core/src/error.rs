@@ -43,19 +43,23 @@ pub enum VaernError {
         message: String,
     },
 
-    /// Failure resolving a relative ES-module import.
+    /// Failure resolving an ES-module import. `tried` lists the paths and
+    /// package.json fields consulted, in order.
     #[error(
-        "module resolution failed for '{specifier}' referenced by '{referrer}': {reason}. Verify the imported path exists relative to the importing file."
+        "module resolution failed for '{specifier}' imported by '{referrer}': {reason}.{}\n{action}",
+        tried_list(.tried)
     )]
     ModuleResolution {
         specifier: String,
         referrer: String,
         reason: String,
+        tried: Vec<String>,
+        action: String,
     },
 
     /// Uncaught JavaScript runtime exception during execution.
     #[error(
-        "runtime exception in '{file}': {message}. Inspect the call stack and handle the error."
+        "runtime exception in '{file}': {message}\nInspect the call stack and handle the error."
     )]
     Execution { file: String, message: String },
 
@@ -99,6 +103,10 @@ pub enum VaernError {
         message: String,
         action: String,
     },
+}
+
+fn tried_list(tried: &[String]) -> String {
+    tried.iter().map(|t| format!("\n  tried: {t}")).collect()
 }
 
 /// Convenience result type alias for Vaern core operations.

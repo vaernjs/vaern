@@ -79,6 +79,11 @@ fn promise_identity(promise: &Value<'_>) -> u64 {
 
 struct VaernModuleResolver {
     base_dir: PathBuf,
+    /// Full error of the last failed resolution. QuickJS formats a thrown
+    /// message into a 256-byte buffer, which would cut off the list of paths
+    /// tried, so the script sees the short reason and the top-level report
+    /// uses this.
+    failure: Rc<RefCell<Option<VaernError>>>,
 }
 
 impl Resolver for VaernModuleResolver {
@@ -98,9 +103,14 @@ impl Resolver for VaernModuleResolver {
             PathBuf::from(base)
         };
         let loader = FsModuleLoader;
-        let resolved = loader
-            .resolve(name, &referrer_path)
-            .map_err(|err| rquickjs::Error::new_loading_message(name, format!("{err}")))?;
+        let resolved = loader.resolve(name, &referrer_path).map_err(|err| {
+            let short = match &err {
+                VaernError::ModuleResolution { reason, .. } => reason.clone(),
+                other => other.to_string(),
+            };
+            *self.failure.borrow_mut() = Some(err);
+            rquickjs::Error::new_loading_message(name, short)
+        })?;
         Ok(resolved.to_string_lossy().replace('\\', "/"))
     }
 }
@@ -255,6 +265,8 @@ pub struct QuickJsRuntime {
     /// Times the event loop parked waiting for work. Tests use it to prove an
     /// idle runtime does not wake on a fixed tick.
     parks: std::cell::Cell<u64>,
+    /// Shared with the module resolver; see [`VaernModuleResolver::failure`].
+    resolve_failure: Rc<RefCell<Option<VaernError>>>,
     active_servers_list: Arc<tokio::sync::Mutex<Vec<Arc<HttpServer>>>>,
     _tokio_rt: tokio::runtime::Runtime,
 }
@@ -322,6 +334,7 @@ impl QuickJsRuntime {
             transpiler,
             events_rx,
             parks: std::cell::Cell::new(0),
+            resolve_failure: Rc::new(RefCell::new(None)),
             active_servers_list,
             _tokio_rt: tokio_rt,
         };
@@ -2094,6 +2107,20 @@ impl QuickJsRuntime {
         });
     }
 
+    /// The full resolution error behind a failed import, when `message` is
+    /// the shortened form QuickJS threw for it.
+    fn take_resolve_failure(&self, message: &str) -> Option<VaernError> {
+        let failure = self.resolve_failure.borrow_mut().take()?;
+        match &failure {
+            VaernError::ModuleResolution { specifier, .. }
+                if message.contains(&format!("Error loading module '{specifier}'")) =>
+            {
+                Some(failure)
+            }
+            _ => None,
+        }
+    }
+
     fn dispatch_fs_completion(&self, completion: FsCompletion) {
         let _ = self.context.with(|ctx| -> rquickjs::Result<()> {
             let dispatch_fn: Function = ctx.globals().get("__vaern_dispatch_fs")?;
@@ -2373,7 +2400,10 @@ impl Runtime for QuickJsRuntime {
         let base_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
 
         self.qjs_runtime.set_loader(
-            VaernModuleResolver { base_dir },
+            VaernModuleResolver {
+                base_dir,
+                failure: Rc::clone(&self.resolve_failure),
+            },
             VaernModuleLoader {
                 transpiler: self.transpiler.clone(),
             },
@@ -2391,7 +2421,10 @@ impl Runtime for QuickJsRuntime {
             let msg = self.context.with(|ctx| {
                 let exc = ctx.catch();
                 if let Some(e) = exc.as_exception() {
+                    // A failed import is thrown with an empty stack, so a blank
+                    // stack must not hide the message.
                     e.stack()
+                        .filter(|stack| !stack.trim().is_empty())
                         .or_else(|| e.message())
                         .unwrap_or_else(|| err.to_string())
                 } else if let Some(s) = exc.as_string() {
@@ -2400,6 +2433,9 @@ impl Runtime for QuickJsRuntime {
                     err.to_string()
                 }
             });
+            if let Some(failure) = self.take_resolve_failure(&msg) {
+                return Err(failure);
+            }
             return Err(VaernError::Execution {
                 file: path_str,
                 message: msg,
@@ -2418,7 +2454,10 @@ impl Runtime for QuickJsRuntime {
 
         let base_dir = Path::new(".").to_path_buf();
         self.qjs_runtime.set_loader(
-            VaernModuleResolver { base_dir },
+            VaernModuleResolver {
+                base_dir,
+                failure: Rc::clone(&self.resolve_failure),
+            },
             VaernModuleLoader {
                 transpiler: self.transpiler.clone(),
             },
@@ -2435,7 +2474,10 @@ impl Runtime for QuickJsRuntime {
             let msg = self.context.with(|ctx| {
                 let exc = ctx.catch();
                 if let Some(e) = exc.as_exception() {
+                    // A failed import is thrown with an empty stack, so a blank
+                    // stack must not hide the message.
                     e.stack()
+                        .filter(|stack| !stack.trim().is_empty())
                         .or_else(|| e.message())
                         .unwrap_or_else(|| err.to_string())
                 } else if let Some(s) = exc.as_string() {
@@ -2444,6 +2486,9 @@ impl Runtime for QuickJsRuntime {
                     err.to_string()
                 }
             });
+            if let Some(failure) = self.take_resolve_failure(&msg) {
+                return Err(failure);
+            }
             return Err(VaernError::Execution {
                 file: filename.to_string(),
                 message: msg,
@@ -3072,5 +3117,28 @@ mod tests {
         let exit_code = runtime.eval("fs.js", &code).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(exit_code, 0);
+    }
+
+    #[test]
+    fn test_failed_import_reports_the_full_typed_resolution_error() {
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        let err = runtime
+            .eval("missing.js", "import 'vaern-absent-package-for-tests';")
+            .unwrap_err();
+        match err {
+            VaernError::ModuleResolution {
+                specifier, tried, ..
+            } => {
+                assert_eq!(specifier, "vaern-absent-package-for-tests");
+                let cwd = std::env::current_dir().unwrap();
+                assert_eq!(tried.len(), cwd.ancestors().count());
+                assert!(
+                    tried
+                        .iter()
+                        .all(|t| t.ends_with("vaern-absent-package-for-tests"))
+                );
+            }
+            other => panic!("expected a resolution error, got {other}"),
+        }
     }
 }
