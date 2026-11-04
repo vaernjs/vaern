@@ -95,6 +95,15 @@ const cases = [
     stdout: "status 413, handler ran 0 times\n",
   },
   {
+    name: "console_error.js prints an Error with its frames and cause",
+    args: ["run", "console_error.js"],
+    code: 0,
+    stdout:
+      "Error: boom\n    at <anonymous> (console_error.js:2:44)\n" +
+      "Caused by: TypeError: inner\n    at <anonymous> (console_error.js:2:44)\n",
+    stderr: "",
+  },
+  {
     name: "heap_limit.js stops at the heap limit with a located error",
     args: ["run", "heap_limit.js"],
     code: 1,

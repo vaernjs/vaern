@@ -14,6 +14,7 @@ pub mod server;
 #[cfg(any(test, feature = "test-tls"))]
 pub mod test_tls;
 pub mod transpile;
+mod webapi;
 
 pub use error::{Result, VaernError};
 pub use fetch::{FetchOptions, FetchResponse, execute_fetch};

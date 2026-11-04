@@ -807,6 +807,8 @@ impl QuickJsRuntime {
                     reason: format!("failed to register server stream chunk bridge: {err}"),
                 })?;
 
+            crate::webapi::register(&ctx, &globals)?;
+
             // Evaluate standard JavaScript bootstrap environment
             let bootstrap_js = r#"
                 const __timers = new Map();
@@ -853,15 +855,35 @@ impl QuickJsRuntime {
                     Promise.resolve().then(cb);
                 };
 
+                // QuickJS keeps only the frames in `stack`, so the name and
+                // message line is added here, as other runtimes print it.
+                function __formatError(err, depth) {
+                    const head = err.message ? `${err.name || 'Error'}: ${err.message}` : String(err.name || 'Error');
+                    const frames = typeof err.stack === 'string' ? err.stack.replace(/\n+$/, '') : '';
+                    let out = frames ? (frames.startsWith(head) ? frames : `${head}\n${frames}`) : head;
+                    if (err.cause !== undefined && depth < 8) {
+                        const cause = err.cause instanceof Error ? __formatError(err.cause, depth + 1) : __formatArg(err.cause);
+                        out += `\nCaused by: ${cause}`;
+                    }
+                    return out;
+                }
+
+                function __jsonReplacer(_key, value) {
+                    if (value instanceof Error) return `${value.name}: ${value.message}`;
+                    if (typeof value === 'bigint') return `${value}n`;
+                    return value;
+                }
+
                 function __formatArg(arg) {
                     if (typeof arg === 'string') return arg;
                     if (typeof arg === 'undefined') return 'undefined';
                     if (arg === null) return 'null';
                     if (typeof arg === 'symbol') return arg.toString();
                     if (typeof arg === 'bigint') return arg.toString() + 'n';
+                    if (arg instanceof Error) return __formatError(arg, 0);
                     if (typeof arg === 'object') {
                         try {
-                            return JSON.stringify(arg);
+                            return JSON.stringify(arg, __jsonReplacer);
                         } catch (_) {
                             return String(arg);
                         }
@@ -886,45 +908,101 @@ impl QuickJsRuntime {
                     },
                 };
 
-                // WHATWG TextEncoder & TextDecoder
+                // WHATWG TextEncoder & TextDecoder (UTF-8 only)
+                function __toBytes(input) {
+                    if (input === undefined || input === null) return new Uint8Array(0);
+                    if (input instanceof Uint8Array) return input;
+                    if (ArrayBuffer.isView(input)) return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+                    if (input instanceof ArrayBuffer) return new Uint8Array(input);
+                    throw new TypeError("TextDecoder.decode: expected an ArrayBuffer or a view of one");
+                }
+
+                function __latin1(bytes) {
+                    let out = "";
+                    for (let i = 0; i < bytes.length; i += 8192) {
+                        out += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+                    }
+                    return out;
+                }
+
                 class TextEncoder {
+                    get encoding() { return "utf-8"; }
                     encode(str = "") {
-                        const s = String(str);
-                        const utf8 = [];
-                        for (let i = 0; i < s.length; i++) {
-                            let charcode = s.charCodeAt(i);
-                            if (charcode < 0x80) utf8.push(charcode);
-                            else if (charcode < 0x800) {
-                                utf8.push(0xc0 | (charcode >> 6), 0x80 | (charcode & 0x3f));
-                            } else if (charcode < 0xd800 || charcode >= 0xe000) {
-                                utf8.push(0xe0 | (charcode >> 12), 0x80 | ((charcode >> 6) & 0x3f), 0x80 | (charcode & 0x3f));
-                            } else {
-                                i++;
-                                charcode = 0x10000 + (((charcode & 0x3ff) << 10) | (s.charCodeAt(i) & 0x3ff));
-                                utf8.push(0xf0 | (charcode >> 18), 0x80 | ((charcode >> 12) & 0x3f), 0x80 | ((charcode >> 6) & 0x3f), 0x80 | (charcode & 0x3f));
-                            }
-                        }
-                        return new Uint8Array(utf8);
+                        return __vaern_utf8_encode(String(str).toWellFormed());
                     }
                 }
                 globalThis.TextEncoder = TextEncoder;
 
                 class TextDecoder {
-                    decode(bytes) {
-                        if (!bytes) return "";
-                        const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-                        let str = "";
-                        for (let i = 0; i < u8.length; i++) {
-                            str += String.fromCharCode(u8[i]);
+                    constructor(label = "utf-8", options = {}) {
+                        const name = String(label).trim().toLowerCase();
+                        if (name !== "utf-8" && name !== "utf8" && name !== "unicode-1-1-utf-8") {
+                            throw new RangeError(`TextDecoder: unsupported encoding '${label}'; only utf-8 is available`);
                         }
-                        try {
-                            return decodeURIComponent(escape(str));
-                        } catch (_) {
-                            return str;
+                        this._fatal = Boolean(options.fatal);
+                        this._ignoreBOM = Boolean(options.ignoreBOM);
+                        this._pending = new Uint8Array(0);
+                        this._started = false;
+                    }
+                    get encoding() { return "utf-8"; }
+                    get fatal() { return this._fatal; }
+                    get ignoreBOM() { return this._ignoreBOM; }
+
+                    decode(input, options = {}) {
+                        const incoming = __toBytes(input);
+                        let bytes = incoming;
+                        if (this._pending.length) {
+                            bytes = new Uint8Array(this._pending.length + incoming.length);
+                            bytes.set(this._pending);
+                            bytes.set(incoming, this._pending.length);
                         }
+                        let end = bytes.length;
+                        if (options.stream) {
+                            // Hold back a sequence the next chunk may complete.
+                            for (let back = 1; back <= 3 && back <= bytes.length; back++) {
+                                const b = bytes[bytes.length - back];
+                                if ((b & 0xc0) === 0x80) continue;
+                                const need = b >= 0xf0 ? 4 : b >= 0xe0 ? 3 : b >= 0xc0 ? 2 : 1;
+                                if (need > back) end = bytes.length - back;
+                                break;
+                            }
+                        }
+                        this._pending = options.stream ? bytes.slice(end) : new Uint8Array(0);
+                        let head = bytes.subarray(0, end);
+                        if (!this._started && head.length) {
+                            this._started = true;
+                            if (!this._ignoreBOM && head[0] === 0xef && head[1] === 0xbb && head[2] === 0xbf) {
+                                head = head.subarray(3);
+                            }
+                        }
+                        const text = __vaern_utf8_decode(__latin1(head), this._fatal);
+                        if (!options.stream) this._started = false;
+                        return text;
                     }
                 }
                 globalThis.TextDecoder = TextDecoder;
+
+                // Reads a body stream to the end as one byte array, so text
+                // decoding never sees a code point split across chunks.
+                async function __readAllBytes(stream) {
+                    const reader = stream.getReader();
+                    const parts = [];
+                    let total = 0;
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        const part = typeof value === 'string' ? __vaern_utf8_encode(value.toWellFormed()) : __toBytes(value);
+                        parts.push(part);
+                        total += part.length;
+                    }
+                    const out = new Uint8Array(total);
+                    let offset = 0;
+                    for (const part of parts) {
+                        out.set(part, offset);
+                        offset += part.length;
+                    }
+                    return out;
+                }
 
                 // WHATWG URL & URLSearchParams
                 class URLSearchParams {
@@ -1221,18 +1299,7 @@ impl QuickJsRuntime {
                             return new TextDecoder().decode(this._bodyBytes);
                         }
                         if (this.body) {
-                            const reader = this.body.getReader();
-                            const chunks = [];
-                            while (true) {
-                                const { done, value } = await reader.read();
-                                if (done) break;
-                                if (typeof value === 'string') {
-                                    chunks.push(value);
-                                } else if (value instanceof Uint8Array) {
-                                    chunks.push(new TextDecoder().decode(value));
-                                }
-                            }
-                            return chunks.join("");
+                            return new TextDecoder().decode(await __readAllBytes(this.body));
                         }
                         return "";
                     }
@@ -1254,8 +1321,8 @@ impl QuickJsRuntime {
                             );
                         }
                         if (this.body) {
-                            const txt = await this.text();
-                            return new TextEncoder().encode(txt).buffer;
+                            const bytes = await __readAllBytes(this.body);
+                            return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
                         }
                         return new ArrayBuffer(0);
                     }
@@ -1319,18 +1386,7 @@ impl QuickJsRuntime {
                         }
                         this.bodyUsed = true;
                         if (this._isStream && this.body) {
-                            const reader = this.body.getReader();
-                            const chunks = [];
-                            while (true) {
-                                const { done, value } = await reader.read();
-                                if (done) break;
-                                if (typeof value === 'string') {
-                                    chunks.push(value);
-                                } else if (value instanceof Uint8Array) {
-                                    chunks.push(new TextDecoder().decode(value));
-                                }
-                            }
-                            return chunks.join("");
+                            return new TextDecoder().decode(await __readAllBytes(this.body));
                         }
                         if (this._bodyBytes) {
                             return new TextDecoder().decode(this._bodyBytes);
@@ -1349,8 +1405,8 @@ impl QuickJsRuntime {
                         }
                         this.bodyUsed = true;
                         if (this._isStream && this.body) {
-                            const txt = await this.text();
-                            return new TextEncoder().encode(txt).buffer;
+                            const bytes = await __readAllBytes(this.body);
+                            return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
                         }
                         if (this._bodyBuffer instanceof ArrayBuffer) {
                             return this._bodyBuffer;
@@ -2510,5 +2566,74 @@ mod tests {
         "#;
         let exit_code = runtime.eval("invalid_host.ts", code).unwrap();
         assert_eq!(exit_code, 0);
+    }
+
+    #[test]
+    fn test_stream_text_keeps_code_points_split_across_chunks() {
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        let code = r#"
+            const expected = "hé€\u{1F600}!";
+            const bytes = new TextEncoder().encode(expected);
+            const body = new ReadableStream({
+                start(c) {
+                    for (const b of bytes) c.enqueue(new Uint8Array([b]));
+                    c.close();
+                }
+            });
+            const text = await new Response(body).text();
+            process.exitCode = text === expected ? 0 : 1;
+        "#;
+        assert_eq!(runtime.eval("split_utf8.js", code).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_stream_array_buffer_keeps_binary_bytes() {
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        let code = r#"
+            const body = new ReadableStream({
+                start(c) {
+                    c.enqueue(new Uint8Array([0xff, 0x00]));
+                    c.enqueue(new Uint8Array([0xc3]));
+                    c.close();
+                }
+            });
+            const bytes = new Uint8Array(await new Response(body).arrayBuffer());
+            process.exitCode = bytes.join(",") === "255,0,195" ? 0 : 1;
+        "#;
+        assert_eq!(runtime.eval("binary_body.js", code).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_console_formats_errors_with_message_and_stack() {
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        let code = r#"
+            const out = __formatArg(new Error("boom", { cause: new TypeError("inner") }));
+            const lines = out.split("\n");
+            const nested = __formatArg({ err: new RangeError("deep"), n: 1n });
+            process.exitCode =
+                (lines[0] === "Error: boom" ? 0 : 1) |
+                (lines[1].includes("format.js:2:") ? 0 : 2) |
+                (out.includes("Caused by: TypeError: inner") ? 0 : 4) |
+                (nested === '{"err":"RangeError: deep","n":"1n"}' ? 0 : 8);
+        "#;
+        assert_eq!(runtime.eval("format.js", code).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_text_codec_follows_whatwg_utf8() {
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        let code = r#"
+            const replaced = new TextDecoder().decode(new Uint8Array([0xff, 0x41])) === "�A";
+            const bom = new TextDecoder().decode(new Uint8Array([0xef, 0xbb, 0xbf, 0x42])) === "B";
+            let fatal = false;
+            try {
+                new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array([0xc3]));
+            } catch (e) {
+                fatal = e instanceof TypeError;
+            }
+            const surrogate = new TextEncoder().encode("a\ud800").join(",") === "97,239,191,189";
+            process.exitCode = (replaced ? 0 : 1) | (bom ? 0 : 2) | (fatal ? 0 : 4) | (surrogate ? 0 : 8);
+        "#;
+        assert_eq!(runtime.eval("codec.js", code).unwrap(), 0);
     }
 }
