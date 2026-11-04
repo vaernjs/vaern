@@ -9,12 +9,20 @@ web or Node.js behaviour of the same name.
 - `vaern run <file>` runs `.js`, `.mjs` and `.ts` files as ES modules. Top-level
   `await` works.
 - `.ts` files have their types removed before they run. No type-checking is
-  done. The module is re-printed from its syntax tree, so line numbers in
-  stack traces and errors can differ from the `.ts` source when types span
-  several lines.
+  done. Removed types are overwritten with spaces, so line and column numbers
+  in stack traces and errors match the `.ts` source.
 - TypeScript constructs that emit runtime code are rejected with a
   `file:line:col` error: `enum`, `const enum`, `namespace`/`module` blocks and
   decorators.
+- Imports used only as types are removed, as TypeScript removes them, so a
+  module that exports nothing at runtime can still be imported for its types.
+- A module where types cannot be overwritten in place is re-printed from the
+  syntax tree instead. It runs the same code, but reported line numbers can
+  differ from the source. This applies to constructor parameter properties
+  (`constructor(private x: number)`), `import x = require(...)`, `export =`,
+  `export as namespace`, a `<T>value` type assertion that spans lines, and
+  any removal that would leave a line ending before `(`, `[`, a template,
+  `+`, `-` or `/`.
 
 ## Modules
 

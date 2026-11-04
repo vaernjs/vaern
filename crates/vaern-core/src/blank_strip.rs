@@ -6,15 +6,14 @@
 //! syntax by overwriting it with spaces in the original text instead. Line
 //! breaks survive, so every remaining token keeps its line and column.
 //!
-//! A blanked statement starts with `;`, so the code around it cannot merge
-//! across the gap under automatic semicolon insertion. Imports
+//! A blanked statement or class member starts with `;`, so the code around it
+//! cannot merge across the gap under automatic semicolon insertion. Imports
 //! used only as types are removed the way TypeScript removes them, by
 //! checking whether a binding is ever referenced as a value.
 //!
-//! `strip` returns `None` for constructs it does not rewrite (`import x =
-//! require()`, `export =`) and for blanks that could change how the code
-//! parses. TypeScript-only class member syntax is not rewritten here, so a
-//! class that uses it fails the caller's JavaScript parse check instead. The caller then re-prints the module instead,
+//! `strip` returns `None` for constructs it does not rewrite (parameter
+//! properties, `import x = require()`, `export =`) and for blanks that could
+//! change how the code parses. The caller then re-prints the module instead,
 //! which runs correctly but loses line fidelity.
 
 use std::collections::HashSet;
@@ -22,6 +21,17 @@ use swc_atoms::Atom;
 use swc_common::{BytePos, Span, Spanned};
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
+
+/// Modifier keywords that exist only in TypeScript class members.
+const TS_MEMBER_MODIFIERS: &[&str] = &[
+    "public",
+    "private",
+    "protected",
+    "readonly",
+    "override",
+    "declare",
+    "abstract",
+];
 
 /// Removes TypeScript syntax from `source`, keeping every line break in place.
 ///
@@ -186,6 +196,51 @@ impl Blanker<'_> {
         }
         match self.src.get(pos) {
             Some(b'?' | b'!') => self.ranges.push((pos, pos + 1)),
+            _ => self.unsupported = true,
+        }
+    }
+
+    /// Blanks TypeScript-only modifier keywords between `lo` and `hi`.
+    fn blank_modifiers(&mut self, lo: BytePos, hi: BytePos) {
+        let (lo, hi) = (self.off(lo), self.off(hi));
+        let mut pos = lo;
+        while pos < hi {
+            let start = pos;
+            while pos < hi && self.src.get(pos).is_some_and(|b| b.is_ascii_alphabetic()) {
+                pos += 1;
+            }
+            if pos == start {
+                pos += 1;
+                continue;
+            }
+            let word = self.src.get(start..pos).unwrap_or_default();
+            if TS_MEMBER_MODIFIERS.iter().any(|m| m.as_bytes() == word) {
+                self.ranges.push((start, pos));
+            }
+        }
+    }
+
+    /// Blanks an `abstract` keyword that starts at, or directly precedes, `lo`.
+    fn blank_abstract_keyword(&mut self, lo: BytePos) {
+        const WORD: &[u8] = b"abstract";
+        let lo = self.off(lo);
+        if self.src.get(lo..lo + WORD.len()) == Some(WORD) {
+            self.ranges.push((lo, lo + WORD.len()));
+            return;
+        }
+        let mut end = lo;
+        while end > 0
+            && self
+                .src
+                .get(end - 1)
+                .is_some_and(|b| b.is_ascii_whitespace())
+        {
+            end -= 1;
+        }
+        match end.checked_sub(WORD.len()) {
+            Some(start) if self.src.get(start..end) == Some(WORD) => {
+                self.ranges.push((start, end));
+            }
             _ => self.unsupported = true,
         }
     }
@@ -391,5 +446,90 @@ impl Visit for Blanker<'_> {
         f.type_params.visit_with(self);
         f.return_type.visit_with(self);
         f.body.visit_with(self);
+    }
+
+    fn visit_class(&mut self, c: &Class) {
+        if c.is_abstract {
+            self.blank_abstract_keyword(c.span.lo);
+        }
+        if let (Some(first), Some(last)) = (c.implements.first(), c.implements.last()) {
+            const WORD: &[u8] = b"implements";
+            let lo = self.off(first.span.lo);
+            let start = self
+                .src
+                .get(..lo)
+                .and_then(|head| head.windows(WORD.len()).rposition(|w| w == WORD));
+            match start {
+                Some(start) => self.ranges.push((start, self.off(last.span.hi))),
+                None => self.unsupported = true,
+            }
+        }
+        c.super_class.visit_with(self);
+        c.type_params.visit_with(self);
+        c.super_type_params.visit_with(self);
+        c.body.visit_with(self);
+    }
+
+    fn visit_class_member(&mut self, member: &ClassMember) {
+        match member {
+            ClassMember::TsIndexSignature(s) => self.blank_item(s.span),
+            ClassMember::ClassProp(p) if p.declare || p.is_abstract => self.blank_item(p.span),
+            ClassMember::Method(m) if m.is_abstract || m.function.body.is_none() => {
+                self.blank_item(m.span)
+            }
+            ClassMember::PrivateMethod(m) if m.is_abstract || m.function.body.is_none() => {
+                self.blank_item(m.span)
+            }
+            ClassMember::Constructor(c) if c.body.is_none() => self.blank_item(c.span),
+            ClassMember::Constructor(c) => {
+                if c.params
+                    .iter()
+                    .any(|p| matches!(p, ParamOrTsParamProp::TsParamProp(_)))
+                {
+                    self.unsupported = true;
+                }
+                self.blank_modifiers(c.span.lo, c.key.span().lo);
+                c.params.visit_with(self);
+                c.body.visit_with(self);
+            }
+            ClassMember::ClassProp(p) => {
+                self.blank_modifiers(p.span.lo, p.key.span().lo);
+                if p.is_optional || p.definite {
+                    self.blank_marker_after(p.key.span().hi);
+                }
+                p.key.visit_with(self);
+                p.type_ann.visit_with(self);
+                p.value.visit_with(self);
+            }
+            ClassMember::PrivateProp(p) => {
+                self.blank_modifiers(p.span.lo, p.key.span.lo);
+                if p.is_optional || p.definite {
+                    self.blank_marker_after(p.key.span.hi);
+                }
+                p.type_ann.visit_with(self);
+                p.value.visit_with(self);
+            }
+            ClassMember::Method(m) => {
+                self.blank_modifiers(m.span.lo, m.key.span().lo);
+                if m.is_optional {
+                    self.blank_marker_after(m.key.span().hi);
+                }
+                m.key.visit_with(self);
+                m.function.visit_with(self);
+            }
+            ClassMember::PrivateMethod(m) => {
+                self.blank_modifiers(m.span.lo, m.key.span.lo);
+                if m.is_optional {
+                    self.blank_marker_after(m.key.span.hi);
+                }
+                m.function.visit_with(self);
+            }
+            ClassMember::AutoAccessor(a) => {
+                self.blank_modifiers(a.span.lo, a.key.span().lo);
+                a.type_ann.visit_with(self);
+                a.value.visit_with(self);
+            }
+            _ => member.visit_children_with(self),
+        }
     }
 }

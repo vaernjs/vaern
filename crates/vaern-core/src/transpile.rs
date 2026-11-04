@@ -345,6 +345,27 @@ mod tests {
     }
 
     #[test]
+    fn test_class_members_keep_line_numbers() {
+        let ts = "abstract class Base<T> implements Iterable<T>,\n    Disposable {\n  private readonly items: T[] = [];\n  declare tag: string;\n  [key: string]: unknown;\n  count?: number;\n  ready!: boolean;\n  abstract size(): number;\n  add(item: T): void;\n  add(item: T, again?: boolean): void {\n    this.items.push(item);\n  }\n  protected override toString(this: Base<T>): string {\n    return `${this.items.length}`;\n  }\n}\nexport { Base };\n";
+        let js = SwcTranspiler.transpile("class.ts", ts).unwrap();
+        assert_same_position(ts, &js, "this.items.push");
+        assert_same_position(ts, &js, "return `");
+        for word in [
+            "abstract",
+            "implements",
+            "private",
+            "readonly",
+            "declare",
+            "protected",
+            "override",
+            "?:",
+            "!:",
+        ] {
+            assert!(!js.contains(word), "{word} left in:\n{js}");
+        }
+    }
+
+    #[test]
     fn test_type_only_imports_are_removed() {
         let ts = "import type { Shape } from \"./shape.ts\";\nimport { type Point, area, unused } from \"./geo.ts\";\nimport Default, * as ns from \"./lib.ts\";\nexport type { Shape };\ninterface Local {}\nexport { Local, area };\nconst p: Point = { x: 1 };\nconsole.log(area(p), ns.version);\n";
         let js = SwcTranspiler.transpile("imports.ts", ts).unwrap();
