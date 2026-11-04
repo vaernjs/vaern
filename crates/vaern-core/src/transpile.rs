@@ -4,6 +4,11 @@
 //! `as` expressions, type annotations) to emit valid standard ECMAScript code.
 //! It intentionally rejects constructs that cannot be erased without changing runtime
 //! behaviour (enums, const enums, namespaces, decorators) with descriptive errors.
+//!
+//! Types are removed in place by `blank_strip`, so stack traces and error
+//! locations match the `.ts` file. Modules that path cannot rewrite safely are
+//! re-printed from the stripped AST instead, which runs the same code with
+//! shifted line numbers.
 
 use crate::error::{Result, VaernError};
 use swc_common::{FileName, GLOBALS, Globals, Mark, SourceMap, Spanned, sync::Lrc};
@@ -69,15 +74,23 @@ impl Transpiler for SwcTranspiler {
                 return Err(err);
             }
 
-            // Apply pure TypeScript type-stripping
+            if let Some(js) = crate::blank_strip::strip(&module, source, fm.start_pos)
+                && parses_as_javascript(&cm, filename, &js)
+            {
+                return Ok(js);
+            }
+
+            // Re-print from the AST when the in-place path declined the module.
             let unresolved_mark = Mark::new();
             let top_level_mark = Mark::new();
             let mut program = Program::Module(module);
             let mut pass = strip(unresolved_mark, top_level_mark);
             pass.process(&mut program);
-            let module = match program {
-                Program::Module(m) => m,
-                Program::Script(_) => unreachable!(),
+            let Program::Module(module) = program else {
+                return Err(VaernError::Execution {
+                    file: filename.to_string(),
+                    message: "type stripping returned a script instead of a module".to_string(),
+                });
             };
 
             // Emit stripped ECMAScript
@@ -103,6 +116,23 @@ impl Transpiler for SwcTranspiler {
             })
         })
     }
+}
+
+/// Checks that in-place stripping left valid JavaScript. A miss here means a
+/// construct `blank_strip` did not account for, and the caller re-prints.
+fn parses_as_javascript(cm: &Lrc<SourceMap>, filename: &str, js: &str) -> bool {
+    let fm = cm.new_source_file(
+        FileName::Custom(format!("{filename} (stripped)")).into(),
+        js.to_string(),
+    );
+    let lexer = Lexer::new(
+        Syntax::Es(Default::default()),
+        EsVersion::latest(),
+        StringInput::from(&*fm),
+        None,
+    );
+    let mut parser = Parser::new_from(lexer);
+    parser.parse_module().is_ok() && parser.take_errors().is_empty()
 }
 
 /// AST visitor that detects and flags unsupported TypeScript syntax for M1a.
@@ -177,7 +207,7 @@ mod tests {
         let js = transpiler.transpile("types.ts", ts).unwrap();
         assert!(!js.contains("interface"));
         assert!(!js.contains("type Bar"));
-        assert!(js.contains("const x = 'hello';") || js.contains("const x = \"hello\";"));
+        assert!(js.contains("const x      = 'hello';"), "{js}");
     }
 
     #[test]
@@ -187,7 +217,7 @@ mod tests {
         let js = transpiler.transpile("generics.ts", ts).unwrap();
         assert!(!js.contains("<T>"));
         assert!(!js.contains("as T"));
-        assert!(js.contains("function id(x)"));
+        assert!(js.contains("function id   (x   )"), "{js}");
     }
 
     #[test]
@@ -273,5 +303,74 @@ mod tests {
             }
             _ => panic!("expected UnsupportedFeature for decorator"),
         }
+    }
+
+    /// Line and 1-based column of the first occurrence of `needle`.
+    fn position(text: &str, needle: &str) -> (usize, usize) {
+        let at = text.find(needle).expect("needle present");
+        let before = &text[..at];
+        let line = before.matches('\n').count() + 1;
+        let col = at - before.rfind('\n').map_or(0, |i| i + 1) + 1;
+        (line, col)
+    }
+
+    fn assert_same_position(ts: &str, js: &str, needle: &str) {
+        assert_eq!(
+            position(ts, needle),
+            position(js, needle),
+            "{needle} moved:\n{js}"
+        );
+    }
+
+    #[test]
+    fn test_multiline_types_keep_line_numbers() {
+        let ts = "interface Config {\n  name: string;\n  retries: number;\n}\n\ntype Handler = (\n  input: string,\n) => void;\n\nfunction fail(config: Config): never {\n  throw new Error(config.name);\n}\nfail({ name: \"x\", retries: 1 });\n";
+        let js = SwcTranspiler.transpile("lines.ts", ts).unwrap();
+        assert_eq!(ts.lines().count(), js.lines().count(), "{js}");
+        assert_same_position(ts, &js, "throw new Error");
+        assert_same_position(ts, &js, "fail({");
+        assert!(!js.contains("interface") && !js.contains("Handler"), "{js}");
+    }
+
+    #[test]
+    fn test_multiline_expression_types_keep_columns() {
+        let ts = "const items = [1, 2, 3] as\n  readonly number[];\nconst first = items[0]!;\nconst pick = <T,>(\n  list: readonly T[],\n): T | undefined => list[0];\nconsole.log(pick<number>(items), first satisfies number);\n";
+        let js = SwcTranspiler.transpile("exprs.ts", ts).unwrap();
+        assert_same_position(ts, &js, "console.log");
+        assert_same_position(ts, &js, "list[0]");
+        assert!(
+            !js.contains("readonly") && !js.contains("satisfies") && !js.contains('!'),
+            "{js}"
+        );
+    }
+
+    #[test]
+    fn test_type_only_imports_are_removed() {
+        let ts = "import type { Shape } from \"./shape.ts\";\nimport { type Point, area, unused } from \"./geo.ts\";\nimport Default, * as ns from \"./lib.ts\";\nexport type { Shape };\ninterface Local {}\nexport { Local, area };\nconst p: Point = { x: 1 };\nconsole.log(area(p), ns.version);\n";
+        let js = SwcTranspiler.transpile("imports.ts", ts).unwrap();
+        assert_same_position(ts, &js, "console.log");
+        assert!(
+            !js.contains("Shape") && !js.contains("Point") && !js.contains("unused"),
+            "{js}"
+        );
+        assert!(!js.contains("Default") && !js.contains("Local"), "{js}");
+        assert!(js.contains("area") && js.contains("* as ns"), "{js}");
+    }
+
+    #[test]
+    fn test_blanked_statement_does_not_join_neighbours() {
+        let ts = "let total = 1\ninterface Gap {}\n(globalThis as any).total = total\n";
+        let js = SwcTranspiler.transpile("asi.ts", ts).unwrap();
+        assert!(
+            js.lines().nth(1).is_some_and(|l| l.starts_with(';')),
+            "{js}"
+        );
+    }
+
+    #[test]
+    fn test_parameter_properties_still_transpile() {
+        let ts = "class P {\n  constructor(private x: number) {}\n}\nnew P(1);\n";
+        let js = SwcTranspiler.transpile("params.ts", ts).unwrap();
+        assert!(js.contains("this.x = x"), "{js}");
     }
 }

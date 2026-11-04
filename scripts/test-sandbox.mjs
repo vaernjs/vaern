@@ -120,6 +120,14 @@ const cases = [
     stderr: "",
   },
   {
+    name: "multiline_stack.ts reports the source line under multi-line types",
+    args: ["run", "multiline_stack.ts"],
+    code: 1,
+    stdout: "at fail (multiline_stack.ts:12:29)\n",
+    stderrIncludes: ["Error: failed uncaught", "multiline_stack.ts:12:29", "multiline_stack.ts:21:1"],
+    stderrExcludes: ["panicked"],
+  },
+  {
     name: "heap_limit.js stops at the heap limit with a located error",
     args: ["run", "heap_limit.js"],
     code: 1,
