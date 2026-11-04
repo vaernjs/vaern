@@ -37,10 +37,10 @@ fs.cpSync(path.join(sandbox, "resolve", "packages"), installed, { recursive: tru
 
 const cases = [
   {
-    name: "--version reports 0.0.5",
+    name: "--version reports 0.0.6",
     args: ["--version"],
     code: 0,
-    stdout: "vaern 0.0.5\n",
+    stdout: "vaern 0.0.6\n",
   },
   {
     name: "hello.ts strips types and prints",

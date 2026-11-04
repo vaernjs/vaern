@@ -8,10 +8,10 @@ Vaern is an agent-native JavaScript and TypeScript runtime. It is being built so
 
 ## Status
 
-v0.0.5, an early native runtime. `@vaernjs/vaern` on npm ships the `vaern` binary for Linux, macOS and Windows.
-It runs JavaScript and TypeScript files with `console`, timers, `fetch`, an HTTP `serve()`, `process.argv`, `process.env` and `process.exit()`.
-TypeScript enums, namespaces and decorators are rejected with a `file:line:col` error, because they emit runtime code that type stripping cannot produce.
-Not implemented yet: `node:*` modules, capability sandboxing (`vaern.toml`), `agent()` and `tool()`.
+v0.0.6, an early native runtime. `@vaernjs/vaern` on npm ships the `vaern` binary for Linux, macOS and Windows.
+It runs JavaScript and TypeScript files with `console`, timers, `fetch`, an HTTP `serve()`, whole-file reads and writes from `vaern:fs`, `process.argv`, `process.env` and `process.exit()`, and imports ES module packages already installed in `node_modules`.
+TypeScript keeps its line and column numbers in stack traces. Enums, namespaces and decorators are rejected with a `file:line:col` error, because they emit runtime code that type stripping cannot produce.
+Not implemented yet: `node:*` modules, CommonJS packages, capability sandboxing (`vaern.toml`), `agent()` and `tool()`.
 [docs/subset.md](./docs/subset.md) lists every API that works, its limits, and what is absent.
 
 ## Install

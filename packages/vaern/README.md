@@ -6,24 +6,26 @@
 
 ---
 
-> ### Status: v0.0.5, early native runtime
+> ### Status: v0.0.6, early native runtime
 >
 > This release ships the native `vaern` binary for Linux, macOS and Windows.
 > The API surface is small and will change before v1.0.
 
 **Works today**
 
-- `vaern run <file>`: JavaScript and TypeScript, with types stripped at load time
-- Relative ES module imports
+- `vaern run <file>`: JavaScript and TypeScript, with types stripped at load time and line numbers kept
+- Relative ES module imports, and ES module packages already installed in `node_modules`
 - `console`, `setTimeout` / `setInterval`, `queueMicrotask`
 - `process.argv`, `process.env`, `process.exit()`
 - `fetch` with `Headers`, `Response`, `AbortController`, redirects and timeouts (hyper and rustls)
+- `URL`, `URLSearchParams`, `TextEncoder` and `TextDecoder`
 - `serve()` from `vaern:http`, an HTTP server with Web-standard `Request` / `Response` and streamed bodies
+- `readFile`, `writeFile` and `appendFile` from `vaern:fs`
 - Uncaught exceptions, unhandled rejections and throwing timers exit non-zero with a `file:line:col` location
 
 **Not implemented yet**
 
-- `node:*` modules and npm package imports
+- `node:*` modules, CommonJS packages and downloading packages
 - Capability sandboxing (`vaern.toml`)
 - `agent()`, `tool()`, MCP, budgets and `vaern replay`
 

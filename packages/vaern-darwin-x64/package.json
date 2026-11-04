@@ -1,6 +1,6 @@
 {
   "name": "@vaernjs/vaern-darwin-x64",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "description": "The macOS x86_64 binary for @vaernjs/vaern, the agent-native JavaScript & TypeScript runtime.",
   "license": "MIT",
   "author": {
