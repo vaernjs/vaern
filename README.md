@@ -12,6 +12,7 @@ v0.0.5, an early native runtime. `@vaernjs/vaern` on npm ships the `vaern` binar
 It runs JavaScript and TypeScript files with `console`, timers, `fetch`, an HTTP `serve()`, `process.argv`, `process.env` and `process.exit()`.
 TypeScript enums, namespaces and decorators are rejected with a `file:line:col` error, because they emit runtime code that type stripping cannot produce.
 Not implemented yet: `node:*` modules, capability sandboxing (`vaern.toml`), `agent()` and `tool()`.
+[docs/subset.md](./docs/subset.md) lists every API that works, its limits, and what is absent.
 
 ## Install
 
