@@ -1004,57 +1004,143 @@ impl QuickJsRuntime {
                     return out;
                 }
 
-                // WHATWG URL & URLSearchParams
+                // WHATWG URL & URLSearchParams, parsed by the `url` crate
                 class URLSearchParams {
                     constructor(init = "") {
-                        this._params = new Map();
-                        if (typeof init === 'string') {
-                            const str = init.startsWith('?') ? init.slice(1) : init;
-                            if (str) {
-                                for (const part of str.split('&')) {
-                                    const [k, v] = part.split('=');
-                                    if (k) this.set(decodeURIComponent(k), v ? decodeURIComponent(v) : "");
+                        this._list = [];
+                        this._url = null;
+                        if (init instanceof URLSearchParams) {
+                            this._list = init._list.map(([k, v]) => [k, v]);
+                        } else if (init !== null && typeof init === 'object') {
+                            if (typeof init[Symbol.iterator] === 'function') {
+                                for (const pair of init) {
+                                    const entry = Array.from(pair);
+                                    if (entry.length !== 2) {
+                                        throw new TypeError("URLSearchParams: each pair needs exactly a name and a value");
+                                    }
+                                    this._list.push([String(entry[0]), String(entry[1])]);
                                 }
+                            } else {
+                                for (const key of Object.keys(init)) this._list.push([key, String(init[key])]);
                             }
+                        } else {
+                            const str = String(init);
+                            this._list = __vaern_form_parse(str.startsWith('?') ? str.slice(1) : str);
                         }
                     }
+                    _reset(search) {
+                        this._list = __vaern_form_parse(search.startsWith('?') ? search.slice(1) : search);
+                    }
+                    _update() {
+                        if (this._url) this._url._apply('search', this.toString(), false);
+                    }
+                    get size() { return this._list.length; }
+                    append(name, value) {
+                        this._list.push([String(name), String(value)]);
+                        this._update();
+                    }
+                    delete(name, value) {
+                        const n = String(name);
+                        this._list = this._list.filter(([k, v]) => k !== n || (value !== undefined && v !== String(value)));
+                        this._update();
+                    }
                     get(name) {
-                        return this._params.has(name) ? this._params.get(name) : null;
+                        const hit = this._list.find(([k]) => k === String(name));
+                        return hit ? hit[1] : null;
+                    }
+                    getAll(name) {
+                        return this._list.filter(([k]) => k === String(name)).map(([, v]) => v);
+                    }
+                    has(name, value) {
+                        const n = String(name);
+                        return this._list.some(([k, v]) => k === n && (value === undefined || v === String(value)));
                     }
                     set(name, value) {
-                        this._params.set(name, String(value));
+                        const n = String(name);
+                        const at = this._list.findIndex(([k]) => k === n);
+                        if (at === -1) {
+                            this._list.push([n, String(value)]);
+                        } else {
+                            this._list[at] = [n, String(value)];
+                            this._list = this._list.filter(([k], i) => k !== n || i <= at);
+                        }
+                        this._update();
                     }
-                    has(name) {
-                        return this._params.has(name);
+                    sort() {
+                        this._list = this._list
+                            .map((pair, i) => [pair, i])
+                            .sort(([a, i], [b, j]) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : i - j))
+                            .map(([pair]) => pair);
+                        this._update();
                     }
+                    forEach(callback, thisArg) {
+                        for (const [k, v] of this._list) callback.call(thisArg, v, k, this);
+                    }
+                    *entries() { for (const [k, v] of this._list) yield [k, v]; }
+                    *keys() { for (const [k] of this._list) yield k; }
+                    *values() { for (const [, v] of this._list) yield v; }
+                    [Symbol.iterator]() { return this.entries(); }
+                    toString() { return __vaern_form_serialize(this._list); }
                 }
                 globalThis.URLSearchParams = URLSearchParams;
 
+                function __parseUrl(input, base) {
+                    return base === undefined ? __vaern_url_parse(String(input)) : __vaern_url_parse(String(input), String(base));
+                }
+
                 class URL {
                     constructor(input, base) {
-                        let full = String(input);
-                        if (base && !full.includes("://")) {
-                            const b = String(base).endsWith('/') ? String(base).slice(0, -1) : String(base);
-                            const p = full.startsWith('/') ? full : '/' + full;
-                            full = b + p;
-                        }
-                        const m = full.match(/^([a-zA-Z]+:)\/\/([^/:]+)(?::(\d+))?(\/[^?#]*)?(\?[^#]*)?(#.*)?$/);
-                        if (!m) {
+                        const parts = __parseUrl(input, base);
+                        if (!parts) {
                             throw new TypeError(`Invalid URL: ${input}`);
                         }
-                        this.protocol = m[1];
-                        this.hostname = m[2];
-                        this.port = m[3] || "";
-                        this.host = this.port ? `${this.hostname}:${this.port}` : this.hostname;
-                        this.pathname = m[4] || "/";
-                        this.search = m[5] || "";
-                        this.hash = m[6] || "";
-                        this.href = `${this.protocol}//${this.host}${this.pathname}${this.search}${this.hash}`;
-                        this.searchParams = new URLSearchParams(this.search);
+                        this._parts = parts;
+                        this._params = new URLSearchParams(parts.search);
+                        this._params._url = this;
                     }
-                    toString() {
-                        return this.href;
+                    static canParse(input, base) {
+                        return Boolean(__parseUrl(input, base));
                     }
+                    static parse(input, base) {
+                        try {
+                            return new URL(input, base);
+                        } catch (_) {
+                            return null;
+                        }
+                    }
+                    _apply(part, value, resetParams) {
+                        const parts = __vaern_url_set(this._parts.href, part, String(value));
+                        if (!parts) {
+                            if (part === 'href') throw new TypeError(`Invalid URL: ${value}`);
+                            return;
+                        }
+                        this._parts = parts;
+                        if (resetParams) this._params._reset(parts.search);
+                    }
+                    get href() { return this._parts.href; }
+                    set href(v) { this._apply('href', v, true); }
+                    get origin() { return this._parts.origin; }
+                    get protocol() { return this._parts.protocol; }
+                    set protocol(v) { this._apply('protocol', v, false); }
+                    get username() { return this._parts.username; }
+                    set username(v) { this._apply('username', v, false); }
+                    get password() { return this._parts.password; }
+                    set password(v) { this._apply('password', v, false); }
+                    get host() { return this._parts.host; }
+                    set host(v) { this._apply('host', v, false); }
+                    get hostname() { return this._parts.hostname; }
+                    set hostname(v) { this._apply('hostname', v, false); }
+                    get port() { return this._parts.port; }
+                    set port(v) { this._apply('port', v, false); }
+                    get pathname() { return this._parts.pathname; }
+                    set pathname(v) { this._apply('pathname', v, false); }
+                    get search() { return this._parts.search; }
+                    set search(v) { this._apply('search', v, true); }
+                    get hash() { return this._parts.hash; }
+                    set hash(v) { this._apply('hash', v, false); }
+                    get searchParams() { return this._params; }
+                    toString() { return this._parts.href; }
+                    toJSON() { return this._parts.href; }
                 }
                 globalThis.URL = URL;
 
@@ -1498,6 +1584,9 @@ impl QuickJsRuntime {
                 globalThis.fetch = async (input, init = {}) => {
                     const url = typeof input === 'string' ? input : String(input);
                     const method = String(init.method || "GET").toUpperCase();
+                    if (init.redirect !== undefined && init.redirect !== 'follow') {
+                        throw new TypeError(`fetch: redirect '${init.redirect}' is not supported; redirects are always followed (up to 20 hops)`);
+                    }
 
                     const headersList = [];
                     if (init.headers) {
@@ -2635,5 +2724,40 @@ mod tests {
             process.exitCode = (replaced ? 0 : 1) | (bom ? 0 : 2) | (fatal ? 0 : 4) | (surrogate ? 0 : 8);
         "#;
         assert_eq!(runtime.eval("codec.js", code).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_url_follows_whatwg_parser() {
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        let code = r#"
+            const auth = new URL("https://user:pw@example.com:8443/a/../b");
+            const v6 = new URL("http://[::1]:3000/x");
+            const rel = new URL("../up?q=a b", "https://example.com/dir/sub/page");
+            const u = new URL("https://example.com/?tag=a");
+            u.searchParams.append("q", "x y");
+            process.exitCode =
+                (auth.username === "user" && auth.password === "pw" && auth.pathname === "/b" ? 0 : 1) |
+                (v6.hostname === "[::1]" && v6.port === "3000" ? 0 : 2) |
+                (rel.href === "https://example.com/dir/up?q=a%20b" ? 0 : 4) |
+                (u.href === "https://example.com/?tag=a&q=x+y" ? 0 : 8);
+        "#;
+        assert_eq!(runtime.eval("url.js", code).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_fetch_rejects_unsupported_redirect_modes() {
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        let code = r#"
+            let rejected = 0;
+            for (const redirect of ["manual", "error"]) {
+                try {
+                    await fetch("http://127.0.0.1:9/", { redirect });
+                } catch (err) {
+                    if (err instanceof TypeError && err.message.includes(redirect)) rejected++;
+                }
+            }
+            process.exitCode = rejected === 2 ? 0 : 1;
+        "#;
+        assert_eq!(runtime.eval("redirect_mode.js", code).unwrap(), 0);
     }
 }

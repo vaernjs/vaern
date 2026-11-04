@@ -104,6 +104,22 @@ const cases = [
     stderr: "",
   },
   {
+    name: "url_subset.js parses URLs the way the WHATWG parser does",
+    args: ["run", "url_subset.js"],
+    code: 0,
+    stdout:
+      "user p%40ss example.com:8443 /b ?x=1 #top\n" +
+      "[::1] 3000 http://[::1]:3000\n" +
+      "https://example.com/dir/up?q=a%20b\n" +
+      "https://example.com/%7Efoo\n" +
+      "?tag=b&q=x+y%26z b 2\n" +
+      "v https://example.com/?k=v\n" +
+      "https://example.com/new%20path?k=v\n" +
+      "false true\n" +
+      "a=1&b=two+words\n",
+    stderr: "",
+  },
+  {
     name: "heap_limit.js stops at the heap limit with a located error",
     args: ["run", "heap_limit.js"],
     code: 1,
