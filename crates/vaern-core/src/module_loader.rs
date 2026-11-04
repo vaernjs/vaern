@@ -388,3 +388,215 @@ fn strip_verbatim(path: PathBuf) -> PathBuf {
         None => path,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Writes `files` (relative path, contents) under a new temporary root.
+    fn tree(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        for (rel, contents) in files {
+            let path = root.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        root
+    }
+
+    fn resolve_from(root: &tempfile::TempDir, importer: &str, specifier: &str) -> Result<PathBuf> {
+        FsModuleLoader.resolve(specifier, &root.path().join(importer))
+    }
+
+    fn real(root: &tempfile::TempDir, rel: &str) -> PathBuf {
+        strip_verbatim(std::fs::canonicalize(root.path().join(rel)).unwrap())
+    }
+
+    fn reason_and_tried(err: VaernError) -> (String, Vec<String>) {
+        match err {
+            VaernError::ModuleResolution { reason, tried, .. } => (reason, tried),
+            other => panic!("expected a resolution error, got {other}"),
+        }
+    }
+
+    #[test]
+    fn test_nearest_node_modules_wins_while_walking_up() {
+        let root = tree(&[
+            ("app/src/main.js", ""),
+            ("node_modules/pkg/package.json", r#"{"module": "outer.js"}"#),
+            ("node_modules/pkg/outer.js", ""),
+            (
+                "app/node_modules/pkg/package.json",
+                r#"{"module": "./inner.js"}"#,
+            ),
+            ("app/node_modules/pkg/inner.js", ""),
+            (
+                "node_modules/other/package.json",
+                r#"{"type": "module", "main": "lib/index.js"}"#,
+            ),
+            ("node_modules/other/lib/index.js", ""),
+        ]);
+        assert_eq!(
+            resolve_from(&root, "app/src/main.js", "pkg").unwrap(),
+            real(&root, "app/node_modules/pkg/inner.js")
+        );
+        assert_eq!(
+            resolve_from(&root, "app/src/main.js", "other").unwrap(),
+            real(&root, "node_modules/other/lib/index.js")
+        );
+    }
+
+    #[test]
+    fn test_exports_conditions_follow_declaration_order() {
+        let root = tree(&[
+            ("main.js", ""),
+            (
+                "node_modules/cond/package.json",
+                r#"{"exports": {"node": "./node.cjs", "require": "./req.cjs",
+                    "import": {"types": "./x.d.ts", "default": "./esm.js"},
+                    "default": "./fallback.js"}}"#,
+            ),
+            ("node_modules/cond/esm.js", ""),
+            (
+                "node_modules/vaern-first/package.json",
+                r#"{"exports": {"default": "./d.js", "vaern": "./v.js"}}"#,
+            ),
+            ("node_modules/vaern-first/d.js", ""),
+            (
+                "node_modules/str/package.json",
+                r#"{"exports": "./entry.ts"}"#,
+            ),
+            ("node_modules/str/entry.ts", ""),
+        ]);
+        assert_eq!(
+            resolve_from(&root, "main.js", "cond").unwrap(),
+            real(&root, "node_modules/cond/esm.js")
+        );
+        // "default" comes first in that package, so it wins over "vaern".
+        assert_eq!(
+            resolve_from(&root, "main.js", "vaern-first").unwrap(),
+            real(&root, "node_modules/vaern-first/d.js")
+        );
+        assert_eq!(
+            resolve_from(&root, "main.js", "str").unwrap(),
+            real(&root, "node_modules/str/entry.ts")
+        );
+    }
+
+    #[test]
+    fn test_exports_subpaths_patterns_and_refusals() {
+        let root = tree(&[
+            ("main.js", ""),
+            (
+                "node_modules/@scope/kit/package.json",
+                r#"{"exports": {".": "./index.js", "./util": {"import": "./src/util.js"},
+                    "./features/*.js": "./src/features/*.js", "./features/secret.js": null,
+                    "./escape": "./../outside.js", "./cjs": {"require": "./c.cjs"}}}"#,
+            ),
+            ("node_modules/@scope/kit/index.js", ""),
+            ("node_modules/@scope/kit/src/util.js", ""),
+            ("node_modules/@scope/kit/src/features/a/b.js", ""),
+            ("node_modules/@scope/kit/src/hidden.js", ""),
+        ]);
+        assert_eq!(
+            resolve_from(&root, "main.js", "@scope/kit").unwrap(),
+            real(&root, "node_modules/@scope/kit/index.js")
+        );
+        assert_eq!(
+            resolve_from(&root, "main.js", "@scope/kit/util").unwrap(),
+            real(&root, "node_modules/@scope/kit/src/util.js")
+        );
+        assert_eq!(
+            resolve_from(&root, "main.js", "@scope/kit/features/a/b.js").unwrap(),
+            real(&root, "node_modules/@scope/kit/src/features/a/b.js")
+        );
+        for (specifier, expected) in [
+            ("@scope/kit/features/secret.js", "explicitly not exported"),
+            ("@scope/kit/src/hidden.js", "is not exported"),
+            ("@scope/kit/escape", "leaves the package directory"),
+            ("@scope/kit/cjs", "no export condition matches"),
+        ] {
+            let err = resolve_from(&root, "main.js", specifier).unwrap_err();
+            let (reason, _) = reason_and_tried(err);
+            assert!(reason.contains(expected), "{specifier}: {reason}");
+        }
+    }
+
+    #[test]
+    fn test_packages_without_exports_need_an_es_module_entry() {
+        let root = tree(&[
+            ("main.js", ""),
+            (
+                "node_modules/legacy/package.json",
+                r#"{"main": "index.js"}"#,
+            ),
+            ("node_modules/legacy/index.js", ""),
+            ("node_modules/legacy/esm/part.js", ""),
+        ]);
+        let (reason, tried) =
+            reason_and_tried(resolve_from(&root, "main.js", "legacy").unwrap_err());
+        assert!(reason.contains("no ES module entry point"), "{reason}");
+        assert_eq!(tried.len(), 3);
+        assert_eq!(
+            resolve_from(&root, "main.js", "legacy/esm/part.js").unwrap(),
+            real(&root, "node_modules/legacy/esm/part.js")
+        );
+        for (specifier, expected) in [
+            ("legacy/esm/part", "does not exist"),
+            ("legacy/../x.js", "leaves the package directory"),
+        ] {
+            let err = resolve_from(&root, "main.js", specifier).unwrap_err();
+            let (reason, _) = reason_and_tried(err);
+            assert!(reason.contains(expected), "{specifier}: {reason}");
+        }
+    }
+
+    #[test]
+    fn test_missing_package_lists_every_directory_tried() {
+        let root = tree(&[("a/b/main.js", "")]);
+        let err = resolve_from(&root, "a/b/main.js", "absent").unwrap_err();
+        let text = err.to_string();
+        let (reason, tried) = reason_and_tried(err);
+        assert!(reason.contains("'absent' is not installed"), "{reason}");
+        let first = root.path().join("a/b/node_modules/absent");
+        assert_eq!(
+            tried[0],
+            std::path::absolute(first).unwrap().display().to_string()
+        );
+        assert_eq!(tried.len(), root.path().join("a/b").ancestors().count());
+        assert!(text.contains("tried: "), "{text}");
+    }
+
+    #[test]
+    fn test_node_builtins_and_invalid_specifiers_are_refused() {
+        let root = tree(&[("main.js", "")]);
+        for (specifier, expected) in [
+            ("node:fs", "built-in modules are not provided"),
+            ("vaern:nope", "no such vaern: module"),
+            ("/abs.js", "neither relative nor a package name"),
+            (".hidden", "neither relative nor a package name"),
+            ("@scope", "neither relative nor a package name"),
+            ("pkg/", "neither relative nor a package name"),
+            ("C:\\x.js", "neither relative nor a package name"),
+            ("https://x.test/a.js", "neither relative nor a package name"),
+        ] {
+            let err = resolve_from(&root, "main.js", specifier).unwrap_err();
+            let (reason, _) = reason_and_tried(err);
+            assert!(reason.contains(expected), "{specifier}: {reason}");
+        }
+    }
+
+    #[test]
+    fn test_strip_verbatim_keeps_ordinary_paths() {
+        for (input, expected) in [
+            (r"\\?\C:\x\y.js", r"C:\x\y.js"),
+            (r"\\?\UNC\srv\share\a.js", r"\\srv\share\a.js"),
+            ("/usr/lib/a.js", "/usr/lib/a.js"),
+        ] {
+            assert_eq!(
+                strip_verbatim(PathBuf::from(input)),
+                PathBuf::from(expected)
+            );
+        }
+    }
+}

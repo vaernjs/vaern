@@ -1,0 +1,7 @@
+{
+  "name": "greeter",
+  "exports": {
+    ".": { "require": "./cjs/index.cjs", "import": "./esm/index.ts" },
+    "./version": "./esm/version.js"
+  }
+}

@@ -29,6 +29,11 @@ fs.chmodSync(binary, 0o755);
 // Fixtures that write files do so under out/, recreated empty for every run.
 fs.rmSync(path.join(sandbox, "out"), { recursive: true, force: true });
 fs.mkdirSync(path.join(sandbox, "out"));
+// Package fixtures live in resolve/packages because node_modules is never
+// tracked; they are installed by copying them into place for each run.
+const installed = path.join(sandbox, "resolve", "node_modules");
+fs.rmSync(installed, { recursive: true, force: true });
+fs.cpSync(path.join(sandbox, "resolve", "packages"), installed, { recursive: true });
 
 const cases = [
   {
@@ -140,6 +145,26 @@ const cases = [
       "FsError open ENOENT true\n" +
       "FsError open EISDIR true\n",
     stderr: "",
+  },
+  {
+    name: "resolve/main.ts imports packages from node_modules through exports and main",
+    args: ["run", "resolve/main.ts"],
+    code: 0,
+    stdout: "hello, vaern 1.2.3 5\ntrue\n",
+    stderr: "",
+  },
+  {
+    name: "resolve/missing_package.js lists every node_modules directory tried",
+    args: ["run", "resolve/missing_package.js"],
+    code: 1,
+    stdout: "",
+    stderrIncludes: [
+      "module resolution failed for 'not-installed'",
+      `tried: ${path.join(sandbox, "resolve", "node_modules", "not-installed")}\n`,
+      `tried: ${path.join(sandbox, "node_modules", "not-installed")}\n`,
+      "Vaern does not download packages.",
+    ],
+    stderrExcludes: ["panicked", "runtime exception"],
   },
   {
     name: "heap_limit.js stops at the heap limit with a located error",

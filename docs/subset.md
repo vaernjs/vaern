@@ -30,10 +30,38 @@ web or Node.js behaviour of the same name.
   extension included. There is no extension or `index` lookup.
 - `vaern:http`, which exports `serve`.
 - `vaern:fs`, which exports `readFile`, `writeFile` and `appendFile`.
+- Packages already installed in `node_modules`, imported by name (`pkg`,
+  `@scope/pkg`, `pkg/sub`). Static and dynamic `import()` both work.
 
-Absent: bare specifiers and `node_modules`, `node:*` modules, `require` and
-CommonJS, JSON imports, and dynamic `import()` of anything other than the
-above.
+### Package resolution
+
+- `node_modules/<name>` is looked for in the importer's directory, then each
+  parent up to the filesystem root, as Node.js does. The first package
+  directory found is the only one used.
+- With `exports` in `package.json`: a string, a conditions object or a
+  subpath map, including patterns with one `*` (the longest matching prefix
+  wins). Conditions are read in the order the package declares them, and
+  the first of `vaern`, `import` or `default` is used. `node` and `require`
+  never match. A `null` target or an unlisted subpath is not exported.
+- Without `exports`: `pkg/sub` names an exact file in the package, and `pkg`
+  uses the `module` field, then `main` only when `"type": "module"` is set.
+  Otherwise the package has no ES module entry point and the import fails.
+- Every target must stay inside the package directory and outside any
+  nested `node_modules`.
+- The resolved file is reached through its real path, so a linked package
+  (as a pnpm store creates) is one module however it is imported. `.ts`
+  files inside packages have their types removed as usual.
+- A failed import reports the specifier, the importer, the reason, every
+  path or `package.json` field tried, and what to do next.
+
+Limits: QuickJS shortens a thrown message to 256 bytes, so a script that
+catches a failed import sees only the reason; the full list of paths
+appears when the failure ends the run.
+
+Absent: `node:*` modules (importing one fails with its own message), the
+`imports` field (`#name` specifiers), a package importing itself by name,
+array targets in `exports`, `require` and CommonJS, JSON imports, absolute
+paths and URL imports, and downloading packages from a registry.
 
 ## Globals
 
