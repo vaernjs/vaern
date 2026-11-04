@@ -1,7 +1,8 @@
 //! WHATWG-compliant HTTP client implementation powered by Hyper and Rustls.
 //!
 //! This module owns the network client lifecycle:
-//! - HTTPS connection pooling and pure Rustls TLS validation (no OpenSSL).
+//! - Pure Rustls TLS validation (no OpenSSL), and a client that callers keep
+//!   across requests so connections and TLS sessions are reused.
 //! - Staged error reporting identifying the exact failure phase (dns, connect, tls, send, read).
 //! - Automatic redirect following capped at 20 hops with loop prevention.
 //! - Request timeout and cancellation propagation.
@@ -100,29 +101,44 @@ pub(crate) fn build_client_with_roots(root_store: RootCertStore) -> Result<HttpC
     Ok(client)
 }
 
-/// Executes a native fetch request, following up to 20 redirects and enforcing timeouts.
+/// Executes a native fetch request on a client of its own, following up to 20
+/// redirects and enforcing timeouts. Nothing is reused between calls.
 pub async fn execute_fetch(
     initial_url: &str,
     options: FetchOptions,
     abort_rx: Option<broadcast::Receiver<()>>,
 ) -> Result<FetchResponse> {
+    let client = build_http_client()?;
+    execute_fetch_pooled(&client, initial_url, options, abort_rx).await
+}
+
+/// Executes a fetch on `pooled`, a production client the caller keeps across
+/// requests so keep-alive connections and TLS sessions carry over.
+pub async fn execute_fetch_pooled(
+    pooled: &HttpClient,
+    initial_url: &str,
+    options: FetchOptions,
+    abort_rx: Option<broadcast::Receiver<()>>,
+) -> Result<FetchResponse> {
     let url = parse_fetch_url(initial_url)?;
-    let client = client_for(&url)?;
+    let client = client_for(&url, pooled)?;
     execute_fetch_with(&client, url, options, abort_rx).await
 }
 
+// The pooled client only ever holds the public roots: the test origin gets a
+// separate client, so the test certificate cannot enter a shared pool.
 #[cfg(any(test, feature = "test-tls"))]
-fn client_for(url: &Url) -> Result<HttpClient> {
+fn client_for(url: &Url, pooled: &HttpClient) -> Result<HttpClient> {
     if crate::test_tls::is_test_origin(url) {
         crate::test_tls::ensure_server_running();
         return crate::test_tls::client();
     }
-    build_http_client()
+    Ok(pooled.clone())
 }
 
 #[cfg(not(any(test, feature = "test-tls")))]
-fn client_for(_url: &Url) -> Result<HttpClient> {
-    build_http_client()
+fn client_for(_url: &Url, pooled: &HttpClient) -> Result<HttpClient> {
+    Ok(pooled.clone())
 }
 
 /// Parses a fetch URL and rejects schemes other than http and https.
@@ -454,6 +470,20 @@ mod tests {
             ),
             Err(other) => panic!("expected a typed fetch error, got {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_pooled_client_reuses_one_connection() {
+        let (addr, accepted) = crate::test_tls::start_counting_http_server().expect("server");
+        let client = build_http_client().expect("client");
+        for _ in 0..3 {
+            let url = format!("http://{addr}/");
+            let res = execute_fetch_pooled(&client, &url, FetchOptions::default(), None)
+                .await
+                .expect("fetch");
+            assert_eq!(res.body, b"ok");
+        }
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

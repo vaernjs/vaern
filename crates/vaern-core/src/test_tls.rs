@@ -1,4 +1,5 @@
-//! Loopback HTTPS server and matching client for hermetic fetch tests.
+//! Loopback HTTPS server and matching client for hermetic fetch tests, plus
+//! a plain HTTP server that counts connections for the pooling tests.
 //!
 //! The server listens on 127.0.0.1:8443 with a self-signed certificate that
 //! is generated per process. Only the client built here trusts it; the
@@ -19,6 +20,7 @@ use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -300,4 +302,44 @@ async fn route(
     hyper::Response::builder()
         .status(StatusCode::NOT_FOUND)
         .body(Empty::new().boxed())
+}
+
+/// Starts a plain HTTP/1.1 server on an ephemeral loopback port that answers
+/// every request with `ok`, and returns its address with a count of the TCP
+/// connections it has accepted. A client that reuses connections keeps the
+/// count at one across sequential requests.
+pub fn start_counting_http_server() -> Option<(SocketAddr, Arc<AtomicUsize>)> {
+    let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = accepted.clone();
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        rt.block_on(async move {
+            let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else {
+                return;
+            };
+            let Ok(addr) = listener.local_addr() else {
+                return;
+            };
+            let _ = addr_tx.send(addr);
+            while let Ok((stream, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(|_req| async {
+                        Ok::<_, Infallible>(hyper::Response::new(Full::new(Bytes::from("ok"))))
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+    });
+    let addr = addr_rx.recv().ok()?;
+    Some((addr, accepted))
 }

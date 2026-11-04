@@ -48,6 +48,9 @@ struct SharedState {
     timers: HashMap<u32, TimerRecord>,
     abort_senders: HashMap<u32, tokio::sync::broadcast::Sender<()>>,
     pending_fetches: usize,
+    /// Production HTTP client shared by every fetch, built on the first one.
+    /// Reusing it keeps connections alive and resumes TLS sessions.
+    fetch_client: Option<crate::fetch::HttpClient>,
     events_tx: EventSender,
     active_servers: usize,
     server_handles: HashMap<u32, Arc<HttpServer>>,
@@ -273,6 +276,7 @@ impl QuickJsRuntime {
             timers: HashMap::new(),
             abort_senders: HashMap::new(),
             pending_fetches: 0,
+            fetch_client: None,
             events_tx,
             active_servers: 0,
             server_handles: HashMap::new(),
@@ -512,12 +516,34 @@ impl QuickJsRuntime {
                     };
 
                     let tx = state_fetch.borrow().events_tx.clone();
+                    let client = {
+                        let mut s = state_fetch.borrow_mut();
+                        match &s.fetch_client {
+                            Some(client) => Ok(client.clone()),
+                            None => crate::fetch::build_http_client().inspect(|client| {
+                                s.fetch_client = Some(client.clone());
+                            }),
+                        }
+                    };
                     state_fetch.borrow_mut().pending_fetches += 1;
 
-                    tokio_handle_fetch.spawn(async move {
-                        let result = crate::fetch::execute_fetch(&url, options, abort_rx).await;
-                        let _ = tx.send(LoopEvent::FetchDone(FetchCompletion { req_id, result }));
-                    });
+                    match client {
+                        Ok(client) => {
+                            tokio_handle_fetch.spawn(async move {
+                                let result = crate::fetch::execute_fetch_pooled(
+                                    &client, &url, options, abort_rx,
+                                )
+                                .await;
+                                let _ = tx.send(LoopEvent::FetchDone(FetchCompletion { req_id, result }));
+                            });
+                        }
+                        Err(err) => {
+                            let _ = tx.send(LoopEvent::FetchDone(FetchCompletion {
+                                req_id,
+                                result: Err(err),
+                            }));
+                        }
+                    }
 
                     Ok(())
                 },
@@ -2759,5 +2785,21 @@ mod tests {
             process.exitCode = rejected === 2 ? 0 : 1;
         "#;
         assert_eq!(runtime.eval("redirect_mode.js", code).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_fetches_from_one_runtime_share_a_connection() {
+        let (addr, accepted) = crate::test_tls::start_counting_http_server().unwrap();
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        let code = format!(
+            r#"
+            for (let i = 0; i < 3; i++) {{
+                const res = await fetch("http://{addr}/");
+                if ((await res.text()) !== "ok") process.exitCode = 1;
+            }}
+        "#
+        );
+        assert_eq!(runtime.eval("pool.js", &code).unwrap(), 0);
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
