@@ -9,6 +9,7 @@ mod blank_strip;
 pub mod error;
 pub mod event;
 pub mod fetch;
+pub mod fs;
 pub mod module_loader;
 pub mod runtime;
 pub mod server;

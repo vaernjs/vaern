@@ -81,6 +81,17 @@ pub enum VaernError {
         action: String,
     },
 
+    /// `vaern:fs` failure. `stage` is `resolve`, `open`, `read` or `write`;
+    /// `code` is a POSIX-style name such as `ENOENT`.
+    #[error("fs {stage} failed for '{path}' ({code}): {message}. {action}")]
+    Fs {
+        stage: String,
+        code: String,
+        path: String,
+        message: String,
+        action: String,
+    },
+
     /// A streamed HTTP response chunk could not be handed to the connection.
     #[error("response stream for server request {req_id} failed: {message}. {action}")]
     ServerStream {
