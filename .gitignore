@@ -31,3 +31,5 @@ packages/vaern-*/bin/vaern*
 # Binary copied in by scripts/test-sandbox.mjs
 tests/sandbox_run/vaern
 tests/sandbox_run/vaern.exe
+# Files written by sandbox fixtures
+tests/sandbox_run/out/

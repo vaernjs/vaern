@@ -1,12 +1,13 @@
 //! Messages from Tokio tasks to the JavaScript thread's event loop.
 //!
-//! Fetch completions, incoming server requests and server shutdowns all arrive
-//! on one channel. The event loop blocks on that channel, with the nearest
-//! timer deadline as its timeout, so an idle runtime sleeps until there is
-//! work instead of polling for it.
+//! Fetch and file completions, incoming server requests and server shutdowns
+//! all arrive on one channel. The event loop blocks on that channel, with the
+//! nearest timer deadline as its timeout, so an idle runtime sleeps until
+//! there is work instead of polling for it.
 
 use crate::error::Result;
 use crate::fetch::FetchResponse;
+use crate::fs::FsOutput;
 use crate::server::ServerIncomingRequest;
 
 /// Outcome of a fetch started from JavaScript.
@@ -15,9 +16,16 @@ pub struct FetchCompletion {
     pub result: Result<FetchResponse>,
 }
 
+/// Outcome of a `vaern:fs` operation started from JavaScript.
+pub struct FsCompletion {
+    pub req_id: u32,
+    pub result: Result<FsOutput>,
+}
+
 /// Work for the JavaScript thread produced outside it.
 pub enum LoopEvent {
     FetchDone(FetchCompletion),
+    FsDone(FsCompletion),
     ServerRequest(ServerIncomingRequest),
     ServerClosed(u32),
 }

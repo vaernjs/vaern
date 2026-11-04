@@ -26,6 +26,9 @@ if (!fs.existsSync(built)) {
 }
 fs.copyFileSync(built, binary);
 fs.chmodSync(binary, 0o755);
+// Fixtures that write files do so under out/, recreated empty for every run.
+fs.rmSync(path.join(sandbox, "out"), { recursive: true, force: true });
+fs.mkdirSync(path.join(sandbox, "out"));
 
 const cases = [
   {
@@ -126,6 +129,17 @@ const cases = [
     stdout: "at fail (multiline_stack.ts:12:29)\n",
     stderrIncludes: ["Error: failed uncaught", "multiline_stack.ts:12:29", "multiline_stack.ts:21:1"],
     stderrExcludes: ["panicked"],
+  },
+  {
+    name: "fs_subset.ts writes, appends and reads files with typed errors",
+    args: ["run", "fs_subset.ts"],
+    code: 0,
+    stdout:
+      '"line one\\nline two\\n" 18\n' +
+      "FsError open EEXIST true\n" +
+      "FsError open ENOENT true\n" +
+      "FsError open EISDIR true\n",
+    stderr: "",
   },
   {
     name: "heap_limit.js stops at the heap limit with a located error",

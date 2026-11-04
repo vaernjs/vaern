@@ -5,7 +5,7 @@
 //! and driving the event loop to completion using Tokio.
 
 use crate::error::{Result, VaernError};
-use crate::event::{EventReceiver, EventSender, FetchCompletion, LoopEvent};
+use crate::event::{EventReceiver, EventSender, FetchCompletion, FsCompletion, LoopEvent};
 use crate::module_loader::{FsModuleLoader, ModuleLoader};
 use crate::server::{HttpServer, ServerIncomingRequest, ServerResponse, ServerResponseBody};
 use crate::transpile::{SwcTranspiler, Transpiler};
@@ -48,6 +48,8 @@ struct SharedState {
     timers: HashMap<u32, TimerRecord>,
     abort_senders: HashMap<u32, tokio::sync::broadcast::Sender<()>>,
     pending_fetches: usize,
+    /// `vaern:fs` operations running on the blocking pool.
+    pending_fs: usize,
     /// Production HTTP client shared by every fetch, built on the first one.
     /// Reusing it keeps connections alive and resumes TLS sessions.
     fetch_client: Option<crate::fetch::HttpClient>,
@@ -87,8 +89,8 @@ impl Resolver for VaernModuleResolver {
         name: &str,
         _attributes: Option<ImportAttributes<'js>>,
     ) -> rquickjs::Result<String> {
-        if name == "vaern:http" {
-            return Ok("vaern:http".to_string());
+        if name == "vaern:http" || name == "vaern:fs" {
+            return Ok(name.to_string());
         }
         let referrer_path = if base.is_empty() {
             self.base_dir.clone()
@@ -119,6 +121,15 @@ impl Loader for VaernModuleLoader {
                 ctx.clone(),
                 name,
                 "export const serve = globalThis.__vaern_serve;\nexport default { serve };",
+            );
+        }
+        if name == "vaern:fs" {
+            return Module::declare(
+                ctx.clone(),
+                name,
+                "const { readFile, writeFile, appendFile } = globalThis.__vaern_fs;\n\
+                 export { readFile, writeFile, appendFile };\n\
+                 export default { readFile, writeFile, appendFile };",
             );
         }
         let path = Path::new(name);
@@ -276,6 +287,7 @@ impl QuickJsRuntime {
             timers: HashMap::new(),
             abort_senders: HashMap::new(),
             pending_fetches: 0,
+            pending_fs: 0,
             fetch_client: None,
             events_tx,
             active_servers: 0,
@@ -555,6 +567,74 @@ impl QuickJsRuntime {
                 .set("__vaern_fetch_start", fetch_start_fn)
                 .map_err(|err| VaernError::EngineInit {
                     reason: format!("failed to register fetch start bridge: {err}"),
+                })?;
+
+            // Native vaern:fs bridge. `payload` carries write data: UTF-8 text
+            // when `kind` is "text", or one Latin-1 code unit per byte when it
+            // is "bytes", since typed-array memory is reachable only through
+            // `unsafe` accessors.
+            let state_fs = Rc::clone(&state);
+            let tokio_handle_fs = tokio_handle.clone();
+            let fs_start_fn = Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>,
+                      req_id: u32,
+                      op: String,
+                      path: String,
+                      kind: String,
+                      payload: String|
+                      -> rquickjs::Result<()> {
+                    let data = if kind == "bytes" {
+                        let mut bytes = Vec::with_capacity(payload.len());
+                        for ch in payload.chars() {
+                            match u8::try_from(u32::from(ch)) {
+                                Ok(byte) => bytes.push(byte),
+                                Err(_) => {
+                                    return Err(rquickjs::Exception::throw_type(
+                                        &ctx,
+                                        "vaern:fs: byte string holds a value above 0xFF",
+                                    ));
+                                }
+                            }
+                        }
+                        bytes
+                    } else {
+                        payload.into_bytes()
+                    };
+                    let mode = match op.as_str() {
+                        "write" => Some(crate::fs::WriteMode::Truncate),
+                        "write_new" => Some(crate::fs::WriteMode::CreateNew),
+                        "append" => Some(crate::fs::WriteMode::Append),
+                        _ => None,
+                    };
+                    let op = match (op.as_str(), mode) {
+                        ("read", _) => crate::fs::FsOp::Read { path, utf8: false },
+                        ("read_utf8", _) => crate::fs::FsOp::Read { path, utf8: true },
+                        (_, Some(mode)) => crate::fs::FsOp::Write { path, data, mode },
+                        (other, None) => {
+                            return Err(rquickjs::Exception::throw_type(
+                                &ctx,
+                                &format!("vaern:fs: unknown operation '{other}'"),
+                            ));
+                        }
+                    };
+
+                    let tx = state_fs.borrow().events_tx.clone();
+                    state_fs.borrow_mut().pending_fs += 1;
+                    tokio_handle_fs.spawn_blocking(move || {
+                        let result = crate::fs::run(op);
+                        let _ = tx.send(LoopEvent::FsDone(FsCompletion { req_id, result }));
+                    });
+                    Ok(())
+                },
+            )
+            .map_err(|err| VaernError::EngineInit {
+                reason: format!("failed to create fs bridge: {err}"),
+            })?;
+            globals
+                .set("__vaern_fs_start", fs_start_fn)
+                .map_err(|err| VaernError::EngineInit {
+                    reason: format!("failed to register fs bridge: {err}"),
                 })?;
 
             // Native abort signal bridge
@@ -1703,6 +1783,92 @@ impl QuickJsRuntime {
                     }
                 };
 
+                // vaern:fs: whole-file reads and writes
+                const __fsCallbacks = new Map();
+                let __nextFsId = 1;
+
+                class FsError extends Error {
+                    constructor(info) {
+                        super(info.message);
+                        this.name = "FsError";
+                        this.stage = info.stage;
+                        this.code = info.code;
+                        this.path = info.path;
+                        this.action = info.action;
+                    }
+                }
+
+                function __fsPath(fn, path) {
+                    if (typeof path !== "string") {
+                        throw new TypeError(`${fn}: path must be a string`);
+                    }
+                    if (path.length === 0 || path.includes("\0")) {
+                        throw new TypeError(`${fn}: path must be non-empty and free of NUL characters`);
+                    }
+                }
+
+                function __fsEncoding(fn, options) {
+                    const encoding = typeof options === "string"
+                        ? options
+                        : (options !== null && typeof options === "object" ? options.encoding : undefined);
+                    if (encoding === undefined || encoding === null) return null;
+                    if (encoding === "utf8" || encoding === "utf-8") return "utf8";
+                    throw new TypeError(`${fn}: unsupported encoding ${JSON.stringify(String(encoding))}; use "utf8", or omit it for bytes`);
+                }
+
+                function __fsData(fn, data) {
+                    if (typeof data === "string") return ["text", data.toWellFormed()];
+                    if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
+                        return ["bytes", __latin1(__toBytes(data))];
+                    }
+                    throw new TypeError(`${fn}: data must be a string, ArrayBuffer or ArrayBuffer view`);
+                }
+
+                function __fsStart(op, path, kind, payload) {
+                    return new Promise((resolve, reject) => {
+                        const reqId = __nextFsId++;
+                        __fsCallbacks.set(reqId, { resolve, reject });
+                        __vaern_fs_start(reqId, op, path, kind, payload);
+                    });
+                }
+
+                globalThis.__vaern_dispatch_fs = (info) => {
+                    const cb = __fsCallbacks.get(info.reqId);
+                    if (!cb) return;
+                    __fsCallbacks.delete(info.reqId);
+                    if (info.success) {
+                        cb.resolve(info.body instanceof ArrayBuffer ? new Uint8Array(info.body) : info.body);
+                    } else {
+                        cb.reject(new FsError(info));
+                    }
+                };
+
+                globalThis.__vaern_fs = Object.freeze({
+                    async readFile(path, options) {
+                        __fsPath("readFile", path);
+                        const utf8 = __fsEncoding("readFile", options) === "utf8";
+                        return __fsStart(utf8 ? "read_utf8" : "read", path, "text", "");
+                    },
+                    async writeFile(path, data, options) {
+                        __fsPath("writeFile", path);
+                        __fsEncoding("writeFile", options);
+                        const flag = options !== null && typeof options === "object" && options.flag !== undefined
+                            ? options.flag
+                            : "w";
+                        if (flag !== "w" && flag !== "wx") {
+                            throw new TypeError(`writeFile: unsupported flag ${JSON.stringify(String(flag))}; use "w" or "wx"`);
+                        }
+                        const [kind, payload] = __fsData("writeFile", data);
+                        await __fsStart(flag === "wx" ? "write_new" : "write", path, kind, payload);
+                    },
+                    async appendFile(path, data, options) {
+                        __fsPath("appendFile", path);
+                        __fsEncoding("appendFile", options);
+                        const [kind, payload] = __fsData("appendFile", data);
+                        await __fsStart("append", path, kind, payload);
+                    },
+                });
+
                 // vaern:http serve implementation
                 const __serverHandlers = new Map();
                 const __serverCloseCallbacks = new Map();
@@ -1928,6 +2094,53 @@ impl QuickJsRuntime {
         });
     }
 
+    fn dispatch_fs_completion(&self, completion: FsCompletion) {
+        let _ = self.context.with(|ctx| -> rquickjs::Result<()> {
+            let dispatch_fn: Function = ctx.globals().get("__vaern_dispatch_fs")?;
+            let info = Object::new(ctx.clone())?;
+            info.set("reqId", completion.req_id)?;
+            match completion.result {
+                Ok(crate::fs::FsOutput::Bytes(bytes)) => {
+                    info.set("success", true)?;
+                    info.set("body", ArrayBuffer::new(ctx.clone(), bytes)?)?;
+                }
+                Ok(crate::fs::FsOutput::Text(text)) => {
+                    info.set("success", true)?;
+                    info.set("body", text)?;
+                }
+                Ok(crate::fs::FsOutput::Written) => {
+                    info.set("success", true)?;
+                }
+                Err(err) => {
+                    let message = err.to_string();
+                    let (stage, code, path, action) = match err {
+                        VaernError::Fs {
+                            stage,
+                            code,
+                            path,
+                            action,
+                            ..
+                        } => (stage, code, path, action),
+                        _ => (
+                            "read".to_string(),
+                            "EIO".to_string(),
+                            String::new(),
+                            "inspect error details".to_string(),
+                        ),
+                    };
+                    info.set("success", false)?;
+                    info.set("message", message)?;
+                    info.set("stage", stage)?;
+                    info.set("code", code)?;
+                    info.set("path", path)?;
+                    info.set("action", action)?;
+                }
+            }
+            dispatch_fn.call::<_, ()>((info,))?;
+            Ok(())
+        });
+    }
+
     fn dispatch_server_request(&self, req: ServerIncomingRequest) {
         let req_id = req.req_id;
         let resp_sender = req.resp_sender;
@@ -1974,6 +2187,13 @@ impl QuickJsRuntime {
                     self.state.borrow_mut().pending_fetches -= 1;
                 }
                 self.dispatch_fetch_completion(completion);
+            }
+            LoopEvent::FsDone(completion) => {
+                {
+                    let mut s = self.state.borrow_mut();
+                    s.pending_fs = s.pending_fs.saturating_sub(1);
+                }
+                self.dispatch_fs_completion(completion);
             }
             LoopEvent::ServerClosed(closed_server_id) => {
                 if self.state.borrow().active_servers > 0 {
@@ -2032,7 +2252,8 @@ impl QuickJsRuntime {
                 _has_active_timers,
             ) = {
                 let s = self.state.borrow();
-                let pending_fetches = s.pending_fetches > 0;
+                // A file operation keeps the loop alive the same way a fetch does.
+                let pending_fetches = s.pending_fetches > 0 || s.pending_fs > 0;
                 let active_timers = !s.timers.is_empty();
                 let active_servers = s.active_servers > 0;
                 if !pending_fetches && !active_timers && !active_servers {
@@ -2801,5 +3022,55 @@ mod tests {
         );
         assert_eq!(runtime.eval("pool.js", &code).unwrap(), 0);
         assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_vaern_fs_reads_and_writes_text_and_bytes() {
+        let dir = std::env::temp_dir().join(format!("vaern-rt-fs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_js = dir.display().to_string().replace('\\', "/");
+        let code = format!(
+            r#"
+            import fs, {{ readFile, writeFile, appendFile }} from "vaern:fs";
+            const dir = "{dir_js}";
+            let fails = 0;
+            await writeFile(dir + "/t.txt", "café \u{{1F600}}\n");
+            await appendFile(dir + "/t.txt", "second");
+            if ((await readFile(dir + "/t.txt", "utf8")) !== "café \u{{1F600}}\nsecond") fails |= 1;
+            if ((await fs.readFile(dir + "/t.txt", {{ encoding: "utf-8" }})).length !== 14) fails |= 2;
+
+            await writeFile(dir + "/b.bin", new Uint8Array([0, 128, 255]));
+            await appendFile(dir + "/b.bin", new Uint8Array([1, 2, 3]).buffer);
+            const bytes = await readFile(dir + "/b.bin");
+            if (!(bytes instanceof Uint8Array) || bytes.join() !== "0,128,255,1,2,3") fails |= 4;
+
+            try {{
+                await writeFile(dir + "/t.txt", "x", {{ flag: "wx" }});
+                fails |= 8;
+            }} catch (err) {{
+                if (err.name !== "FsError" || err.code !== "EEXIST" || err.stage !== "open") fails |= 8;
+            }}
+            try {{
+                await readFile(dir + "/missing.txt", "utf8");
+                fails |= 16;
+            }} catch (err) {{
+                if (err.code !== "ENOENT" || !err.path.endsWith("missing.txt") || !err.message.includes("ENOENT")) fails |= 16;
+            }}
+            for (const call of [() => readFile(42), () => readFile("x", "latin1"), () => writeFile("x", 5), () => writeFile("x", "", {{ flag: "a" }})]) {{
+                try {{
+                    await call();
+                    fails |= 32;
+                }} catch (err) {{
+                    if (!(err instanceof TypeError)) fails |= 32;
+                }}
+            }}
+            process.exitCode = fails;
+        "#
+        );
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        let exit_code = runtime.eval("fs.js", &code).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(exit_code, 0);
     }
 }

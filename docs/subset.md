@@ -29,6 +29,7 @@ web or Node.js behaviour of the same name.
 - Relative imports (`./x.ts`, `../lib/y.js`) with the exact file name,
   extension included. There is no extension or `index` lookup.
 - `vaern:http`, which exports `serve`.
+- `vaern:fs`, which exports `readFile`, `writeFile` and `appendFile`.
 
 Absent: bare specifiers and `node_modules`, `node:*` modules, `require` and
 CommonJS, JSON imports, and dynamic `import()` of anything other than the
@@ -195,6 +196,36 @@ a `Response`, or a promise of one.
 - A handler that throws is answered with 500.
 - `close()` waits up to 5 seconds for requests in flight. Ctrl+C (SIGINT)
   closes servers the same way; SIGTERM is not handled.
+
+## vaern:fs
+
+Whole-file reads and writes, as named and default exports. Every function
+returns a promise; the work runs off the JavaScript thread.
+
+- `readFile(path, options)` resolves to a string when `options` is `"utf8"`,
+  `"utf-8"` or `{ encoding }` with one of those, and to a `Uint8Array`
+  otherwise. Invalid UTF-8 reads as U+FFFD; a byte order mark is kept.
+- `writeFile(path, data, options)` creates or replaces the file. `data` is a
+  string (written as UTF-8), an `ArrayBuffer` or any view of one. With
+  `{ flag: "wx" }` it fails if the file already exists; `"w"` is the default
+  and the only other flag.
+- `appendFile(path, data)` creates the file or adds to its end.
+- A relative path resolves against the current working directory. Parent
+  directories are not created.
+- Files larger than 256 MiB, the heap cap, are refused with `EFBIG` before
+  any byte is read.
+- A failure rejects with an `FsError` whose `stage` is `resolve`, `open`,
+  `read` or `write`, whose `code` is `ENOENT`, `EACCES`, `EEXIST`, `EISDIR`,
+  `ENOTDIR`, `EFBIG` or `EIO`, whose `path` is the absolute path, and whose
+  `action` says what to do next. A bad argument (a non-string path, an
+  unsupported encoding or flag, data of another type) rejects with
+  `TypeError`.
+- No policy applies yet: a script can read and write anything the process
+  can.
+
+Absent: synchronous and callback variants, `stat`, `readdir`, `mkdir`, `rm`,
+`rename`, file handles, streams, `file:` URLs as paths, and the `node:fs`
+name.
 
 ## Limits
 
