@@ -1,5 +1,8 @@
 # Dependencies and package output
 node_modules/
+# The workspace has no registry dependencies; a lockfile would only record
+# the local packages and drift with every version bump.
+package-lock.json
 *.tgz
 .DS_Store
 dist/
