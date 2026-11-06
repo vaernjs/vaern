@@ -15,6 +15,9 @@
 //! Resolution is local only: nothing is fetched from a registry, and there is
 //! no `imports` map, self-reference, CommonJS or JSON support. Every failure
 //! is a typed [`VaernError::ModuleResolution`] listing what was tried.
+//!
+//! Every module source, the entry file included, is read through
+//! [`read_source`], which bounds the read before the text reaches the heap.
 
 use crate::error::{Result, VaernError};
 use serde_json::Value;
@@ -24,6 +27,47 @@ use std::path::{Component, Path, PathBuf};
 /// conditions object is read in its own key order and the first key that is
 /// in this list wins, as Node.js specifies.
 const CONDITIONS: [&str; 3] = ["vaern", "import", "default"];
+
+/// Largest module source the loader reads. Source text is copied into the
+/// QuickJS heap and parsed there, so it gets the same quarter-of-the-heap
+/// bound as a `vaern:fs` read; without one, a huge or endless file would be
+/// read into host memory before any engine limit applies.
+pub const MAX_SOURCE_BYTES: u64 = crate::fs::MAX_READ_BYTES;
+
+/// Reads a module's UTF-8 source, refusing anything over [`MAX_SOURCE_BYTES`].
+pub fn read_source(path: &Path) -> Result<String> {
+    use std::io::Read;
+    let io_error = |source| VaernError::Io {
+        path: path.display().to_string(),
+        source,
+    };
+    let too_large = || VaernError::SourceTooLarge {
+        path: path.display().to_string(),
+        limit_mib: MAX_SOURCE_BYTES / (1024 * 1024),
+    };
+    let file = std::fs::File::open(path).map_err(io_error)?;
+    if file.metadata().map_err(io_error)?.len() > MAX_SOURCE_BYTES {
+        return Err(too_large());
+    }
+    // The reported length can be stale or zero (a pipe or device), so the
+    // read itself stops one byte past the limit.
+    let mut bytes = Vec::new();
+    file.take(MAX_SOURCE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(io_error)?;
+    if bytes.len() as u64 > MAX_SOURCE_BYTES {
+        return Err(too_large());
+    }
+    String::from_utf8(bytes).map_err(|err| {
+        io_error(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "the source is not valid UTF-8 at byte {}",
+                err.utf8_error().valid_up_to()
+            ),
+        ))
+    })
+}
 
 /// Trait defining ES-module resolution and loading behavior.
 pub trait ModuleLoader: Send + Sync {
@@ -88,10 +132,7 @@ impl ModuleLoader for FsModuleLoader {
     }
 
     fn load(&self, path: &Path) -> Result<String> {
-        std::fs::read_to_string(path).map_err(|err| VaernError::Io {
-            path: path.display().to_string(),
-            source: err,
-        })
+        read_source(path)
     }
 }
 
@@ -422,6 +463,37 @@ fn strip_verbatim(path: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_source_over_the_limit_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let big = root.path().join("big.js");
+        // Sparse, so the test costs no disk space or read time.
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_SOURCE_BYTES + 1)
+            .unwrap();
+        match read_source(&big) {
+            Err(VaernError::SourceTooLarge { path, limit_mib }) => {
+                assert!(path.ends_with("big.js"), "{path}");
+                assert_eq!(limit_mib, 64);
+            }
+            Err(other) => panic!("expected SourceTooLarge, got {other}"),
+            Ok(text) => panic!("expected SourceTooLarge, read {} bytes", text.len()),
+        }
+    }
+
+    #[test]
+    fn test_source_must_be_utf8_and_names_the_bad_byte() {
+        let root = tempfile::tempdir().unwrap();
+        let good = root.path().join("good.js");
+        std::fs::write(&good, "export const x = '\u{6587}';").unwrap();
+        assert_eq!(read_source(&good).unwrap(), "export const x = '\u{6587}';");
+        let bad = root.path().join("bad.js");
+        std::fs::write(&bad, b"abc\xff").unwrap();
+        let text = read_source(&bad).unwrap_err().to_string();
+        assert!(text.contains("not valid UTF-8 at byte 3"), "{text}");
+    }
 
     /// Writes `files` (relative path, contents) under a new temporary root.
     fn tree(files: &[(&str, &str)]) -> tempfile::TempDir {

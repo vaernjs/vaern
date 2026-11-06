@@ -96,6 +96,12 @@ pub enum VaernError {
         action: String,
     },
 
+    /// Module source over the size the loader reads into the heap.
+    #[error(
+        "source file '{path}' is larger than the {limit_mib} MiB module size limit. Split the module, or read large data at run time with vaern:fs."
+    )]
+    SourceTooLarge { path: String, limit_mib: u64 },
+
     /// A streamed HTTP response chunk could not be handed to the connection.
     #[error("response stream for server request {req_id} failed: {message}. {action}")]
     ServerStream {

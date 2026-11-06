@@ -287,3 +287,6 @@ name.
 - The JavaScript heap is capped at 256 MiB. Exceeding it throws
   `InternalError: out of memory` at the allocation's location, and the run
   exits with code 1.
+- Each module source, the entry file included, must be valid UTF-8 and at
+  most 64 MiB, a quarter of the heap cap. A larger file fails to load with
+  an error naming the file and the limit, before any of it is read.

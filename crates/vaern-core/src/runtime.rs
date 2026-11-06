@@ -147,10 +147,9 @@ impl Loader for VaernModuleLoader {
                  export default { readFile, writeFile, appendFile };",
             );
         }
-        let path = Path::new(name);
-        let content = std::fs::read_to_string(path).map_err(|err| {
-            rquickjs::Error::new_loading_message(name, format!("failed to read '{name}': {err}"))
-        })?;
+        let content = FsModuleLoader
+            .load(Path::new(name))
+            .map_err(|err| rquickjs::Error::new_loading_message(name, err.to_string()))?;
         let transpiled = if name.ends_with(".ts") {
             self.transpiler
                 .transpile(name, &content)
@@ -2554,10 +2553,7 @@ impl Runtime for QuickJsRuntime {
             });
         }
 
-        let source = std::fs::read_to_string(path).map_err(|err| VaernError::Io {
-            path: path_str.clone(),
-            source: err,
-        })?;
+        let source = FsModuleLoader.load(path)?;
 
         let transpiled = if path.extension().is_some_and(|ext| ext == "ts") {
             self.transpiler.transpile(&path_str, &source)?
@@ -3382,6 +3378,30 @@ mod tests {
                 );
             }
             other => panic!("expected a resolution error, got {other}"),
+        }
+    }
+
+    #[test]
+    fn test_oversized_module_source_is_refused_on_import_and_as_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let big = root.path().join("big.js");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(crate::module_loader::MAX_SOURCE_BYTES + 1)
+            .unwrap();
+        let main = root.path().join("main.js");
+        std::fs::write(&main, "import './big.js';\n").unwrap();
+
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        let text = runtime.run_file(&main).unwrap_err().to_string();
+        assert!(text.contains("64 MiB module size limit"), "{text}");
+        assert!(text.contains("big.js"), "{text}");
+
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        match runtime.run_file(&big) {
+            Err(VaernError::SourceTooLarge { .. }) => {}
+            Err(other) => panic!("expected SourceTooLarge, got {other}"),
+            Ok(code) => panic!("expected SourceTooLarge, ran with status {code}"),
         }
     }
 
