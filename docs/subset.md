@@ -242,8 +242,10 @@ returns a promise; the work runs off the JavaScript thread.
 - `appendFile(path, data)` creates the file or adds to its end.
 - A relative path resolves against the current working directory. Parent
   directories are not created.
-- Files larger than 256 MiB, the heap cap, are refused with `EFBIG` before
-  any byte is read.
+- Files larger than 64 MiB, a quarter of the heap cap, are refused with
+  `EFBIG` before any byte is read. A read under that limit whose result
+  still does not fit in the heap rejects with `InternalError: out of
+  memory`.
 - A failure rejects with an `FsError` whose `stage` is `resolve`, `open`,
   `read` or `write`, whose `code` is `ENOENT`, `EACCES`, `EEXIST`, `EISDIR`,
   `ENOTDIR`, `EFBIG` or `EIO`, whose `path` is the absolute path, and whose

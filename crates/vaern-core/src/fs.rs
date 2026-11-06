@@ -15,9 +15,11 @@ use crate::error::{Result, VaernError};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-/// Largest file `readFile` accepts. It matches the JavaScript heap cap, so a
-/// read that would exhaust the heap fails with `EFBIG` before it allocates.
-pub const MAX_READ_BYTES: u64 = 256 * 1024 * 1024;
+/// Largest file `readFile` accepts: a quarter of the JavaScript heap cap.
+/// A text read becomes a heap string, up to two bytes per character, and the
+/// script needs room left to use it, so a limit equal to the heap cap would
+/// pass the size check and then fail inside the heap.
+pub const MAX_READ_BYTES: u64 = (crate::runtime::HEAP_LIMIT_BYTES / 4) as u64;
 
 /// How `write` opens its target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,7 +178,8 @@ fn too_large(path: &Path) -> VaernError {
         code: "EFBIG".to_string(),
         path: path.display().to_string(),
         message: format!("the file is larger than the {MAX_READ_BYTES}-byte read limit"),
-        action: "Read a smaller file; the limit matches the JavaScript heap cap.".to_string(),
+        action: "Read a smaller file; the limit is a quarter of the JavaScript heap cap."
+            .to_string(),
     }
 }
 
@@ -279,6 +282,22 @@ mod tests {
             .unwrap();
         let err = read_op(&file, false).unwrap_err();
         assert_eq!(code_of(err), ("read".to_string(), "EFBIG".to_string()));
+        std::fs::remove_file(&file).unwrap();
+    }
+
+    #[test]
+    fn test_read_cap_leaves_room_in_the_heap() {
+        assert!(MAX_READ_BYTES * 4 <= crate::runtime::HEAP_LIMIT_BYTES as u64);
+        let dir = scratch("boundary");
+        let file = dir.join("exact.bin");
+        std::fs::File::create(&file)
+            .unwrap()
+            .set_len(MAX_READ_BYTES)
+            .unwrap();
+        match read_op(&file, false).unwrap() {
+            FsOutput::Bytes(bytes) => assert_eq!(bytes.len() as u64, MAX_READ_BYTES),
+            other => panic!("expected bytes, got {other:?}"),
+        }
         std::fs::remove_file(&file).unwrap();
     }
 

@@ -201,7 +201,7 @@ const STREAM_CHUNK_CAPACITY: usize = 32;
 /// out-of-memory error it can report, instead of growing until the host
 /// kills the process. Generous for scripts; a per-run limit comes with the
 /// policy file.
-const HEAP_LIMIT_BYTES: usize = 256 * 1024 * 1024;
+pub(crate) const HEAP_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 
 /// How long the pump waits for buffer space before treating the client as stalled.
 const STREAM_CHUNK_SEND_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1848,12 +1848,21 @@ impl QuickJsRuntime {
                 globalThis.__vaern_dispatch_fs = (info) => {
                     const cb = __fsCallbacks.get(info.reqId);
                     if (!cb) return;
+                    // Built before the callback is removed, so a throw here
+                    // leaves it for __vaern_reject_fs.
+                    const value = info.success
+                        ? (info.body instanceof ArrayBuffer ? new Uint8Array(info.body) : info.body)
+                        : new FsError(info);
                     __fsCallbacks.delete(info.reqId);
-                    if (info.success) {
-                        cb.resolve(info.body instanceof ArrayBuffer ? new Uint8Array(info.body) : info.body);
-                    } else {
-                        cb.reject(new FsError(info));
-                    }
+                    if (info.success) cb.resolve(value); else cb.reject(value);
+                };
+
+                globalThis.__vaern_reject_fs = (reqId, err) => {
+                    const cb = __fsCallbacks.get(reqId);
+                    if (!cb) return false;
+                    __fsCallbacks.delete(reqId);
+                    cb.reject(err);
+                    return true;
                 };
 
                 globalThis.__vaern_fs = Object.freeze({
@@ -2122,50 +2131,81 @@ impl QuickJsRuntime {
     }
 
     fn dispatch_fs_completion(&self, completion: FsCompletion) {
-        let _ = self.context.with(|ctx| -> rquickjs::Result<()> {
-            let dispatch_fn: Function = ctx.globals().get("__vaern_dispatch_fs")?;
-            let info = Object::new(ctx.clone())?;
-            info.set("reqId", completion.req_id)?;
-            match completion.result {
-                Ok(crate::fs::FsOutput::Bytes(bytes)) => {
-                    info.set("success", true)?;
-                    info.set("body", ArrayBuffer::new(ctx.clone(), bytes)?)?;
-                }
-                Ok(crate::fs::FsOutput::Text(text)) => {
-                    info.set("success", true)?;
-                    info.set("body", text)?;
-                }
-                Ok(crate::fs::FsOutput::Written) => {
-                    info.set("success", true)?;
-                }
-                Err(err) => {
-                    let message = err.to_string();
-                    let (stage, code, path, action) = match err {
-                        VaernError::Fs {
-                            stage,
-                            code,
-                            path,
-                            action,
-                            ..
-                        } => (stage, code, path, action),
-                        _ => (
-                            "read".to_string(),
-                            "EIO".to_string(),
-                            String::new(),
-                            "inspect error details".to_string(),
-                        ),
-                    };
-                    info.set("success", false)?;
-                    info.set("message", message)?;
-                    info.set("stage", stage)?;
-                    info.set("code", code)?;
-                    info.set("path", path)?;
-                    info.set("action", action)?;
-                }
+        let req_id = completion.req_id;
+        let unsettled = self.context.with(|ctx| {
+            if Self::settle_fs(&ctx, completion).is_ok() {
+                return None;
             }
-            dispatch_fn.call::<_, ()>((info,))?;
-            Ok(())
+            // Building the result threw, most often out of memory for a large
+            // text read. Rejecting with that exception lets the script handle
+            // it; otherwise the promise would never settle and the run could
+            // end with status 0.
+            let exception = ctx.catch();
+            let rejected = ctx
+                .globals()
+                .get::<_, Function>("__vaern_reject_fs")
+                .and_then(|reject| reject.call::<_, bool>((req_id, exception)));
+            match rejected {
+                Ok(true) => None,
+                Ok(false) => Some(format!(
+                    "vaern:fs request {req_id} failed while its result was delivered"
+                )),
+                Err(err) => Some(format!(
+                    "vaern:fs request {req_id} could not be rejected: {err}"
+                )),
+            }
         });
+        if let Some(message) = unsettled {
+            let mut s = self.state.borrow_mut();
+            if s.unhandled_error.is_none() {
+                s.unhandled_error = Some(message);
+            }
+        }
+    }
+
+    fn settle_fs<'js>(ctx: &Ctx<'js>, completion: FsCompletion) -> rquickjs::Result<()> {
+        let dispatch_fn: Function = ctx.globals().get("__vaern_dispatch_fs")?;
+        let info = Object::new(ctx.clone())?;
+        info.set("reqId", completion.req_id)?;
+        match completion.result {
+            Ok(crate::fs::FsOutput::Bytes(bytes)) => {
+                info.set("success", true)?;
+                info.set("body", ArrayBuffer::new(ctx.clone(), bytes)?)?;
+            }
+            Ok(crate::fs::FsOutput::Text(text)) => {
+                info.set("success", true)?;
+                info.set("body", text)?;
+            }
+            Ok(crate::fs::FsOutput::Written) => {
+                info.set("success", true)?;
+            }
+            Err(err) => {
+                let message = err.to_string();
+                let (stage, code, path, action) = match err {
+                    VaernError::Fs {
+                        stage,
+                        code,
+                        path,
+                        action,
+                        ..
+                    } => (stage, code, path, action),
+                    _ => (
+                        "read".to_string(),
+                        "EIO".to_string(),
+                        String::new(),
+                        "inspect error details".to_string(),
+                    ),
+                };
+                info.set("success", false)?;
+                info.set("message", message)?;
+                info.set("stage", stage)?;
+                info.set("code", code)?;
+                info.set("path", path)?;
+                info.set("action", action)?;
+            }
+        }
+        dispatch_fn.call::<_, ()>((info,))?;
+        Ok(())
     }
 
     fn dispatch_server_request(&self, req: ServerIncomingRequest) {
@@ -3140,5 +3180,38 @@ mod tests {
             }
             other => panic!("expected a resolution error, got {other}"),
         }
+    }
+
+    #[test]
+    fn test_fs_result_that_does_not_fit_the_heap_rejects() {
+        let dir = std::env::temp_dir().join(format!("vaern-rt-oom-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Under the read cap, but larger than what is left once the heap is
+        // filled, so only building the string can fail.
+        let file = dir.join("big.txt");
+        std::fs::write(&file, vec![b'a'; 48 * 1024 * 1024]).unwrap();
+        let file_js = file.display().to_string().replace('\\', "/");
+        let code = format!(
+            r#"
+            import {{ readFile }} from "vaern:fs";
+            process.exitCode = 3;
+            const hold = [];
+            try {{ for (;;) hold.push(new ArrayBuffer(8 * 1024 * 1024)); }} catch {{}}
+            hold.length = Math.max(0, hold.length - 2);
+            let outcome;
+            try {{
+                outcome = "resolved " + (await readFile("{file_js}", "utf8")).length;
+            }} catch (err) {{
+                outcome = "rejected";
+            }}
+            hold.length = 0;
+            process.exitCode = outcome === "rejected" ? 0 : 4;
+        "#
+        );
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        let result = runtime.eval("oom.js", &code);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(result.unwrap(), 0);
     }
 }
