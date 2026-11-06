@@ -298,14 +298,14 @@ fn exports_target(exports: &Value, key: &str) -> std::result::Result<String, Str
     let Some(subpaths) = subpaths else {
         // A string or a conditions object is shorthand for { ".": value }.
         return if key == "." {
-            resolve_target(exports, None)
+            exported_target(exports, None)
         } else {
             Err(format!("subpath '{key}' is not exported"))
         };
     };
 
     if let Some(value) = subpaths.get(key).filter(|_| !key.contains('*')) {
-        return resolve_target(value, None);
+        return exported_target(value, None);
     }
     // Pattern keys with one `*`; the longest prefix wins, as in Node.js.
     let mut best: Option<(&str, &Value, &str)> = None;
@@ -325,35 +325,61 @@ fn exports_target(exports: &Value, key: &str) -> std::result::Result<String, Str
         }
     }
     match best {
-        Some((_, value, middle)) => resolve_target(value, Some(middle)),
+        Some((_, value, middle)) => exported_target(value, Some(middle)),
         None => Err(format!("subpath '{key}' is not exported")),
     }
 }
 
-fn resolve_target(value: &Value, star: Option<&str>) -> std::result::Result<String, String> {
-    match value {
-        Value::String(target) => {
-            if !target.starts_with("./") {
-                return Err(format!("export target '{target}' does not start with './'"));
-            }
-            Ok(match star {
-                Some(middle) => target.replace('*', middle),
-                None => target.clone(),
-            })
-        }
-        Value::Null => Err("the subpath is explicitly not exported (null)".to_string()),
-        Value::Object(conditions) => {
-            for (condition, nested) in conditions {
-                if CONDITIONS.contains(&condition.as_str()) {
-                    return resolve_target(nested, star);
-                }
-            }
-            let offered: Vec<&str> = conditions.keys().map(String::as_str).collect();
+/// Result of reading one export target. `NoMatch` is a conditions object
+/// none of whose keys apply; Node.js treats it as undefined and moves on to
+/// the next sibling condition, whereas `null` and malformed targets end the
+/// lookup as errors.
+enum Target {
+    Found(String),
+    NoMatch,
+}
+
+/// Resolves the value an `exports` key maps to, failing when no condition
+/// at any level applies.
+fn exported_target(value: &Value, star: Option<&str>) -> std::result::Result<String, String> {
+    match resolve_target(value, star)? {
+        Target::Found(target) => Ok(target),
+        Target::NoMatch => {
+            let offered: Vec<&str> = match value {
+                Value::Object(conditions) => conditions.keys().map(String::as_str).collect(),
+                _ => Vec::new(),
+            };
             Err(format!(
                 "no export condition matches; the package offers [{}] and Vaern matches [{}]",
                 offered.join(", "),
                 CONDITIONS.join(", ")
             ))
+        }
+    }
+}
+
+fn resolve_target(value: &Value, star: Option<&str>) -> std::result::Result<Target, String> {
+    match value {
+        Value::String(target) => {
+            if !target.starts_with("./") {
+                return Err(format!("export target '{target}' does not start with './'"));
+            }
+            Ok(Target::Found(match star {
+                Some(middle) => target.replace('*', middle),
+                None => target.clone(),
+            }))
+        }
+        Value::Null => Err("the subpath is explicitly not exported (null)".to_string()),
+        Value::Object(conditions) => {
+            for (condition, nested) in conditions {
+                if !CONDITIONS.contains(&condition.as_str()) {
+                    continue;
+                }
+                if let Target::Found(target) = resolve_target(nested, star)? {
+                    return Ok(Target::Found(target));
+                }
+            }
+            Ok(Target::NoMatch)
         }
         Value::Array(_) => Err("export target arrays are not supported".to_string()),
         _ => Err("an export target must be a string, an object or null".to_string()),
@@ -579,6 +605,53 @@ mod tests {
             ("pkg/", "neither relative nor a package name"),
             ("C:\\x.js", "neither relative nor a package name"),
             ("https://x.test/a.js", "neither relative nor a package name"),
+        ] {
+            let err = resolve_from(&root, "main.js", specifier).unwrap_err();
+            let (reason, _) = reason_and_tried(err);
+            assert!(reason.contains(expected), "{specifier}: {reason}");
+        }
+    }
+
+    #[test]
+    fn test_unmatched_nested_conditions_fall_through_to_siblings() {
+        let root = tree(&[
+            ("main.js", ""),
+            (
+                "node_modules/typed/package.json",
+                r#"{"exports": {"import": {"types": "./index.d.ts"}, "default": "./index.js"}}"#,
+            ),
+            ("node_modules/typed/index.js", ""),
+            (
+                "node_modules/deep/package.json",
+                r#"{"exports": {"./sub": {"import": {"node": {"types": "./a.d.ts"}},
+                    "default": {"import": "./sub.js"}}}}"#,
+            ),
+            ("node_modules/deep/sub.js", ""),
+            (
+                "node_modules/nulled/package.json",
+                r#"{"exports": {"import": null, "default": "./index.js"}}"#,
+            ),
+            ("node_modules/nulled/index.js", ""),
+            (
+                "node_modules/typesonly/package.json",
+                r#"{"exports": {"import": {"types": "./index.d.ts"}}}"#,
+            ),
+        ]);
+        assert_eq!(
+            resolve_from(&root, "main.js", "typed").unwrap(),
+            real(&root, "node_modules/typed/index.js")
+        );
+        assert_eq!(
+            resolve_from(&root, "main.js", "deep/sub").unwrap(),
+            real(&root, "node_modules/deep/sub.js")
+        );
+        // null ends the lookup instead of falling through, as in Node.js.
+        for (specifier, expected) in [
+            ("nulled", "explicitly not exported"),
+            (
+                "typesonly",
+                "no export condition matches; the package offers [import]",
+            ),
         ] {
             let err = resolve_from(&root, "main.js", specifier).unwrap_err();
             let (reason, _) = reason_and_tried(err);

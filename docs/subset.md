@@ -42,7 +42,9 @@ web or Node.js behaviour of the same name.
   subpath map, including patterns with one `*` (the longest matching prefix
   wins). Conditions are read in the order the package declares them, and
   the first of `vaern`, `import` or `default` is used. `node` and `require`
-  never match. A `null` target or an unlisted subpath is not exported.
+  never match. A nested conditions object where nothing matches is skipped
+  and the next sibling condition is tried, as in Node.js. A `null` target or
+  an unlisted subpath is not exported.
 - Without `exports`: `pkg/sub` names an exact file in the package, and `pkg`
   uses the `module` field, then `main` only when `"type": "module"` is set.
   Otherwise the package has no ES module entry point and the import fails.
