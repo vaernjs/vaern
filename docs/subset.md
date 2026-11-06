@@ -11,6 +11,10 @@ web or Node.js behaviour of the same name.
 - `.ts` files have their types removed before they run. No type-checking is
   done. Removed types are overwritten with spaces, so line and column numbers
   in stack traces and errors match the `.ts` source.
+- Columns count UTF-8 bytes, as the engine reports them, in `.js` and `.ts`
+  files alike. On a line with non-ASCII text before the reported position,
+  the column is higher than the one an editor shows: one more for each extra
+  byte, so 1 for `é`, 2 for `文` and 3 for an emoji.
 - TypeScript constructs that emit runtime code are rejected with a
   `file:line:col` error: `enum`, `const enum`, `namespace`/`module` blocks and
   decorators. Their `declare` forms (`declare enum`, `declare namespace`,

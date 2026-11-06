@@ -3481,6 +3481,34 @@ mod tests {
         assert_eq!(runtime.eval("ambient.ts", code).unwrap(), 0);
     }
 
+    // The engine reports byte columns, so blanked type text must keep its
+    // byte length for `.ts` columns to agree with `.js` ones.
+    #[test]
+    fn test_columns_count_bytes_in_js_and_in_blanked_ts_types() {
+        let column = |name: &str, code: &str| {
+            let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+            let text = runtime.eval(name, code).unwrap_err().to_string();
+            let start = text.rfind(name).unwrap_or_else(|| panic!("{text}")) + name.len();
+            text[start..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == ':')
+                .collect::<String>()
+        };
+        // '文' is three bytes, the same as 'abc'.
+        let js_wide = column("wide.js", "const s = '文'; throw new Error('x');\n");
+        let js_ascii = column("ascii.js", "const s = 'abc'; throw new Error('x');\n");
+        let ts_wide = column(
+            "wide.ts",
+            "const s: Array<文> = []; throw new Error('x');\n",
+        );
+        let ts_ascii = column(
+            "ascii.ts",
+            "const s: Array<abc> = []; throw new Error('x');\n",
+        );
+        assert_eq!(js_wide, js_ascii);
+        assert_eq!(ts_wide, ts_ascii);
+    }
+
     #[test]
     fn test_parse_error_reports_name_message_and_location() {
         let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
