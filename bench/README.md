@@ -19,6 +19,23 @@ The startup loss held in both orders (+1.1 ms with 0.0.6 first). It has not been
 
 Binary size, stripped: 16,103,936 bytes (0.0.5: 15,860,224, +243,712). This is 375,296 bytes over the 15 MiB budget.
 
+## Unreleased hardening against 0.0.6
+
+Re-run on 2026-11-07 on the same machine, after the fetch body cap, the pool timer and the streaming backpressure change. The 0.0.6 binary was built from the `v0.0.6` tag in the same session; each row is one hyperfine call with 0.0.6 listed first, using the commands below, and startup and parallel HTTP were repeated with the new build first. Absolute times are lower than on 2026-11-04 for both builds; compare within a row only.
+
+| Benchmark | Unreleased | 0.0.6 | Comparison | Status |
+|---|---|---|---|---|
+| Startup and greeting | 10.7 ms ± 1.1 | 10.1 ms ± 0.6 | `node -e 0`: 39.3 ms | **Loss, +0.6 ms** (+0.7 ms with the new build first) |
+| Loopback fetch and JSON parse | 16.1 ms ± 3.7 | 17.3 ms ± 5.8 | | Within noise |
+| Arithmetic loop (1M) | 38.2 ms ± 1.4 | 38.8 ms ± 2.3 | Node: 86.9 ms | Within noise; win vs Node |
+| Arithmetic loop (50M) | 1.415 s ± 0.043 | 1.412 s ± 0.045 | Node: 0.262 s | **Loss, 5.4x slower than Node**; unchanged from 0.0.6 |
+| Parallel HTTP (100 requests) | 50.0 ms ± 3.7 | 48.2 ms ± 3.4 | | Within noise (−1.2% with the new build first) |
+| Idle HTTP server, CPU over 3 s | 0.0 ms | 0.0 ms | | Unchanged |
+
+The startup loss has not been profiled. The likely cause is the larger JavaScript prelude evaluated at every start (the managed-header list, the stream wait map and the `TextDecoder` option checks); the fetch client and its pool timer are built only on the first fetch, so `hello.ts` does not pay for them.
+
+Binary size, stripped: 16,166,912 bytes (0.0.6: 16,103,936, +62,976), 438,272 bytes over the 15 MiB budget.
+
 ## Reproduction commands
 
 Build first with `cargo build --release`. To compare two versions, pass both binaries to the same hyperfine call.
