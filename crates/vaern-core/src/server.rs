@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 /// Validates that a hostname is either 'localhost' or a valid IPv4/IPv6 address.
 pub fn validate_hostname(hostname: &str, port: u16) -> Result<IpAddr> {
@@ -252,7 +252,9 @@ pub struct HttpServer {
     pub server_id: u32,
     pub hostname: String,
     pub port: u16,
-    shutdown_notify: Arc<tokio::sync::Notify>,
+    /// Set to `true` by `close()`. A watch channel keeps the value, so the
+    /// accept loop sees a close it was not waiting for when it was sent.
+    shutdown_tx: watch::Sender<bool>,
     in_flight: Arc<AtomicUsize>,
     is_closed: Arc<AtomicBool>,
 }
@@ -268,11 +270,10 @@ impl HttpServer {
         tokio_handle: tokio::runtime::Handle,
         limits: ServerLimits,
     ) -> Self {
-        let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let in_flight = Arc::new(AtomicUsize::new(0));
         let is_closed = Arc::new(AtomicBool::new(false));
 
-        let shutdown_rx = shutdown_notify.clone();
         let in_flight_server = in_flight.clone();
         let is_closed_server = is_closed.clone();
         let server_hostname = hostname.clone();
@@ -282,10 +283,20 @@ impl HttpServer {
             let next_req_id = Arc::new(AtomicU64::new(1));
 
             loop {
+                // Checked on every pass, so a close sent while this task was
+                // busy between accepts, or before it first ran, stops it here.
+                if *shutdown_rx.borrow_and_update() {
+                    break;
+                }
                 tokio::select! {
                     biased;
-                    _ = shutdown_rx.notified() => {
-                        break;
+                    changed = shutdown_rx.changed() => {
+                        // An error means the handle is gone and nothing can
+                        // close this server any more, so stop accepting.
+                        if changed.is_err() {
+                            break;
+                        }
+                        continue;
                     }
                     accept_res = listener.accept() => {
                         let (stream, _) = match accept_res {
@@ -429,7 +440,7 @@ impl HttpServer {
             server_id,
             hostname,
             port,
-            shutdown_notify,
+            shutdown_tx,
             in_flight,
             is_closed,
         }
@@ -445,7 +456,7 @@ impl HttpServer {
         if self.is_closed.swap(true, Ordering::SeqCst) {
             return;
         }
-        self.shutdown_notify.notify_waiters();
+        self.shutdown_tx.send_replace(true);
 
         let start = Instant::now();
         while self.in_flight.load(Ordering::SeqCst) > 0 {
@@ -667,6 +678,51 @@ mod tests {
             }
             _ => panic!("expected typed server error for invalid IP"),
         }
+    }
+
+    /// True when `addr` still accepts a connection and answers a request.
+    async fn still_serving(addr: SocketAddr) -> bool {
+        let connect = tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(addr)).await;
+        let Ok(Ok(mut stream)) = connect else {
+            return false;
+        };
+        let request = b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+        if stream.write_all(request).await.is_err() {
+            return false;
+        }
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(1), stream.read_to_end(&mut buf)).await;
+        buf.starts_with(b"HTTP/1.1 200")
+    }
+
+    // On the single-threaded test runtime the accept task has not run yet
+    // when close() returns, so no task is waiting for the shutdown signal.
+    #[tokio::test]
+    async fn test_close_before_the_accept_loop_runs_stops_the_listener() {
+        let (server, addr, dispatched) = start_counting_server(short_limits()).await;
+        server.close().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !still_serving(addr).await,
+            "the listener still accepts after close()"
+        );
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_close_during_accept_traffic_stops_the_listener() {
+        let (server, addr, _) = start_counting_server(short_limits()).await;
+        let traffic = tokio::spawn(async move {
+            loop {
+                let _ = still_serving(addr).await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        server.close().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let serving = still_serving(addr).await;
+        traffic.abort();
+        assert!(!serving, "the listener still accepts after close()");
     }
 
     #[tokio::test]
