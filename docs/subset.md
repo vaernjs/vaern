@@ -14,6 +14,11 @@ web or Node.js behaviour of the same name.
 - TypeScript constructs that emit runtime code are rejected with a
   `file:line:col` error: `enum`, `const enum`, `namespace`/`module` blocks and
   decorators.
+- Auto-accessor fields (`accessor x = 1`) are rejected the same way. The
+  engine cannot parse them, and removing the keyword would turn a getter and
+  setter on the prototype into a plain field.
+- A syntax error the engine finds in a `.js` file is reported as
+  `SyntaxError: <message>` with its `file:line:col`.
 - Imports used only as types are removed, as TypeScript removes them, so a
   module that exports nothing at runtime can still be imported for its types.
 - A module where types cannot be overwritten in place is re-printed from the

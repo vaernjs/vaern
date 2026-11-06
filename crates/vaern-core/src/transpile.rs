@@ -3,7 +3,8 @@
 //! This module owns stripping TypeScript types (interfaces, type aliases, generics,
 //! `as` expressions, type annotations) to emit valid standard ECMAScript code.
 //! It intentionally rejects constructs that cannot be erased without changing runtime
-//! behaviour (enums, const enums, namespaces, decorators) with descriptive errors.
+//! behaviour (enums, const enums, namespaces, decorators, auto-accessors) with
+//! descriptive errors.
 //!
 //! Types are removed in place by `blank_strip`, so stack traces and error
 //! locations match the `.ts` file. Modules that path cannot rewrite safely are
@@ -181,6 +182,23 @@ impl<'a> Visit for UnsupportedValidator<'a> {
         decl.visit_children_with(self);
     }
 
+    // The engine cannot parse `accessor`, and erasing the keyword would turn
+    // a getter/setter pair on the prototype into an own data field, so the
+    // member is rejected rather than rewritten.
+    fn visit_auto_accessor(&mut self, accessor: &AutoAccessor) {
+        if self.error.is_none() {
+            let loc = self.cm.lookup_char_pos(accessor.span.lo);
+            self.error = Some(VaernError::UnsupportedFeature {
+                file: self.filename.clone(),
+                line: loc.line,
+                col: loc.col_display + 1,
+                feature: "accessor".to_string(),
+                message: "auto-accessor fields are not supported by the engine and cannot be erased without changing behaviour; declare a getter and setter over a private field instead".to_string(),
+            });
+        }
+        accessor.visit_children_with(self);
+    }
+
     fn visit_decorator(&mut self, decorator: &Decorator) {
         if self.error.is_none() {
             let loc = self.cm.lookup_char_pos(decorator.span.lo);
@@ -302,6 +320,29 @@ mod tests {
                 assert_eq!(line, 1);
             }
             _ => panic!("expected UnsupportedFeature for decorator"),
+        }
+    }
+
+    #[test]
+    fn test_reject_auto_accessor_at_its_location() {
+        let transpiler = SwcTranspiler;
+        for (ts, col) in [
+            ("class Box {\n  accessor x: number = 1;\n}", 3),
+            ("class Box {\n    static accessor #y = 2;\n}", 5),
+        ] {
+            match transpiler.transpile("acc.ts", ts) {
+                Err(VaernError::UnsupportedFeature {
+                    feature,
+                    line,
+                    col: at,
+                    message,
+                    ..
+                }) => {
+                    assert_eq!((feature.as_str(), line, at), ("accessor", 2, col), "{ts}");
+                    assert!(message.contains("getter and setter"), "{message}");
+                }
+                other => panic!("expected UnsupportedFeature for accessor, got {other:?}"),
+            }
         }
     }
 

@@ -76,6 +76,22 @@ const cases = [
     stderrExcludes: ["panicked"],
   },
   {
+    name: "parse_error.js reports the SyntaxError name, message and location",
+    args: ["run", "parse_error.js"],
+    code: 1,
+    stdout: "",
+    stderrIncludes: ["SyntaxError: unexpected token in expression", "parse_error.js:2:"],
+    stderrExcludes: ["panicked"],
+  },
+  {
+    name: "accessor.ts rejects an auto-accessor at its location",
+    args: ["run", "accessor.ts"],
+    code: 1,
+    stdout: "",
+    stderrIncludes: ["unsupported TypeScript feature 'accessor' in 'accessor.ts:2:3'", "getter and setter"],
+    stderrExcludes: ["panicked", "SyntaxError"],
+  },
+  {
     name: "throws.js reports file:line:col and fails",
     args: ["run", "throws.js"],
     code: 1,

@@ -184,6 +184,8 @@ fn describe_rejection(reason: &Value<'_>) -> String {
         let stack = stack.trim_end();
         return if stack.is_empty() {
             head
+        } else if stack.starts_with(&head) {
+            stack.to_string()
         } else {
             format!("{head}\n{stack}")
         };
@@ -2460,13 +2462,10 @@ impl Runtime for QuickJsRuntime {
         if let Err(err) = eval_result {
             let msg = self.context.with(|ctx| {
                 let exc = ctx.catch();
-                if let Some(e) = exc.as_exception() {
-                    // A failed import is thrown with an empty stack, so a blank
-                    // stack must not hide the message.
-                    e.stack()
-                        .filter(|stack| !stack.trim().is_empty())
-                        .or_else(|| e.message())
-                        .unwrap_or_else(|| err.to_string())
+                // The stack of a parse error or failed import holds only the
+                // frame, so the name and message are added to it.
+                if exc.as_exception().is_some() {
+                    describe_rejection(&exc)
                 } else if let Some(s) = exc.as_string() {
                     s.to_string().unwrap_or_else(|_| err.to_string())
                 } else {
@@ -2513,13 +2512,10 @@ impl Runtime for QuickJsRuntime {
         if let Err(err) = eval_result {
             let msg = self.context.with(|ctx| {
                 let exc = ctx.catch();
-                if let Some(e) = exc.as_exception() {
-                    // A failed import is thrown with an empty stack, so a blank
-                    // stack must not hide the message.
-                    e.stack()
-                        .filter(|stack| !stack.trim().is_empty())
-                        .or_else(|| e.message())
-                        .unwrap_or_else(|| err.to_string())
+                // The stack of a parse error or failed import holds only the
+                // frame, so the name and message are added to it.
+                if exc.as_exception().is_some() {
+                    describe_rejection(&exc)
                 } else if let Some(s) = exc.as_string() {
                     s.to_string().unwrap_or_else(|_| err.to_string())
                 } else {
@@ -3180,6 +3176,20 @@ mod tests {
             }
             other => panic!("expected a resolution error, got {other}"),
         }
+    }
+
+    #[test]
+    fn test_parse_error_reports_name_message_and_location() {
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        let err = runtime
+            .eval("bad.js", "const a = 1;\nconst b = a +;\n")
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("SyntaxError: unexpected token in expression"),
+            "{text}"
+        );
+        assert!(text.contains("bad.js:2:"), "{text}");
     }
 
     #[test]
