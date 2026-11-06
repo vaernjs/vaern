@@ -19,7 +19,7 @@ use hyper::header::{HeaderName, HeaderValue, LOCATION};
 use hyper::{Method, Request, StatusCode};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::{TokioExecutor, TokioTimer};
 use rustls::{ClientConfig, RootCertStore};
 use std::convert::Infallible;
 use std::future;
@@ -84,8 +84,19 @@ pub fn build_http_client() -> Result<HttpClient> {
     build_client_with_roots(root_store)
 }
 
+/// How long a pooled connection may sit idle before the pool closes it.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Idle connections kept per host. Without a bound, a runtime that fetches
+/// from many hosts holds sockets open for its whole lifetime.
+const POOL_MAX_IDLE_PER_HOST: usize = 8;
+
 /// Builds a client that trusts exactly `root_store`.
 pub(crate) fn build_client_with_roots(root_store: RootCertStore) -> Result<HttpClient> {
+    build_client(root_store, POOL_IDLE_TIMEOUT)
+}
+
+fn build_client(root_store: RootCertStore, idle_timeout: Duration) -> Result<HttpClient> {
     init_crypto_provider();
     let tls_config = ClientConfig::builder()
         .with_root_certificates(root_store)
@@ -97,7 +108,13 @@ pub(crate) fn build_client_with_roots(root_store: RootCertStore) -> Result<HttpC
         .enable_http1()
         .build();
 
-    let client = Client::builder(TokioExecutor::new()).build(https);
+    // The pool timer is what makes the idle timeout run in the background;
+    // without it expired connections are found only when a host is reused.
+    let client = Client::builder(TokioExecutor::new())
+        .pool_timer(TokioTimer::new())
+        .pool_idle_timeout(idle_timeout)
+        .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
+        .build(https);
     Ok(client)
 }
 
@@ -484,6 +501,30 @@ mod tests {
             assert_eq!(res.body, b"ok");
         }
         assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_pool_closes_idle_connections_without_further_requests() {
+        let (addr, _, closed) = crate::test_tls::start_tracking_http_server().expect("server");
+        let client =
+            build_client(RootCertStore::empty(), Duration::from_millis(200)).expect("client");
+        let res = execute_fetch_pooled(
+            &client,
+            &format!("http://{addr}/"),
+            FetchOptions::default(),
+            None,
+        )
+        .await
+        .expect("fetch");
+        assert_eq!(res.body, b"ok");
+        // Nothing touches the client again; only the pool timer can close it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while closed.load(std::sync::atomic::Ordering::SeqCst) == 0
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(closed.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

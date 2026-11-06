@@ -309,9 +309,17 @@ async fn route(
 /// connections it has accepted. A client that reuses connections keeps the
 /// count at one across sequential requests.
 pub fn start_counting_http_server() -> Option<(SocketAddr, Arc<AtomicUsize>)> {
+    start_tracking_http_server().map(|(addr, accepted, _)| (addr, accepted))
+}
+
+/// Like [`start_counting_http_server`], and also counts connections the
+/// client has closed, so a test can see a pool drop an idle socket.
+pub fn start_tracking_http_server() -> Option<(SocketAddr, Arc<AtomicUsize>, Arc<AtomicUsize>)> {
     let (addr_tx, addr_rx) = std::sync::mpsc::channel();
     let accepted = Arc::new(AtomicUsize::new(0));
+    let closed = Arc::new(AtomicUsize::new(0));
     let counter = accepted.clone();
+    let closed_counter = closed.clone();
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -329,6 +337,7 @@ pub fn start_counting_http_server() -> Option<(SocketAddr, Arc<AtomicUsize>)> {
             let _ = addr_tx.send(addr);
             while let Ok((stream, _)) = listener.accept().await {
                 counter.fetch_add(1, Ordering::SeqCst);
+                let closed_counter = closed_counter.clone();
                 tokio::spawn(async move {
                     let service = hyper::service::service_fn(|_req| async {
                         Ok::<_, Infallible>(hyper::Response::new(Full::new(Bytes::from("ok"))))
@@ -336,10 +345,12 @@ pub fn start_counting_http_server() -> Option<(SocketAddr, Arc<AtomicUsize>)> {
                     let _ = hyper::server::conn::http1::Builder::new()
                         .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
                         .await;
+                    // serve_connection ends once the client closes the socket.
+                    closed_counter.fetch_add(1, Ordering::SeqCst);
                 });
             }
         });
     });
     let addr = addr_rx.recv().ok()?;
-    Some((addr, accepted))
+    Some((addr, accepted, closed))
 }
