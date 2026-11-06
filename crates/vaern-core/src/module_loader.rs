@@ -126,10 +126,14 @@ fn split_package(specifier: &str) -> Option<(&str, Option<&str>)> {
         specifier.find('/').unwrap_or(specifier.len())
     };
     let name = &specifier[..name_len];
+    // No part, scope included, may start with a dot, as in npm, so `@a/..`
+    // cannot name the node_modules directory itself.
     let valid = !name.is_empty()
-        && !name.starts_with('.')
         && !name.contains(['\\', '%', ':'])
-        && name.split('/').all(|part| !part.is_empty() && part != "@");
+        && name.split('/').all(|part| {
+            let bare = part.strip_prefix('@').unwrap_or(part);
+            !bare.is_empty() && !bare.starts_with('.')
+        });
     if !valid {
         return None;
     }
@@ -656,6 +660,19 @@ mod tests {
             let err = resolve_from(&root, "main.js", specifier).unwrap_err();
             let (reason, _) = reason_and_tried(err);
             assert!(reason.contains(expected), "{specifier}: {reason}");
+        }
+    }
+
+    #[test]
+    fn test_dot_parts_are_not_package_names() {
+        let root = tree(&[("main.js", ""), ("node_modules/@a/x/index.js", "")]);
+        for specifier in ["@a/..", "@a/.", "@a/../x", "@a/.x", "@./x", "..pkg"] {
+            let err = resolve_from(&root, "main.js", specifier).unwrap_err();
+            let (reason, _) = reason_and_tried(err);
+            assert!(
+                reason.contains("neither relative nor a package name"),
+                "{specifier}: {reason}"
+            );
         }
     }
 
