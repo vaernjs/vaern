@@ -178,12 +178,28 @@ fn parse_fetch_url(initial_url: &str) -> Result<Url> {
     Ok(url)
 }
 
+/// Resolves once an abort has been sent on `abort_rx`, including one sent
+/// before this call: the receiver keeps its own read position, so an abort
+/// between redirect hops waits for the next hop instead of being missed.
+/// A closed channel means nobody can abort any more, not an abort.
+async fn aborted(abort_rx: &mut Option<broadcast::Receiver<()>>) {
+    let Some(rx) = abort_rx else {
+        return future::pending().await;
+    };
+    loop {
+        match rx.recv().await {
+            Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => return,
+            Err(broadcast::error::RecvError::Closed) => future::pending::<()>().await,
+        }
+    }
+}
+
 /// Executes a fetch on `client`, following up to 20 redirects and enforcing timeouts.
 async fn execute_fetch_with(
     client: &HttpClient,
     mut current_url: Url,
     options: FetchOptions,
-    abort_rx: Option<broadcast::Receiver<()>>,
+    mut abort_rx: Option<broadcast::Receiver<()>>,
 ) -> Result<FetchResponse> {
     let timeout_duration = options.timeout.unwrap_or(DEFAULT_TIMEOUT);
 
@@ -233,19 +249,14 @@ async fn execute_fetch_with(
                 action: "verify header names and values".to_string(),
             })?;
 
-        // Race request execution against timeout and cancellation
+        // Race request execution against timeout and cancellation. The abort
+        // arm is polled first, so an abort already sent stops this hop before
+        // any of its bytes, credentials included, leave the process.
         let send_future = client.request(req);
-        let mut abort_channel = abort_rx.as_ref().map(|rx| rx.resubscribe());
 
         let resp = tokio::select! {
             biased;
-            _ = async {
-                if let Some(ref mut rx) = abort_channel {
-                    let _ = rx.recv().await;
-                } else {
-                    future::pending::<()>().await;
-                }
-            } => {
+            _ = aborted(&mut abort_rx) => {
                 return Err(VaernError::Fetch {
                     stage: "send".to_string(),
                     url: current_url.to_string(),
@@ -353,13 +364,7 @@ async fn execute_fetch_with(
         let body_future = resp.into_body().collect();
         let body_bytes_result = tokio::select! {
             biased;
-            _ = async {
-                if let Some(ref mut rx) = abort_channel {
-                    let _ = rx.recv().await;
-                } else {
-                    future::pending::<()>().await;
-                }
-            } => {
+            _ = aborted(&mut abort_rx) => {
                 return Err(VaernError::Fetch {
                     stage: "read".to_string(),
                     url: current_url.to_string(),
@@ -687,5 +692,98 @@ mod tests {
             }
             _ => panic!("expected aborted fetch error"),
         }
+    }
+
+    type Seen = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// Loopback server recording "path authorization" per request. `/hop1`
+    /// runs `on_hop1`, then redirects to `/hop2` on the same origin, so the
+    /// client would carry the Authorization header to the second hop.
+    async fn start_recording_server(
+        on_hop1: impl Fn() + Clone + Send + Sync + 'static,
+    ) -> (std::net::SocketAddr, Seen) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: Seen = Default::default();
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (log, on_hop1) = (log.clone(), on_hop1.clone());
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(move |req: Request<_>| {
+                        let auth = req
+                            .headers()
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("-")
+                            .to_string();
+                        log.lock()
+                            .unwrap()
+                            .push(format!("{} {auth}", req.uri().path()));
+                        let mut res = hyper::Response::new(Full::new(Bytes::from("ok")));
+                        if req.uri().path() == "/hop1" {
+                            on_hop1();
+                            *res.status_mut() = StatusCode::FOUND;
+                            res.headers_mut()
+                                .insert(LOCATION, HeaderValue::from_static("/hop2"));
+                        }
+                        async move { Ok::<_, Infallible>(res) }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        (addr, seen)
+    }
+
+    fn with_credentials() -> FetchOptions {
+        FetchOptions {
+            headers: vec![("authorization".to_string(), "Bearer secret".to_string())],
+            timeout: Some(Duration::from_secs(5)),
+            ..Default::default()
+        }
+    }
+
+    fn assert_aborted(result: Result<FetchResponse>) {
+        match result {
+            Err(VaernError::Fetch { message, .. }) => {
+                assert!(message.contains("aborted by AbortSignal"), "{message}")
+            }
+            Err(other) => panic!("expected an abort, got {other}"),
+            Ok(res) => panic!("expected an abort, got status {}", res.status),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_abort_sent_before_the_request_starts_is_not_lost() {
+        let (addr, seen) = start_recording_server(|| {}).await;
+        let (tx, rx) = broadcast::channel(1);
+        tx.send(()).unwrap();
+        let result =
+            execute_fetch(&format!("http://{addr}/hop1"), with_credentials(), Some(rx)).await;
+        assert_aborted(result);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_abort_during_a_redirect_keeps_credentials_from_the_next_hop() {
+        let (tx, rx) = broadcast::channel(1);
+        let (addr, seen) = start_recording_server(move || {
+            let _ = tx.send(());
+        })
+        .await;
+        let result =
+            execute_fetch(&format!("http://{addr}/hop1"), with_credentials(), Some(rx)).await;
+        assert_aborted(result);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["/hop1 Bearer secret".to_string()]
+        );
     }
 }
