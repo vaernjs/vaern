@@ -6,7 +6,9 @@
 //! Every connection is bounded before a request reaches JavaScript: headers
 //! and bodies must arrive within a deadline and bodies are capped in size, so
 //! a slow or oversized client costs a rejection response rather than memory
-//! or a stuck connection.
+//! or a stuck connection. Open connections and requests in flight are capped
+//! too, and the excess is answered with 503, so the memory a server can hold
+//! for clients is bounded however many of them arrive at once.
 
 use crate::error::{Result, VaernError};
 use bytes::Bytes;
@@ -58,12 +60,32 @@ pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// than the cap plus this allowance is cut off without draining.
 pub const MAX_DRAIN_BYTES: usize = 8 * 1024 * 1024;
 
+/// Default cap on open connections per server. A connection past it is
+/// answered with 503 and closed instead of being served.
+pub const MAX_CONNECTIONS: usize = 1024;
+
+/// Default cap on requests received but not yet answered, per server. Each
+/// can hold a body of up to `MAX_REQUEST_BODY_BYTES` while JavaScript, which
+/// handles one request at a time, works through the queue, so this bounds
+/// buffered bodies at 128 MiB.
+pub const MAX_IN_FLIGHT: usize = 128;
+
+/// How long, and how many bytes, a refused connection is read for after its
+/// 503, so the client's unread request does not reset the connection.
+const REFUSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const REFUSE_DRAIN_BYTES: usize = 64 * 1024;
+
+/// Sent on a connection over `max_connections` before it is closed.
+const BUSY_RESPONSE: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\ncontent-type: text/plain\r\ncontent-length: 40\r\n\r\nserver busy: too many open connections.\n";
+
 /// Bounds applied to every request a server accepts.
 #[derive(Debug, Clone, Copy)]
 pub struct ServerLimits {
     pub max_body_bytes: usize,
     pub header_read_timeout: Duration,
     pub body_read_timeout: Duration,
+    pub max_connections: usize,
+    pub max_in_flight: usize,
 }
 
 impl Default for ServerLimits {
@@ -72,6 +94,8 @@ impl Default for ServerLimits {
             max_body_bytes: MAX_REQUEST_BODY_BYTES,
             header_read_timeout: HEADER_READ_TIMEOUT,
             body_read_timeout: BODY_READ_TIMEOUT,
+            max_connections: MAX_CONNECTIONS,
+            max_in_flight: MAX_IN_FLIGHT,
         }
     }
 }
@@ -281,6 +305,7 @@ impl HttpServer {
         let tokio_handle_loop = tokio_handle.clone();
         tokio_handle.spawn(async move {
             let next_req_id = Arc::new(AtomicU64::new(1));
+            let connections = Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
 
             loop {
                 // Checked on every pass, so a close sent while this task was
@@ -309,6 +334,32 @@ impl HttpServer {
                             }
                         };
 
+                        // Held for the life of the connection task.
+                        let Ok(permit) = connections.clone().try_acquire_owned() else {
+                            tokio_handle_loop.spawn(async move {
+                                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                                let mut stream = stream;
+                                let _ = stream.write_all(BUSY_RESPONSE).await;
+                                let _ = stream.shutdown().await;
+                                // Closing with the request unread makes the kernel
+                                // reset the connection, which can discard the 503
+                                // before the client reads it, so read a bounded
+                                // amount of what it sent first.
+                                let mut sink = [0u8; 4096];
+                                let mut drained = 0;
+                                let _ = tokio::time::timeout(REFUSE_DRAIN_TIMEOUT, async {
+                                    while drained < REFUSE_DRAIN_BYTES {
+                                        match stream.read(&mut sink).await {
+                                            Ok(0) | Err(_) => break,
+                                            Ok(n) => drained += n,
+                                        }
+                                    }
+                                })
+                                .await;
+                            });
+                            continue;
+                        };
+
                         let req_tx = request_tx.clone();
                         let in_flight_conn = in_flight_server.clone();
                         let next_req_id_conn = next_req_id.clone();
@@ -324,8 +375,16 @@ impl HttpServer {
 
                                 async move {
                                     // Count the request before its body arrives, so
-                                    // close() also drains uploads still in progress.
-                                    in_flight_req.fetch_add(1, Ordering::SeqCst);
+                                    // close() also drains uploads still in progress,
+                                    // and refuse it before the body is buffered when
+                                    // the queue for JavaScript is already full.
+                                    if in_flight_req.fetch_add(1, Ordering::SeqCst) >= limits.max_in_flight {
+                                        in_flight_req.fetch_sub(1, Ordering::SeqCst);
+                                        return Ok::<_, Infallible>(rejection(
+                                            StatusCode::SERVICE_UNAVAILABLE,
+                                            "server busy: too many requests in flight; retry later",
+                                        ));
+                                    }
                                     let method = req.method().to_string();
                                     let uri = req.uri().to_string();
 
@@ -436,6 +495,7 @@ impl HttpServer {
                                 .timer(TokioTimer::new())
                                 .header_read_timeout(limits.header_read_timeout);
                             let _ = builder.serve_connection(io, service).await;
+                            drop(permit);
                         });
                     }
                 }
@@ -531,6 +591,7 @@ mod tests {
             max_body_bytes: 1024,
             header_read_timeout: Duration::from_millis(200),
             body_read_timeout: Duration::from_millis(200),
+            ..ServerLimits::default()
         }
     }
 
@@ -639,6 +700,64 @@ mod tests {
             .expect("write request");
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(server.in_flight(), 1);
+    }
+
+    #[test]
+    fn test_busy_response_declares_its_body_length() {
+        let text = std::str::from_utf8(BUSY_RESPONSE).unwrap();
+        let (head, body) = text.split_once("\r\n\r\n").unwrap();
+        let declared = format!("\r\ncontent-length: {}", body.len());
+        assert!(head.contains(&declared), "{head}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_connection_over_the_cap_is_answered_with_503() {
+        let limits = ServerLimits {
+            max_connections: 1,
+            ..ServerLimits::default()
+        };
+        let (_server, addr, dispatched) = start_counting_server(limits).await;
+        let held = TcpStream::connect(addr).await.expect("connect");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let get = b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+        let refused = exchange(addr, get, Duration::from_secs(3)).await;
+        assert!(refused.starts_with("HTTP/1.1 503"), "{refused}");
+        assert!(
+            refused.ends_with("too many open connections.\n"),
+            "{refused}"
+        );
+        // Closing the held connection frees its slot.
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let served = exchange(addr, get, Duration::from_secs(3)).await;
+        assert!(served.starts_with("HTTP/1.1 200"), "{served}");
+        assert_eq!(dispatched.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_request_over_the_in_flight_cap_is_refused_before_its_body() {
+        let limits = ServerLimits {
+            max_in_flight: 1,
+            ..ServerLimits::default()
+        };
+        let (server, addr, dispatched) = start_counting_server(limits).await;
+        // In flight from its headers on, while the rest of its body is awaited.
+        let mut pending = TcpStream::connect(addr).await.expect("connect");
+        pending
+            .write_all(b"POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 10\r\n\r\nab")
+            .await
+            .expect("write request");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let refused = exchange(
+            addr,
+            b"POST / HTTP/1.1\r\nHost: t\r\nConnection: close\r\nContent-Length: 5\r\n\r\nhello",
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(refused.starts_with("HTTP/1.1 503"), "{refused}");
+        assert!(refused.contains("too many requests in flight"), "{refused}");
+        assert_eq!(server.in_flight(), 1);
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
     }
 
     #[test]

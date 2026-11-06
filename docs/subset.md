@@ -245,6 +245,9 @@ a `Response`, or a promise of one.
   before the handler runs.
 - Headers must arrive within 10 seconds (408 otherwise), and the body within
   30 seconds.
+- A server keeps at most 1024 connections open; another one is answered with
+  503 and closed. At most 128 requests can wait for the handler at once;
+  another one is answered with 503 before its body is read.
 - A handler that throws is answered with 500.
 - A `ReadableStream` response body is sent as the client reads it. While a
   slow client has the buffer full, only that response waits; timers, other
