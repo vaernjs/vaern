@@ -8,3 +8,8 @@ resolver = "2"
 [profile.release]
 # Shipped binaries carry no symbol tables; the size budget is for the stripped binary.
 strip = true
+# Whole-program optimisation across crates takes the stripped binary from
+# 16.2 MB to 9.4 MB, inside the 15 MiB budget, at the cost of a slower
+# release build. Panics still unwind so host-function panics surface as now.
+lto = "fat"
+codegen-units = 1
