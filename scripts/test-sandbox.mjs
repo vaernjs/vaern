@@ -34,6 +34,17 @@ fs.mkdirSync(path.join(sandbox, "out"));
 const installed = path.join(sandbox, "resolve", "node_modules");
 fs.rmSync(installed, { recursive: true, force: true });
 fs.cpSync(path.join(sandbox, "resolve", "packages"), installed, { recursive: true });
+// A linked package, as pnpm installs them. "junction" is ignored outside
+// Windows, where it lets the link be made without extra privileges.
+fs.symlinkSync(path.join(installed, "greeter"), path.join(installed, "linked-greeter"), "junction");
+// Files at and one byte past the vaern:fs read cap, made at run time so the
+// repository carries no 64 MiB fixture.
+const readCap = 64 * 1024 * 1024;
+for (const [name, size] of [["exact.bin", readCap], ["over.bin", readCap + 1]]) {
+  const file = path.join(sandbox, "out", name);
+  fs.writeFileSync(file, "");
+  fs.truncateSync(file, size);
+}
 
 const cases = [
   {
@@ -172,6 +183,20 @@ const cases = [
       "FsError open EEXIST true\n" +
       "FsError open ENOENT true\n" +
       "FsError open EISDIR true\n",
+    stderr: "",
+  },
+  {
+    name: "fs_limits.ts reads a file at the cap and refuses one a byte over it",
+    args: ["run", "fs_limits.ts"],
+    code: 0,
+    stdout: "67108864\nFsError EFBIG\n",
+    stderr: "",
+  },
+  {
+    name: "resolve/linked.ts imports a package through a directory link",
+    args: ["run", "resolve/linked.ts"],
+    code: 0,
+    stdout: "hello, link\n",
     stderr: "",
   },
   {
