@@ -5,7 +5,9 @@
 //! and driving the event loop to completion using Tokio.
 
 use crate::error::{Result, VaernError};
-use crate::event::{EventReceiver, EventSender, FetchCompletion, FsCompletion, LoopEvent};
+use crate::event::{
+    EventReceiver, EventSender, FetchCompletion, FsCompletion, LoopEvent, StreamChunkSent,
+};
 use crate::module_loader::{FsModuleLoader, ModuleLoader};
 use crate::server::{HttpServer, ServerIncomingRequest, ServerResponse, ServerResponseBody};
 use crate::transpile::{SwcTranspiler, Transpiler};
@@ -14,7 +16,7 @@ use rquickjs::{
     Array, ArrayBuffer, Context, Ctx, Function, Module, Object, Runtime as QjsRuntime, Value,
 };
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -59,6 +61,9 @@ struct SharedState {
     server_resp_senders: HashMap<u64, tokio::sync::oneshot::Sender<ServerResponse>>,
     server_stream_senders:
         HashMap<u64, tokio::sync::mpsc::Sender<std::result::Result<bytes::Bytes, std::io::Error>>>,
+    /// Streamed responses whose last chunk is waiting for buffer space. Each
+    /// keeps the event loop alive until its outcome is delivered to JS.
+    stream_sends_waiting: HashSet<u64>,
     /// First unhandled promise rejection or uncaught timer exception. The event
     /// loop turns it into an error so a throwing script cannot exit with status 0.
     unhandled_error: Option<String>,
@@ -208,35 +213,37 @@ pub(crate) const HEAP_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 /// How long the pump waits for buffer space before treating the client as stalled.
 const STREAM_CHUNK_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Hands one response chunk to the connection, waiting for buffer space.
+/// The error for a chunk written after the client went away.
+fn stream_closed(req_id: u64) -> VaernError {
+    VaernError::ServerStream {
+        req_id,
+        message: "the client closed the connection before the body was complete".to_string(),
+        action: "Stop writing to this response; the remaining chunks cannot be delivered"
+            .to_string(),
+    }
+}
+
+/// Hands one response chunk to the connection, waiting up to `wait` for
+/// buffer space.
 ///
 /// Waiting gives the pump backpressure: a burst larger than the buffer is
-/// delivered in full instead of dropping chunks. The wait happens on the JS
-/// thread through `block_on`, which is safe because the connection drains on
-/// the Tokio worker threads, never on this one.
-fn send_stream_chunk(
-    handle: &tokio::runtime::Handle,
+/// delivered in full instead of dropping chunks. It runs on a Tokio task, and
+/// the JS side awaits its outcome, so a slow client stalls only its own
+/// response and never the JavaScript thread.
+async fn deliver_stream_chunk(
     tx: &tokio::sync::mpsc::Sender<std::result::Result<bytes::Bytes, std::io::Error>>,
     req_id: u64,
     chunk: bytes::Bytes,
     wait: Duration,
 ) -> Result<()> {
-    // The timer must be created inside `block_on`, which enters the runtime
-    // context; constructing it on the JS thread panics with no reactor.
-    let sent = handle.block_on(async { tokio::time::timeout(wait, tx.send(Ok(chunk))).await });
-    match sent {
+    match tokio::time::timeout(wait, tx.send(Ok(chunk))).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(_)) => Err(VaernError::ServerStream {
-            req_id,
-            message: "the client closed the connection before the body was complete".to_string(),
-            action: "Stop writing to this response; the remaining chunks cannot be delivered"
-                .to_string(),
-        }),
+        Ok(Err(_)) => Err(stream_closed(req_id)),
         Err(_) => {
             // Abort the body rather than let the connection end cleanly, so the
             // client sees a failed transfer instead of a silently short one.
             let tx = tx.clone();
-            handle.spawn(async move {
+            tokio::spawn(async move {
                 let aborted = std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "response stream stalled; body aborted",
@@ -254,6 +261,18 @@ fn send_stream_chunk(
             })
         }
     }
+}
+
+/// [`deliver_stream_chunk`] driven from a plain thread, for tests.
+#[cfg(test)]
+fn send_stream_chunk(
+    handle: &tokio::runtime::Handle,
+    tx: &tokio::sync::mpsc::Sender<std::result::Result<bytes::Bytes, std::io::Error>>,
+    req_id: u64,
+    chunk: bytes::Bytes,
+    wait: Duration,
+) -> Result<()> {
+    handle.block_on(deliver_stream_chunk(tx, req_id, chunk, wait))
 }
 
 /// Native runtime implementation powered by QuickJS-ng.
@@ -308,6 +327,7 @@ impl QuickJsRuntime {
             server_handles: HashMap::new(),
             server_resp_senders: HashMap::new(),
             server_stream_senders: HashMap::new(),
+            stream_sends_waiting: HashSet::new(),
             unhandled_error: None,
             pending_rejections: Vec::new(),
         }));
@@ -898,7 +918,7 @@ impl QuickJsRuntime {
             let tokio_handle_chunk = tokio_handle.clone();
             let server_stream_chunk_fn = Function::new(
                 ctx.clone(),
-                move |req_id: f64, chunk_val: Value<'_>, is_done: bool| -> rquickjs::Result<()> {
+                move |req_id: f64, chunk_val: Value<'_>, is_done: bool| -> rquickjs::Result<bool> {
                     let req_id_u64 = req_id as u64;
                     let mut chunk_bytes = Vec::new();
                     if let Some(arr) = chunk_val.as_array() {
@@ -909,15 +929,44 @@ impl QuickJsRuntime {
                         }
                     }
 
-                    // Cloned so no RefCell borrow is held while this thread waits.
+                    // Returns true when the chunk is queued. False means it is
+                    // waiting for buffer space on a Tokio task, and JS must await
+                    // __vaern_dispatch_stream_sent before writing the next one.
                     let sender = state_stream_chunk.borrow().server_stream_senders.get(&req_id_u64).cloned();
+                    let mut queued = true;
                     if !chunk_bytes.is_empty()
                         && let Some(tx) = sender
                     {
+                        if state_stream_chunk.borrow().stream_sends_waiting.contains(&req_id_u64) {
+                            return Err(rquickjs::Exception::throw_message(
+                                chunk_val.ctx(),
+                                "response stream: a chunk was written while the previous one was still waiting for the client; await each write",
+                            ));
+                        }
                         let chunk = bytes::Bytes::from(chunk_bytes);
-                        if let Err(err) = send_stream_chunk(&tokio_handle_chunk, &tx, req_id_u64, chunk, STREAM_CHUNK_SEND_TIMEOUT) {
-                            state_stream_chunk.borrow_mut().server_stream_senders.remove(&req_id_u64);
-                            return Err(rquickjs::Exception::throw_message(chunk_val.ctx(), &err.to_string()));
+                        let waiting = match tx.try_reserve() {
+                            Ok(permit) => {
+                                permit.send(Ok(chunk));
+                                None
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
+                                state_stream_chunk.borrow_mut().server_stream_senders.remove(&req_id_u64);
+                                let err = stream_closed(req_id_u64);
+                                return Err(rquickjs::Exception::throw_message(chunk_val.ctx(), &err.to_string()));
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(())) => Some(chunk),
+                        };
+                        if let Some(chunk) = waiting {
+                            let events = {
+                                let mut s = state_stream_chunk.borrow_mut();
+                                s.stream_sends_waiting.insert(req_id_u64);
+                                s.events_tx.clone()
+                            };
+                            tokio_handle_chunk.spawn(async move {
+                                let result = deliver_stream_chunk(&tx, req_id_u64, chunk, STREAM_CHUNK_SEND_TIMEOUT).await;
+                                let _ = events.send(LoopEvent::StreamChunkSent(StreamChunkSent { req_id: req_id_u64, result }));
+                            });
+                            queued = false;
                         }
                     }
 
@@ -925,7 +974,7 @@ impl QuickJsRuntime {
                         state_stream_chunk.borrow_mut().server_stream_senders.remove(&req_id_u64);
                     }
 
-                    Ok(())
+                    Ok(queued)
                 },
             )
             .map_err(|err| VaernError::EngineInit {
@@ -1956,6 +2005,18 @@ impl QuickJsRuntime {
                     };
                 };
 
+                // Streamed responses waiting for the client to make buffer room,
+                // keyed by request id; settled by __vaern_dispatch_stream_sent.
+                const __streamWaits = new Map();
+                globalThis.__vaern_dispatch_stream_sent = (reqId, message) => {
+                    const wait = __streamWaits.get(reqId);
+                    if (!wait) return false;
+                    __streamWaits.delete(reqId);
+                    if (message === undefined) wait.resolve();
+                    else wait.reject(new Error(message));
+                    return true;
+                };
+
                 globalThis.__vaern_dispatch_server_request = (reqInfo) => {
                     const handler = __serverHandlers.get(reqInfo.serverId);
                     if (!handler) {
@@ -2003,7 +2064,11 @@ impl QuickJsRuntime {
                                         } else {
                                             chunkBytes = Array.from(new TextEncoder().encode(String(value)));
                                         }
-                                        __vaern_server_respond_stream_chunk(reqInfo.reqId, chunkBytes, false);
+                                        if (!__vaern_server_respond_stream_chunk(reqInfo.reqId, chunkBytes, false)) {
+                                            await new Promise((resolve, reject) => {
+                                                __streamWaits.set(reqInfo.reqId, { resolve, reject });
+                                            });
+                                        }
                                     }
                                 } catch (streamErr) {
                                     __vaern_print(1, `[ERROR] Stream read error: ${streamErr}`);
@@ -2269,9 +2334,47 @@ impl QuickJsRuntime {
         });
     }
 
+    fn dispatch_stream_chunk_sent(&self, sent: StreamChunkSent) {
+        let req_id = sent.req_id;
+        let message = {
+            let mut s = self.state.borrow_mut();
+            s.stream_sends_waiting.remove(&req_id);
+            match sent.result {
+                Ok(()) => None,
+                Err(err) => {
+                    s.server_stream_senders.remove(&req_id);
+                    Some(err.to_string())
+                }
+            }
+        };
+        let delivered = self.context.with(|ctx| {
+            ctx.globals()
+                .get::<_, Function>("__vaern_dispatch_stream_sent")
+                .and_then(|dispatch| dispatch.call::<_, bool>((req_id as f64, message)))
+        });
+        // The pump is suspended until this settles; failing to settle it would
+        // leave the response open with no error anywhere.
+        let unsettled = match delivered {
+            Ok(true) => None,
+            Ok(false) => Some(format!(
+                "response stream {req_id}: a chunk finished sending with no write waiting for it"
+            )),
+            Err(err) => Some(format!(
+                "response stream {req_id}: the chunk outcome could not be delivered: {err}"
+            )),
+        };
+        if let Some(message) = unsettled {
+            let mut s = self.state.borrow_mut();
+            if s.unhandled_error.is_none() {
+                s.unhandled_error = Some(message);
+            }
+        }
+    }
+
     fn handle_event(&self, event: LoopEvent) {
         match event {
             LoopEvent::ServerRequest(req) => self.dispatch_server_request(req),
+            LoopEvent::StreamChunkSent(sent) => self.dispatch_stream_chunk_sent(sent),
             LoopEvent::FetchDone(completion) => {
                 if self.state.borrow().pending_fetches > 0 {
                     self.state.borrow_mut().pending_fetches -= 1;
@@ -2342,8 +2445,10 @@ impl QuickJsRuntime {
                 _has_active_timers,
             ) = {
                 let s = self.state.borrow();
-                // A file operation keeps the loop alive the same way a fetch does.
-                let pending_fetches = s.pending_fetches > 0 || s.pending_fs > 0;
+                // File operations and stream chunks waiting for the client keep
+                // the loop alive the same way a fetch does.
+                let pending_fetches =
+                    s.pending_fetches > 0 || s.pending_fs > 0 || !s.stream_sends_waiting.is_empty();
                 let active_timers = !s.timers.is_empty();
                 let active_servers = s.active_servers > 0;
                 if !pending_fetches && !active_timers && !active_servers {
@@ -2820,6 +2925,54 @@ mod tests {
             }
         "#;
         assert_eq!(runtime.eval("burst.ts", code).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_stalled_stream_client_does_not_block_timers() {
+        // Connects, sends one request, then reads nothing for 4 s. Filling the
+        // buffers between the pump and the socket costs the JS thread some
+        // CPU up front; after that, the old blocking send froze the thread
+        // until the client went away.
+        let client = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(150));
+            let mut stream = std::net::TcpStream::connect("127.0.0.1:8996").unwrap();
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(4000));
+        });
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        let code = r#"
+            import { serve } from "vaern:http";
+            let last = Date.now();
+            let maxGap = 0;
+            const ticker = setInterval(() => {
+                const now = Date.now();
+                maxGap = Math.max(maxGap, now - last);
+                last = now;
+            }, 10);
+            const chunk = new Uint8Array(64 * 1024);
+            const server = serve(() => new Response(new ReadableStream({
+                start(controller) {
+                    for (let i = 0; i < 512; i++) controller.enqueue(chunk);
+                    controller.close();
+                },
+            })), { port: 8996, hostname: "127.0.0.1" });
+            setTimeout(async () => {
+                // Measured here too: after a freeze this callback can run
+                // before the ticker does.
+                maxGap = Math.max(maxGap, Date.now() - last);
+                clearInterval(ticker);
+                await server.close();
+                if (maxGap > 2000) {
+                    console.error(`timers stalled for ${maxGap} ms`);
+                    process.exitCode = 1;
+                }
+            }, 3000);
+        "#;
+        let exit_code = runtime.eval("stalled_stream.ts", code).unwrap();
+        client.join().unwrap();
+        assert_eq!(exit_code, 0);
     }
 
     #[test]

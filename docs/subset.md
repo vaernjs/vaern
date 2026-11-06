@@ -238,6 +238,11 @@ a `Response`, or a promise of one.
 - Headers must arrive within 10 seconds (408 otherwise), and the body within
   30 seconds.
 - A handler that throws is answered with 500.
+- A `ReadableStream` response body is sent as the client reads it. While a
+  slow client has the buffer full, only that response waits; timers, other
+  requests and fetches keep running. A client that reads nothing for 30
+  seconds, or disconnects, ends the response with an error logged to stderr,
+  and the body is aborted rather than ended short.
 - A response carrying `Host`, `Content-Length`, `Transfer-Encoding`,
   `Connection`, `Upgrade`, `TE` or `Trailer` throws `TypeError` when the
   handler returns it, and the request is answered with 500. The runtime sets
