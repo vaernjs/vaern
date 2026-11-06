@@ -529,6 +529,7 @@ impl QuickJsRuntime {
                         headers,
                         body,
                         timeout,
+                        max_body_bytes: crate::fetch::MAX_RESPONSE_BODY_BYTES,
                     };
 
                     let abort_rx = if abort_id > 0 {

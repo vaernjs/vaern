@@ -6,6 +6,7 @@
 //! - Staged error reporting identifying the exact failure phase (dns, connect, tls, send, read).
 //! - Automatic redirect following capped at 20 hops with loop prevention.
 //! - Request timeout and cancellation propagation.
+//! - A bound on response body size, since bodies are held whole in memory.
 //!
 //! The production client trusts the public web roots only. The loopback test
 //! server and the client that trusts its certificate live in `test_tls`,
@@ -14,8 +15,8 @@
 use crate::error::{Result, VaernError};
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Empty, Full};
-use hyper::header::{HeaderName, HeaderValue, LOCATION};
+use http_body_util::{BodyExt, Empty, Full, LengthLimitError, Limited};
+use hyper::header::{CONTENT_LENGTH, HeaderName, HeaderValue, LOCATION};
 use hyper::{Method, Request, StatusCode};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -35,6 +36,11 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum number of redirects followed before returning a typed error.
 pub const MAX_REDIRECTS: usize = 20;
 
+/// Largest response body a fetch reads. The body reaches JavaScript as an
+/// ArrayBuffer that owns the Rust buffer, outside the QuickJS heap cap, so
+/// without this bound a single response could take all host memory.
+pub const MAX_RESPONSE_BODY_BYTES: usize = crate::runtime::HEAP_LIMIT_BYTES;
+
 /// Parsed HTTP request input passed from the JavaScript runtime.
 #[derive(Debug, Clone)]
 pub struct FetchOptions {
@@ -42,6 +48,8 @@ pub struct FetchOptions {
     pub headers: Vec<(String, String)>,
     pub body: Option<Vec<u8>>,
     pub timeout: Option<Duration>,
+    /// Response bodies over this many bytes fail with a `read` error.
+    pub max_body_bytes: usize,
 }
 
 impl Default for FetchOptions {
@@ -51,6 +59,7 @@ impl Default for FetchOptions {
             headers: Vec::new(),
             body: None,
             timeout: Some(DEFAULT_TIMEOUT),
+            max_body_bytes: MAX_RESPONSE_BODY_BYTES,
         }
     }
 }
@@ -360,8 +369,25 @@ async fn execute_fetch_with(
             }
         }
 
+        // A declared length over the limit is refused before any of the body
+        // is read; a body without one, or one that lies, is cut off by
+        // `Limited` as soon as it passes the limit.
+        let limit = options.max_body_bytes;
+        let declared = resp
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        if let Some(len) = declared.filter(|&len| len > limit as u64) {
+            return Err(body_too_large(
+                &current_url,
+                limit,
+                format!("response declares a {len}-byte body"),
+            ));
+        }
+
         // Read response body with read timeout and abort protection
-        let body_future = resp.into_body().collect();
+        let body_future = Limited::new(resp.into_body(), limit).collect();
         let body_bytes_result = tokio::select! {
             biased;
             _ = aborted(&mut abort_rx) => {
@@ -375,6 +401,13 @@ async fn execute_fetch_with(
             res = tokio::time::timeout(timeout_duration, body_future) => {
                 match res {
                     Ok(Ok(collected)) => collected.to_bytes().to_vec(),
+                    Ok(Err(err)) if err.downcast_ref::<LengthLimitError>().is_some() => {
+                        return Err(body_too_large(
+                            &current_url,
+                            limit,
+                            "response body is larger".to_string(),
+                        ));
+                    }
                     Ok(Err(err)) => {
                         return Err(VaernError::Fetch {
                             stage: "read".to_string(),
@@ -402,6 +435,24 @@ async fn execute_fetch_with(
             url: current_url.to_string(),
             body: body_bytes_result,
         });
+    }
+}
+
+/// The `read` error for a response body over `limit` bytes.
+fn body_too_large(url: &Url, limit: usize, what: String) -> VaernError {
+    const MIB: usize = 1024 * 1024;
+    let limit_text = if limit >= MIB && limit.is_multiple_of(MIB) {
+        format!("{} MiB", limit / MIB)
+    } else {
+        format!("{limit}-byte")
+    };
+    VaernError::Fetch {
+        stage: "read".to_string(),
+        url: url.to_string(),
+        message: format!("{what} than the {limit_text} response body limit"),
+        action:
+            "request the resource in smaller parts, for example with a Range header or pagination"
+                .to_string(),
     }
 }
 
@@ -754,6 +805,117 @@ mod tests {
             Err(other) => panic!("expected an abort, got {other}"),
             Ok(res) => panic!("expected an abort, got status {}", res.status),
         }
+    }
+
+    /// Loopback server that answers every connection with `head` followed by
+    /// `body_len` bytes, then holds the socket open for `hold` so the client
+    /// cannot rely on end-of-stream to stop reading.
+    async fn start_raw_server(
+        head: &'static str,
+        body_len: usize,
+        hold: Duration,
+    ) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut request = [0u8; 1024];
+                    let _ = stream.read(&mut request).await;
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let chunk = [b'a'; 4096];
+                    let mut left = body_len;
+                    while left > 0 {
+                        let n = left.min(chunk.len());
+                        if stream.write_all(&chunk[..n]).await.is_err() {
+                            return;
+                        }
+                        left -= n;
+                    }
+                    tokio::time::sleep(hold).await;
+                });
+            }
+        });
+        addr
+    }
+
+    fn assert_body_too_large(result: Result<FetchResponse>, limit_text: &str) {
+        match result {
+            Err(VaernError::Fetch { stage, message, .. }) => {
+                assert_eq!(stage, "read");
+                assert!(
+                    message.contains(&format!("{limit_text} response body limit")),
+                    "{message}"
+                );
+            }
+            Err(other) => panic!("expected a body limit error, got {other}"),
+            Ok(res) => panic!("expected a body limit error, got {} bytes", res.body.len()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_response_body_over_the_limit_is_cut_off() {
+        // No declared length and the socket stays open after the body, so
+        // only the limit can end this read before the timeout.
+        let head = "HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n";
+        let addr = start_raw_server(head, 64 * 1024, Duration::from_secs(10)).await;
+        let options = FetchOptions {
+            max_body_bytes: 1024,
+            timeout: Some(Duration::from_secs(5)),
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let result = execute_fetch_pooled(
+            &build_client_with_roots(RootCertStore::empty()).unwrap(),
+            &format!("http://{addr}/"),
+            options,
+            None,
+        )
+        .await;
+        assert_body_too_large(result, "1024-byte");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the read waited for the server"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_declared_length_over_the_default_limit_is_refused_before_reading() {
+        let head = "HTTP/1.1 200 OK\r\ncontent-length: 268435457\r\n\r\n";
+        let addr = start_raw_server(head, 0, Duration::from_secs(10)).await;
+        let options = FetchOptions {
+            timeout: Some(Duration::from_secs(5)),
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let result = execute_fetch_pooled(
+            &build_client_with_roots(RootCertStore::empty()).unwrap(),
+            &format!("http://{addr}/"),
+            options,
+            None,
+        )
+        .await;
+        assert_body_too_large(result, "256 MiB");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the read waited for the server"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_response_body_at_the_limit_is_read_whole() {
+        let head = "HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n";
+        let addr = start_raw_server(head, 1024, Duration::ZERO).await;
+        let options = FetchOptions {
+            max_body_bytes: 1024,
+            ..Default::default()
+        };
+        let client = build_client_with_roots(RootCertStore::empty()).unwrap();
+        let res = execute_fetch_pooled(&client, &format!("http://{addr}/"), options, None)
+            .await
+            .expect("a body of exactly the limit is delivered");
+        assert_eq!(res.body.len(), 1024);
     }
 
     #[tokio::test]
