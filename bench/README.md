@@ -36,6 +36,21 @@ The startup loss has not been profiled. The likely cause is the larger JavaScrip
 
 Binary size, stripped: 16,166,912 bytes (0.0.6: 16,103,936, +62,976), 438,272 bytes over the 15 MiB budget.
 
+### With fat LTO
+
+The release profile then gained `lto = "fat"` and `codegen-units = 1`. The same comparison, same session, 0.0.6 listed first:
+
+| Benchmark | Unreleased, LTO | 0.0.6 | Comparison | Status |
+|---|---|---|---|---|
+| Startup and greeting | 10.4 ms ± 1.3 | 10.9 ms ± 0.8 | | Within noise (−0.4 ms with the new build first); the loss above is gone |
+| Loopback fetch and JSON parse | 14.2 ms ± 3.0 | 15.0 ms ± 2.5 | | Within noise |
+| Arithmetic loop (1M) | 38.9 ms ± 1.7 | 39.9 ms ± 2.3 | | Within noise |
+| Arithmetic loop (50M) | 1.348 s ± 0.026 | 1.409 s ± 0.052 | Node: 0.249 s | 4% faster than 0.0.6; **loss, 5.4x slower than Node** |
+| Parallel HTTP (100 requests) | 47.2 ms ± 2.7 | 45.4 ms ± 3.7 | | Within noise |
+| Idle HTTP server, CPU over 3 s | 0.0 ms | 0.0 ms | | Unchanged |
+
+Binary size, stripped: 9,427,456 bytes (0.0.6: 16,103,936, −6,676,480), 6,301,184 bytes under the 15 MiB budget. The cost is build time: a cold `cargo build --release` takes about 10 minutes on this machine instead of about 2.
+
 ## Reproduction commands
 
 Build first with `cargo build --release`. To compare two versions, pass both binaries to the same hyperfine call.
