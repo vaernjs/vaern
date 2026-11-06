@@ -3440,6 +3440,17 @@ mod tests {
     }
 
     #[test]
+    fn test_ambient_declarations_run() {
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        let code = "declare enum Level { Low, High }\n\
+                    declare namespace Lib { const version: string; }\n\
+                    declare global { interface Window { tag: string } }\n\
+                    const level: number = 2;\n\
+                    process.exitCode = level === 2 ? 0 : 1;\n";
+        assert_eq!(runtime.eval("ambient.ts", code).unwrap(), 0);
+    }
+
+    #[test]
     fn test_parse_error_reports_name_message_and_location() {
         let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
         let err = runtime

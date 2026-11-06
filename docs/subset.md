@@ -13,7 +13,8 @@ web or Node.js behaviour of the same name.
   in stack traces and errors match the `.ts` source.
 - TypeScript constructs that emit runtime code are rejected with a
   `file:line:col` error: `enum`, `const enum`, `namespace`/`module` blocks and
-  decorators.
+  decorators. Their `declare` forms (`declare enum`, `declare namespace`,
+  `declare module`, `declare global`) hold types only and are removed.
 - Auto-accessor fields (`accessor x = 1`) are rejected the same way. The
   engine cannot parse them, and removing the keyword would turn a getter and
   setter on the prototype into a plain field.

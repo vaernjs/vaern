@@ -147,6 +147,11 @@ impl<'a> Visit for UnsupportedValidator<'a> {
     // Enums declare runtime bindings. Dropping them would move the failure to a
     // distant `ReferenceError` at first use, so they are rejected at their source.
     fn visit_ts_enum_decl(&mut self, decl: &TsEnumDecl) {
+        // `declare enum` only describes a value defined elsewhere and is
+        // erased with the other types.
+        if decl.declare {
+            return;
+        }
         if self.error.is_none() {
             let loc = self.cm.lookup_char_pos(decl.span.lo);
             let (feature, construct) = if decl.is_const {
@@ -169,6 +174,11 @@ impl<'a> Visit for UnsupportedValidator<'a> {
     }
 
     fn visit_ts_module_decl(&mut self, decl: &TsModuleDecl) {
+        // `declare namespace`, `declare module` and `declare global` hold
+        // types only, enums inside them included, and are erased whole.
+        if decl.declare {
+            return;
+        }
         if self.error.is_none() {
             let loc = self.cm.lookup_char_pos(decl.span.lo);
             self.error = Some(VaernError::UnsupportedFeature {
@@ -289,6 +299,21 @@ mod tests {
             }
             _ => panic!("expected UnsupportedFeature for nested enum"),
         }
+    }
+
+    #[test]
+    fn test_ambient_declarations_are_erased_not_rejected() {
+        let ts = "declare enum Level { Low, High }\n\
+                  export declare const enum Flag { A = 1 }\n\
+                  declare namespace Lib { const version: string; enum Inner { X } }\n\
+                  declare module 'virtual' { export const y: number; }\n\
+                  declare global { interface Window { tag: string } }\n\
+                  export const z: number = 1;\n";
+        let js = SwcTranspiler.transpile("ambient.ts", ts).unwrap();
+        for word in ["declare", "enum", "namespace", "global"] {
+            assert!(!js.contains(word), "{word} left in output:\n{js}");
+        }
+        assert!(js.contains("export const z"), "{js}");
     }
 
     #[test]
