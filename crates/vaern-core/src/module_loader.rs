@@ -35,6 +35,8 @@ const CONDITIONS: [&str; 3] = ["vaern", "import", "default"];
 pub const MAX_SOURCE_BYTES: u64 = crate::fs::MAX_READ_BYTES;
 
 /// Reads a module's UTF-8 source, refusing anything over [`MAX_SOURCE_BYTES`].
+/// A leading byte order mark is dropped: the engine counts it as part of the
+/// first line, which shifts every location reported on it.
 pub fn read_source(path: &Path) -> Result<String> {
     use std::io::Read;
     let io_error = |source| VaernError::Io {
@@ -58,7 +60,7 @@ pub fn read_source(path: &Path) -> Result<String> {
     if bytes.len() as u64 > MAX_SOURCE_BYTES {
         return Err(too_large());
     }
-    String::from_utf8(bytes).map_err(|err| {
+    let text = String::from_utf8(bytes).map_err(|err| {
         io_error(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
@@ -66,6 +68,10 @@ pub fn read_source(path: &Path) -> Result<String> {
                 err.utf8_error().valid_up_to()
             ),
         ))
+    })?;
+    Ok(match text.strip_prefix('\u{FEFF}') {
+        Some(rest) => rest.to_string(),
+        None => text,
     })
 }
 

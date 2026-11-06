@@ -3406,6 +3406,40 @@ mod tests {
     }
 
     #[test]
+    fn test_byte_order_mark_does_not_shift_reported_locations() {
+        let root = tempfile::tempdir().unwrap();
+        let line = "const s: string = 'x'; throw new Error('boom');\n";
+        for name in ["plain.ts", "plain.js"] {
+            let source = if name.ends_with(".js") {
+                line.replace(": string", "")
+            } else {
+                line.to_string()
+            };
+            let plain = root.path().join(name);
+            std::fs::write(&plain, &source).unwrap();
+            let marked_name = format!("bom-{name}");
+            let marked = root.path().join(&marked_name);
+            std::fs::write(&marked, format!("\u{FEFF}{source}")).unwrap();
+
+            let location = |path: &Path, file: &str| {
+                let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+                let text = runtime.run_file(path).unwrap_err().to_string();
+                // The last mention is the stack frame, which carries the location.
+                let start = text.rfind(file).unwrap_or_else(|| panic!("{text}"));
+                text[start + file.len()..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == ':')
+                    .collect::<String>()
+            };
+            assert_eq!(
+                location(&marked, &marked_name),
+                location(&plain, name),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn test_parse_error_reports_name_message_and_location() {
         let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
         let err = runtime

@@ -289,4 +289,6 @@ name.
   exits with code 1.
 - Each module source, the entry file included, must be valid UTF-8 and at
   most 64 MiB, a quarter of the heap cap. A larger file fails to load with
-  an error naming the file and the limit, before any of it is read.
+  an error naming the file and the limit, before any of it is read. A
+  leading UTF-8 byte order mark is ignored, so it does not shift reported
+  columns.
