@@ -119,6 +119,9 @@ Nothing else on `process` exists.
   `fatal: true` they throw `TypeError`. A leading byte order mark is removed
   unless `ignoreBOM` is set. With `stream: true`, a code point split across
   calls is held until the next call completes it.
+- An omitted input decodes to `""`; `null` or any other non-buffer throws
+  `TypeError`. Options may be omitted or `null`; any other non-object throws
+  `TypeError`.
 
 Absent: `TextEncoder.encodeInto`, every encoding other than UTF-8,
 `TextEncoderStream` and `TextDecoderStream`.

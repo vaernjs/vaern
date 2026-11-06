@@ -1111,8 +1111,17 @@ impl QuickJsRuntime {
                 }
                 globalThis.TextEncoder = TextEncoder;
 
+                // WebIDL dictionary conversion: undefined and null mean "all
+                // defaults", any other non-object is a TypeError.
+                function __options(where, value) {
+                    if (value === undefined || value === null) return {};
+                    if (typeof value === 'object' || typeof value === 'function') return value;
+                    throw new TypeError(`${where}: options must be an object, got ${typeof value}`);
+                }
+
                 class TextDecoder {
-                    constructor(label = "utf-8", options = {}) {
+                    constructor(label = "utf-8", options) {
+                        options = __options("TextDecoder", options);
                         const name = String(label).trim().toLowerCase();
                         if (name !== "utf-8" && name !== "utf8" && name !== "unicode-1-1-utf-8") {
                             throw new RangeError(`TextDecoder: unsupported encoding '${label}'; only utf-8 is available`);
@@ -1126,7 +1135,12 @@ impl QuickJsRuntime {
                     get fatal() { return this._fatal; }
                     get ignoreBOM() { return this._ignoreBOM; }
 
-                    decode(input, options = {}) {
+                    decode(input, options) {
+                        options = __options("TextDecoder.decode", options);
+                        // Only an omitted input means "no bytes"; null is not a buffer.
+                        if (input === null) {
+                            throw new TypeError("TextDecoder.decode: expected an ArrayBuffer or a view of one, got null");
+                        }
                         const incoming = __toBytes(input);
                         let bytes = incoming;
                         if (this._pending.length) {
@@ -3222,6 +3236,23 @@ mod tests {
             process.exitCode = (replaced ? 0 : 1) | (bom ? 0 : 2) | (fatal ? 0 : 4) | (surrogate ? 0 : 8);
         "#;
         assert_eq!(runtime.eval("codec.js", code).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_text_decoder_converts_arguments_as_webidl_does() {
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        let code = r#"
+            const throwsType = (f) => { try { f(); return false; } catch (e) { return e instanceof TypeError; } };
+            const decoder = new TextDecoder("utf-8", null);
+            const bytes = new Uint8Array([0x68, 0x69]);
+            process.exitCode =
+                (decoder.fatal === false && decoder.decode(bytes, null) === "hi" ? 0 : 1) |
+                (decoder.decode() === "" && decoder.decode(undefined) === "" ? 0 : 2) |
+                (throwsType(() => decoder.decode(null)) ? 0 : 4) |
+                (throwsType(() => new TextDecoder("utf-8", 5)) ? 0 : 8) |
+                (throwsType(() => decoder.decode(bytes, "stream")) ? 0 : 16);
+        "#;
+        assert_eq!(runtime.eval("decoder_args.js", code).unwrap(), 0);
     }
 
     #[test]
