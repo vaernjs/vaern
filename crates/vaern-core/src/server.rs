@@ -394,6 +394,12 @@ impl HttpServer {
                                     let mut resp_builder = Response::builder().status(status_code);
 
                                     for (k, v) in server_resp.headers {
+                                        // The JS layer throws TypeError for these before
+                                        // responding; this keeps hyper's framing intact
+                                        // when the bridge is called directly.
+                                        if crate::fetch::is_runtime_managed_header(&k) {
+                                            continue;
+                                        }
                                         if let (Ok(hname), Ok(hval)) = (HeaderName::from_str(&k), HeaderValue::from_str(&v)) {
                                             resp_builder = resp_builder.header(hname, hval);
                                         }

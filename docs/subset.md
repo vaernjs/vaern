@@ -190,6 +190,9 @@ trusting the public Mozilla root certificates.
   refused.
 - `init.redirect` accepts only `"follow"`. `"manual"` and `"error"` throw
   `TypeError`.
+- `Host`, `Content-Length`, `Transfer-Encoding`, `Connection`, `Upgrade`, `TE`
+  and `Trailer` are set by the runtime from the URL and body. Supplying one
+  in `init.headers` throws `TypeError`.
 - An abort stops the request whether it is sent before the request starts,
   while it is in flight, or between redirect hops.
 - The whole response body is read before `fetch` resolves, and bodies over
@@ -235,6 +238,10 @@ a `Response`, or a promise of one.
 - Headers must arrive within 10 seconds (408 otherwise), and the body within
   30 seconds.
 - A handler that throws is answered with 500.
+- A response carrying `Host`, `Content-Length`, `Transfer-Encoding`,
+  `Connection`, `Upgrade`, `TE` or `Trailer` throws `TypeError` when the
+  handler returns it, and the request is answered with 500. The runtime sets
+  the framing headers from the body.
 - `close()` waits up to 5 seconds for requests in flight. Ctrl+C (SIGINT)
   closes servers the same way; SIGTERM is not handled.
 

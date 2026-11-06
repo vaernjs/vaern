@@ -144,6 +144,18 @@ const cases = [
     stderr: "",
   },
   {
+    name: "managed_headers.js refuses framing headers on fetch and on served responses",
+    args: ["run", "managed_headers.js"],
+    code: 0,
+    stdout:
+      "TypeError: fetch: header 'transfer-encoding' is set by the runtime and cannot be supplied; remove it\n" +
+      "500\n",
+    stderrIncludes: [
+      "[ERROR] GET /: TypeError: serve: handler response: header 'content-length' is set by the runtime",
+    ],
+    stderrExcludes: ["panicked"],
+  },
+  {
     name: "multiline_stack.ts reports the source line under multi-line types",
     args: ["run", "multiline_stack.ts"],
     code: 1,

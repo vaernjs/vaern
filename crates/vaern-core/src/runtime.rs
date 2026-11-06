@@ -584,6 +584,14 @@ impl QuickJsRuntime {
                 .map_err(|err| VaernError::EngineInit {
                     reason: format!("failed to register fetch start bridge: {err}"),
                 })?;
+            globals
+                .set(
+                    "__vaern_runtime_headers",
+                    crate::fetch::RUNTIME_MANAGED_HEADERS.to_vec(),
+                )
+                .map_err(|err| VaernError::EngineInit {
+                    reason: format!("failed to register the runtime-managed header list: {err}"),
+                })?;
 
             // Native vaern:fs bridge. `payload` carries write data: UTF-8 text
             // when `kind` is "text", or one Latin-1 code unit per byte when it
@@ -1699,6 +1707,17 @@ impl QuickJsRuntime {
                 }
                 globalThis.AbortController = AbortController;
 
+                // Framing and routing headers the runtime sets itself; the
+                // list comes from fetch::RUNTIME_MANAGED_HEADERS.
+                const __runtimeHeaders = new Set(__vaern_runtime_headers);
+                const __checkHeaders = (where, list) => {
+                    for (const [key] of list) {
+                        if (__runtimeHeaders.has(key)) {
+                            throw new TypeError(`${where}: header '${key}' is set by the runtime and cannot be supplied; remove it`);
+                        }
+                    }
+                };
+
                 // WHATWG fetch
                 const __fetchCallbacks = new Map();
                 let __nextFetchId = 1;
@@ -1717,6 +1736,7 @@ impl QuickJsRuntime {
                             headersList.push([key, val]);
                         });
                     }
+                    __checkHeaders("fetch", headersList);
 
                     let bodyBytes = null;
                     if (init.body !== undefined && init.body !== null) {
@@ -1963,6 +1983,7 @@ impl QuickJsRuntime {
                             response.headers.forEach((val, key) => {
                                 headersList.push([key, val]);
                             });
+                            __checkHeaders("serve: handler response", headersList);
 
                             if (response._isStream || (response.body && typeof response.body.getReader === 'function')) {
                                 __vaern_server_respond_stream_start(reqInfo.reqId, status, statusText, headersList);
@@ -1999,8 +2020,7 @@ impl QuickJsRuntime {
                             }
                         })
                         .catch((err) => {
-                            const errStr = (err && (err.stack || err.message)) || String(err);
-                            __vaern_print(1, `[ERROR] ${reqInfo.method} ${reqInfo.uri}: ${errStr}`);
+                            __vaern_print(1, `[ERROR] ${reqInfo.method} ${reqInfo.uri}: ${__formatArg(err)}`);
                             const bodyBytes = Array.from(new TextEncoder().encode("Internal Server Error\n"));
                             __vaern_server_respond(
                                 reqInfo.reqId,
@@ -3088,6 +3108,39 @@ mod tests {
             process.exitCode = rejected === 2 ? 0 : 1;
         "#;
         assert_eq!(runtime.eval("redirect_mode.js", code).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_runtime_managed_headers_throw_type_error() {
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        let code = r#"
+            import { serve } from "vaern:http";
+            let fails = 0;
+            for (const name of ["Host", "Content-Length", "transfer-encoding", "connection", "Upgrade", "TE", "trailer"]) {
+                try {
+                    await fetch("http://127.0.0.1:9/", { headers: { [name]: "1" } });
+                    fails |= 1;
+                } catch (err) {
+                    if (!(err instanceof TypeError) || !err.message.includes(`'${name.toLowerCase()}'`)) fails |= 2;
+                }
+            }
+            const server = serve(
+                () => new Response("hi", { headers: { "Content-Length": "999" } }),
+                { port: 0, hostname: "127.0.0.1" },
+            );
+            const res = await fetch(`http://127.0.0.1:${server.addr.port}/`);
+            if (res.status !== 500) fails |= 4;
+            const ok = serve(
+                () => new Response("hi", { headers: { "x-kept": "yes" } }),
+                { port: 0, hostname: "127.0.0.1" },
+            );
+            const kept = await fetch(`http://127.0.0.1:${ok.addr.port}/`, { headers: { "x-sent": "1" } });
+            if (kept.status !== 200 || kept.headers.get("x-kept") !== "yes") fails |= 8;
+            await server.close();
+            await ok.close();
+            process.exitCode = fails;
+        "#;
+        assert_eq!(runtime.eval("managed_headers.js", code).unwrap(), 0);
     }
 
     #[test]

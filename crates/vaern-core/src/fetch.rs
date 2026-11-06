@@ -41,6 +41,28 @@ pub const MAX_REDIRECTS: usize = 20;
 /// without this bound a single response could take all host memory.
 pub const MAX_RESPONSE_BODY_BYTES: usize = crate::runtime::HEAP_LIMIT_BYTES;
 
+/// Headers that frame or route an HTTP/1.1 message. The runtime derives them
+/// from the URL and the body; a script-supplied value can disagree with the
+/// bytes actually sent and let a peer read one message as two. Scripts that
+/// set one get a `TypeError` from the JS layer, and the Rust side refuses or
+/// drops them so the internal bridges cannot be used to get around that.
+pub const RUNTIME_MANAGED_HEADERS: [&str; 7] = [
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "upgrade",
+    "te",
+    "trailer",
+];
+
+/// True when `name` is one of [`RUNTIME_MANAGED_HEADERS`], in any case.
+pub fn is_runtime_managed_header(name: &str) -> bool {
+    RUNTIME_MANAGED_HEADERS
+        .iter()
+        .any(|managed| name.eq_ignore_ascii_case(managed))
+}
+
 /// Parsed HTTP request input passed from the JavaScript runtime.
 #[derive(Debug, Clone)]
 pub struct FetchOptions {
@@ -219,6 +241,19 @@ async fn execute_fetch_with(
             message: format!("invalid HTTP method: {err}"),
             action: "use a valid standard HTTP method name".to_string(),
         })?;
+
+    if let Some((name, _)) = options
+        .headers
+        .iter()
+        .find(|(name, _)| is_runtime_managed_header(name))
+    {
+        return Err(VaernError::Fetch {
+            stage: "send".to_string(),
+            url: current_url.to_string(),
+            message: format!("header '{name}' is set by the runtime and cannot be supplied"),
+            action: format!("remove '{name}' from the request headers"),
+        });
+    }
 
     let mut body_bytes = options.body;
     let mut headers = options.headers;
@@ -581,6 +616,28 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert_eq!(closed.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_runtime_managed_request_headers_are_refused() {
+        for name in RUNTIME_MANAGED_HEADERS {
+            let options = FetchOptions {
+                headers: vec![(name.to_ascii_uppercase(), "1".to_string())],
+                ..Default::default()
+            };
+            // Port 9 is never contacted: the header is refused first.
+            match execute_fetch("http://127.0.0.1:9/", options, None).await {
+                Err(VaernError::Fetch { stage, message, .. }) => {
+                    assert_eq!(stage, "send");
+                    assert!(message.contains("set by the runtime"), "{message}");
+                }
+                Err(other) => panic!("expected a send error for {name}, got {other}"),
+                Ok(res) => panic!(
+                    "expected a send error for {name}, got status {}",
+                    res.status
+                ),
+            }
+        }
     }
 
     #[tokio::test]
