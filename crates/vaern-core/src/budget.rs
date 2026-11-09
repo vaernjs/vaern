@@ -89,6 +89,15 @@ impl Budget {
         }
     }
 
+    /// A named budget rebuilt for a replay from the balance the recorded run
+    /// opened its ledger with. It has no ledger: a replay never writes one.
+    pub fn replayed(limits: Limits, spent: Amount) -> Budget {
+        Budget {
+            spent,
+            ..Budget::new(limits)
+        }
+    }
+
     /// A budget whose spending is kept in the named ledger under `home`.
     pub fn named(home: &Path, name: &str, limits: Limits) -> Result<Budget> {
         if !valid_name(name) {
@@ -317,6 +326,9 @@ pub struct RunBudget {
     run: Option<String>,
     dispatched: bool,
     open: HashMap<(&'static str, u32), (u64, Amount)>,
+    /// Set for a replay: each named ledger's balance when the recorded run
+    /// opened it.
+    replayed: Option<HashMap<String, Amount>>,
 }
 
 impl RunBudget {
@@ -324,6 +336,14 @@ impl RunBudget {
     pub fn configure(&mut self, caps: Limits, home: Option<PathBuf>) {
         self.caps = caps;
         self.home = home;
+    }
+
+    /// Replays a recorded run's budget from its caps and the balance each
+    /// named ledger had when it opened, without opening any ledger.
+    pub fn replay(&mut self, caps: Limits, ledgers: HashMap<String, Amount>) {
+        self.caps = caps;
+        self.home = None;
+        self.replayed = Some(ledgers);
     }
 
     /// Ledger records name the run: the journal's id, or one made up when
@@ -378,6 +398,18 @@ impl RunBudget {
                 return Err(invalid(format!(
                     "the budget '{name}' must be named in the first budget() call"
                 )));
+            }
+            (Some(name), None) if self.replayed.is_some() => {
+                let spent = self.replayed.as_ref().and_then(|ledgers| ledgers.get(name));
+                let Some(spent) = spent.copied() else {
+                    return Err(budget_error(
+                        "LEDGER",
+                        format!("the recorded run did not open the budget '{name}'"),
+                        "Record the run again; this replay has no balance for that ledger.",
+                    ));
+                };
+                self.budget = Some(Budget::replayed(lowered(self.caps, limits), spent));
+                self.name = Some(name.to_string());
             }
             (Some(name), None) => {
                 let Some(home) = self.home.as_deref() else {

@@ -145,6 +145,41 @@ pub enum VaernError {
         action: String,
     },
 
+    /// `vaern replay` cannot start or go on. `code` is `UNSEALED`,
+    /// `MALFORMED` or `UNSUPPORTED`.
+    #[error("replay {code}: {message}. {action}")]
+    Replay {
+        code: String,
+        message: String,
+        action: String,
+    },
+
+    /// A source file the recorded run loaded is not the same file now.
+    #[error(
+        "replay refused: '{path}' has changed since the run was recorded (sha256 {recorded}, now {current}). Restore the recorded source, or record a new run."
+    )]
+    ReplaySourceChanged {
+        path: String,
+        recorded: String,
+        current: String,
+    },
+
+    /// A replay printed, started or ended something other than the
+    /// recording at record `seq`. Both sides are cut to 200 bytes.
+    #[error(
+        "replay of run '{run_id}' diverged at record {seq}: expected {expected}, got {actual}. The script, or something it reads live (the clock, the environment, timer order), behaved differently; the journal holds the recorded run."
+    )]
+    ReplayDivergence {
+        run_id: String,
+        seq: u64,
+        expected: String,
+        actual: String,
+    },
+
+    /// An error served from a journal during a replay, as it was recorded.
+    #[error("{message}")]
+    Replayed { message: String },
+
     /// A streamed HTTP response chunk could not be handed to the connection.
     #[error("response stream for server request {req_id} failed: {message}. {action}")]
     ServerStream {

@@ -17,6 +17,7 @@ pub mod fetch;
 pub mod fs;
 pub mod journal;
 pub mod module_loader;
+pub mod replay;
 pub mod runtime;
 pub mod server;
 #[cfg(any(test, feature = "test-tls"))]
