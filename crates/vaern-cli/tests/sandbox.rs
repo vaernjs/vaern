@@ -99,3 +99,83 @@ fn throwing_timer_callback_fails() -> TestResult {
     assert!(!stderr.contains("panicked"), "{stderr}");
     Ok(())
 }
+
+/// A fresh journal home for one test, outside the sandbox directory.
+fn journal_home(test: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let dir = std::env::temp_dir().join(format!("vaern-cli-{}-{test}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+fn vaern_home(args: &[&str], home: &std::path::Path) -> Result<Output, Box<dyn Error>> {
+    Ok(Command::new(env!("CARGO_BIN_EXE_vaern"))
+        .args(args)
+        .current_dir(sandbox_dir())
+        .env("VAERN_HOME", home)
+        .output()?)
+}
+
+#[test]
+fn run_is_journalled_and_verifies() -> TestResult {
+    let home = journal_home("verify")?;
+    let out = vaern_home(&["run", "hello.ts"], &home)?;
+    assert_eq!(out.status.code(), Some(0));
+
+    let check = vaern_home(&["journal", "verify", "latest"], &home)?;
+    assert_eq!(check.status.code(), Some(0), "{}", text(&check.stderr));
+    let report = text(&check.stdout);
+    assert!(report.contains("records, sealed"), "{report}");
+    assert!(report.contains("final hash "), "{report}");
+
+    // Every printed line is in the journal, in order, before run.end.
+    let id = std::fs::read_to_string(home.join("runs/latest"))?;
+    let journal = std::fs::read_to_string(home.join("runs").join(id.trim()).join("journal.jsonl"))?;
+    let stdout = text(&out.stdout);
+    let first = stdout.lines().next().unwrap_or_default();
+    assert!(journal.contains("\"kind\":\"console\""), "{journal}");
+    assert!(journal.contains(first), "{first} missing from {journal}");
+    assert!(
+        journal
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .contains("\"kind\":\"run.end\",\"at_us\"")
+    );
+
+    // One changed byte breaks verification.
+    let path = home.join("runs").join(id.trim()).join("journal.jsonl");
+    std::fs::write(
+        &path,
+        journal.replacen("\"kind\":\"console\"", "\"kind\":\"consolE\"", 1),
+    )?;
+    let check = vaern_home(&["journal", "verify", "latest"], &home)?;
+    assert_eq!(check.status.code(), Some(1));
+    assert!(text(&check.stderr).contains("fails verification at record"));
+    Ok(())
+}
+
+#[test]
+fn process_exit_seals_the_journal_with_its_code() -> TestResult {
+    let home = journal_home("exit")?;
+    let out = vaern_home(&["run", "exit_test.ts"], &home)?;
+    assert_eq!(out.status.code(), Some(42));
+    let check = vaern_home(&["journal", "verify", "latest"], &home)?;
+    assert_eq!(check.status.code(), Some(0), "{}", text(&check.stdout));
+    let id = std::fs::read_to_string(home.join("runs/latest"))?;
+    let journal = std::fs::read_to_string(home.join("runs").join(id.trim()).join("journal.jsonl"))?;
+    assert!(journal.contains("\"kind\":\"run.end\""), "{journal}");
+    assert!(journal.contains("\"exit_code\":42"), "{journal}");
+    Ok(())
+}
+
+#[test]
+fn no_journal_writes_nothing() -> TestResult {
+    let home = journal_home("off")?;
+    let out = vaern_home(&["run", "--no-journal", "hello.ts"], &home)?;
+    assert_eq!(out.status.code(), Some(0));
+    assert!(!home.join("runs").exists());
+    let check = vaern_home(&["journal", "verify", "latest"], &home)?;
+    assert_eq!(check.status.code(), Some(1));
+    Ok(())
+}

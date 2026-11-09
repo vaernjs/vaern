@@ -32,6 +32,9 @@ pub struct Journal {
     run_id: String,
     next_seq: u64,
     prev: String,
+    /// Running SHA-256 of the transcript; see [`Journal::console`].
+    transcript: ring::digest::Context,
+    sealed: bool,
 }
 
 /// The outcome of [`verify`].
@@ -90,6 +93,8 @@ impl Journal {
             run_id,
             next_seq: 0,
             prev: GENESIS.to_string(),
+            transcript: ring::digest::Context::new(&ring::digest::SHA256),
+            sealed: false,
         })
     }
 
@@ -114,6 +119,41 @@ impl Journal {
     /// crash, such as a budget reservation made before its request is sent.
     pub fn append_durable(&mut self, kind: &str, fields: Map<String, Value>) -> Result<u64> {
         self.write_record(kind, fields, true)
+    }
+
+    /// Records text the script wrote to stdout (`fd` 1) or stderr (`fd` 2),
+    /// exactly as written, newline included. These records are the run's
+    /// transcript; its hash covers `<fd>:<byte length>:<text>` per record.
+    pub fn console(&mut self, fd: u8, text: &str) -> Result<u64> {
+        let mut fields = Map::new();
+        fields.insert("fd".to_string(), Value::from(fd));
+        fields.insert("text".to_string(), Value::from(text));
+        let seq = self.append("console", fields)?;
+        self.transcript
+            .update(format!("{fd}:{}:", text.len()).as_bytes());
+        self.transcript.update(text.as_bytes());
+        Ok(seq)
+    }
+
+    /// Appends `run.end` and syncs the file. Later calls do nothing, so the
+    /// first outcome, such as `process.exit`, is the one recorded.
+    pub fn seal(&mut self, exit_code: i32, error: Option<&str>) -> Result<()> {
+        if self.sealed {
+            return Ok(());
+        }
+        self.sealed = true;
+        let mut fields = Map::new();
+        fields.insert("exit_code".to_string(), Value::from(exit_code));
+        if let Some(error) = error {
+            fields.insert("error".to_string(), Value::from(error));
+        }
+        fields.insert("records".to_string(), Value::from(self.next_seq + 1));
+        fields.insert(
+            "transcript_sha256".to_string(),
+            Value::from(hex(self.transcript.clone().finish().as_ref())),
+        );
+        self.append_durable("run.end", fields)?;
+        Ok(())
     }
 
     fn write_record(

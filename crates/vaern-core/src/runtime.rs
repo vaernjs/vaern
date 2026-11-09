@@ -8,6 +8,7 @@ use crate::error::{Result, VaernError};
 use crate::event::{
     EventReceiver, EventSender, FetchCompletion, FsCompletion, LoopEvent, StreamChunkSent,
 };
+use crate::journal::Journal;
 use crate::module_loader::{FsModuleLoader, ModuleLoader};
 use crate::server::{HttpServer, ServerIncomingRequest, ServerResponse, ServerResponseBody};
 use crate::transpile::{SwcTranspiler, Transpiler};
@@ -126,10 +127,11 @@ struct VaernModuleLoader {
     /// Parse errors in modules outside both keep their location and lose
     /// their message, which can quote the offending token.
     project_roots: Vec<PathBuf>,
+    journal: JournalSlot,
 }
 
 impl VaernModuleLoader {
-    fn new(transpiler: SwcTranspiler, base_dir: &Path) -> Self {
+    fn new(transpiler: SwcTranspiler, base_dir: &Path, journal: JournalSlot) -> Self {
         let real = |path: &Path| {
             std::fs::canonicalize(path)
                 .ok()
@@ -143,6 +145,7 @@ impl VaernModuleLoader {
         Self {
             transpiler,
             project_roots,
+            journal,
         }
     }
 
@@ -207,6 +210,17 @@ impl Loader for VaernModuleLoader {
         let content = FsModuleLoader
             .load(Path::new(name))
             .map_err(|err| rquickjs::Error::new_loading_message(name, err.to_string()))?;
+        if let Some(journal) = self.journal.borrow_mut().as_mut() {
+            let mut fields = serde_json::Map::new();
+            fields.insert("path".into(), name.into());
+            fields.insert(
+                "sha256".into(),
+                crate::journal::sha256_hex(content.as_bytes()).into(),
+            );
+            journal
+                .append("module.load", fields)
+                .map_err(|err| rquickjs::Error::new_loading_message(name, err.to_string()))?;
+        }
         let outside = self.outside_project(name);
         let transpiled = if name.ends_with(".ts") {
             self.transpiler
@@ -365,8 +379,16 @@ pub struct QuickJsRuntime {
     /// Shared with the module resolver; see [`VaernModuleResolver::failure`].
     resolve_failure: Rc<RefCell<Option<VaernError>>>,
     active_servers_list: Arc<tokio::sync::Mutex<Vec<Arc<HttpServer>>>>,
+    /// Where run journals are written; `None` disables the journal.
+    journal_home: Option<PathBuf>,
+    /// The open journal, shared with the bridges that record effects.
+    journal: JournalSlot,
     _tokio_rt: tokio::runtime::Runtime,
 }
+
+/// The run's journal, if one is open. Bridges append through it; it is
+/// `None` before the run starts and when journalling is off.
+type JournalSlot = Rc<RefCell<Option<Journal>>>;
 
 impl QuickJsRuntime {
     /// Creates and initializes a new QuickJS runtime instance with host globals.
@@ -434,6 +456,8 @@ impl QuickJsRuntime {
             parks: std::cell::Cell::new(0),
             resolve_failure: Rc::new(RefCell::new(None)),
             active_servers_list,
+            journal_home: None,
+            journal: Rc::new(RefCell::new(None)),
             _tokio_rt: tokio_rt,
         };
 
@@ -479,15 +503,28 @@ impl QuickJsRuntime {
             let globals = ctx.globals();
 
             // Native console printer bridge
-            let print_fn = Function::new(ctx.clone(), |target: i32, msg: String| {
-                if target == 0 {
-                    let mut out = std::io::stdout().lock();
-                    let _ = writeln!(out, "{msg}");
-                } else {
-                    let mut err = std::io::stderr().lock();
-                    let _ = writeln!(err, "{msg}");
-                }
-            })
+            // The text is journalled before it is written, so a transcript
+            // never lacks output the terminal showed.
+            let journal_print = Rc::clone(&self.journal);
+            let print_fn = Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>, target: i32, msg: String| -> rquickjs::Result<()> {
+                    if let Some(journal) = journal_print.borrow_mut().as_mut() {
+                        let fd = if target == 0 { 1 } else { 2 };
+                        journal
+                            .console(fd, &format!("{msg}\n"))
+                            .map_err(|err| rquickjs::Exception::throw_message(&ctx, &err.to_string()))?;
+                    }
+                    if target == 0 {
+                        let mut out = std::io::stdout().lock();
+                        let _ = writeln!(out, "{msg}");
+                    } else {
+                        let mut err = std::io::stderr().lock();
+                        let _ = writeln!(err, "{msg}");
+                    }
+                    Ok(())
+                },
+            )
             .map_err(|err| VaernError::EngineInit {
                 reason: format!("failed to create print bridge: {err}"),
             })?;
@@ -499,7 +536,17 @@ impl QuickJsRuntime {
 
             // Native exit bridge behind `process.exit`. It flushes both streams
             // first because `std::process::exit` skips destructors.
-            let exit_fn = Function::new(ctx.clone(), |code: i32| exit_process(code))
+            let journal_exit = Rc::clone(&self.journal);
+            let exit_fn = Function::new(ctx.clone(), move |code: i32| {
+                // The process ends here, so this is the run's outcome.
+                if let Some(journal) = journal_exit.borrow_mut().as_mut()
+                    && let Err(err) = journal.seal(code, None)
+                {
+                    eprintln!("{err}");
+                    exit_process(1);
+                }
+                exit_process(code)
+            })
             .map_err(|err| VaernError::EngineInit {
                 reason: format!("failed to create exit bridge: {err}"),
             })?;
@@ -2637,6 +2684,63 @@ impl QuickJsRuntime {
 
 impl Runtime for QuickJsRuntime {
     fn run_file(&mut self, path: &Path) -> Result<i32> {
+        let outcome = self.run_file_inner(path);
+        self.seal_journal(outcome)
+    }
+
+    fn eval(&mut self, filename: &str, source: &str) -> Result<i32> {
+        let outcome = self.eval_inner(filename, source);
+        self.seal_journal(outcome)
+    }
+}
+
+impl QuickJsRuntime {
+    /// Records the next run's effects in a journal under `home` (normally
+    /// `.vaern` in the working directory). `None`, the default, records
+    /// nothing.
+    pub fn set_journal_home(&mut self, home: Option<PathBuf>) {
+        self.journal_home = home;
+    }
+
+    /// Opens the run's journal and records `run.start` and the entry module.
+    fn begin_journal(&mut self, script: &str, source: &str) -> Result<()> {
+        let Some(home) = &self.journal_home else {
+            return Ok(());
+        };
+        let mut journal = Journal::create(home)?;
+        let digest = crate::journal::sha256_hex(source.as_bytes());
+        let mut start = serde_json::Map::new();
+        start.insert("vaern".into(), env!("CARGO_PKG_VERSION").into());
+        start.insert("script".into(), script.into());
+        start.insert("script_sha256".into(), digest.clone().into());
+        start.insert("argv".into(), self.options.argv.clone().into());
+        journal.append("run.start", start)?;
+        let mut module = serde_json::Map::new();
+        module.insert("path".into(), script.into());
+        module.insert("sha256".into(), digest.into());
+        journal.append("module.load", module)?;
+        *self.journal.borrow_mut() = Some(journal);
+        Ok(())
+    }
+
+    /// Seals the journal with the run's outcome. A run that succeeded but
+    /// cannot be sealed fails, since its record would be incomplete.
+    fn seal_journal(&mut self, outcome: Result<i32>) -> Result<i32> {
+        let mut slot = self.journal.borrow_mut();
+        let Some(journal) = slot.as_mut() else {
+            return outcome;
+        };
+        let sealed = match &outcome {
+            Ok(code) => journal.seal(*code, None),
+            Err(err) => journal.seal(1, Some(&err.to_string())),
+        };
+        match (outcome, sealed) {
+            (Ok(_), Err(err)) => Err(err),
+            (outcome, _) => outcome,
+        }
+    }
+
+    fn run_file_inner(&mut self, path: &Path) -> Result<i32> {
         let path_str = path.display().to_string();
         if !path.exists() {
             return Err(VaernError::Io {
@@ -2646,6 +2750,7 @@ impl Runtime for QuickJsRuntime {
         }
 
         let source = FsModuleLoader.load(path)?;
+        self.begin_journal(&path_str, &source)?;
 
         let transpiled = if path.extension().is_some_and(|ext| ext == "ts") {
             self.transpiler.transpile(&path_str, &source)?
@@ -2655,7 +2760,8 @@ impl Runtime for QuickJsRuntime {
 
         let base_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
 
-        let loader = VaernModuleLoader::new(self.transpiler.clone(), &base_dir);
+        let loader =
+            VaernModuleLoader::new(self.transpiler.clone(), &base_dir, Rc::clone(&self.journal));
         self.qjs_runtime.set_loader(
             VaernModuleResolver {
                 base_dir,
@@ -2697,7 +2803,8 @@ impl Runtime for QuickJsRuntime {
         self.run_event_loop(&path_str)
     }
 
-    fn eval(&mut self, filename: &str, source: &str) -> Result<i32> {
+    fn eval_inner(&mut self, filename: &str, source: &str) -> Result<i32> {
+        self.begin_journal(filename, source)?;
         let transpiled = if filename.ends_with(".ts") {
             self.transpiler.transpile(filename, source)?
         } else {
@@ -2705,7 +2812,8 @@ impl Runtime for QuickJsRuntime {
         };
 
         let base_dir = Path::new(".").to_path_buf();
-        let loader = VaernModuleLoader::new(self.transpiler.clone(), &base_dir);
+        let loader =
+            VaernModuleLoader::new(self.transpiler.clone(), &base_dir, Rc::clone(&self.journal));
         self.qjs_runtime.set_loader(
             VaernModuleResolver {
                 base_dir,
@@ -3572,6 +3680,96 @@ mod tests {
             Err(other) => panic!("expected SourceTooLarge, got {other}"),
             Ok(code) => panic!("expected SourceTooLarge, ran with status {code}"),
         }
+    }
+
+    fn journal_records(home: &Path) -> Vec<serde_json::Value> {
+        let id = std::fs::read_to_string(home.join("runs/latest")).unwrap();
+        let path = home.join("runs").join(id).join("journal.jsonl");
+        assert!(crate::journal::verify(&path).unwrap().sealed);
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["r"].clone())
+            .collect()
+    }
+
+    #[test]
+    fn test_run_records_start_modules_transcript_and_end() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join(".vaern");
+        std::fs::write(root.path().join("dep.js"), "export const n = 2;\n").unwrap();
+        let main = root.path().join("main.js");
+        let source = "import { n } from './dep.js';\nconsole.log('n =', n);\nconsole.error('é');\n";
+        std::fs::write(&main, source).unwrap();
+
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        runtime.set_journal_home(Some(home.clone()));
+        assert_eq!(runtime.run_file(&main).unwrap(), 0);
+
+        let records = journal_records(&home);
+        let kinds: Vec<&str> = records
+            .iter()
+            .map(|r| r["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "run.start",
+                "module.load",
+                "module.load",
+                "console",
+                "console",
+                "run.end"
+            ]
+        );
+        assert_eq!(
+            records[0]["script_sha256"],
+            crate::journal::sha256_hex(source.as_bytes())
+        );
+        assert!(records[2]["path"].as_str().unwrap().ends_with("dep.js"));
+        assert_eq!(
+            (records[3]["fd"].as_u64(), records[3]["text"].as_str()),
+            (Some(1), Some("n = 2\n"))
+        );
+        assert_eq!(
+            (records[4]["fd"].as_u64(), records[4]["text"].as_str()),
+            (Some(2), Some("é\n"))
+        );
+
+        let end = &records[5];
+        assert_eq!(end["exit_code"], 0);
+        assert_eq!(end["records"], 6);
+        // The documented transcript construction: <fd>:<byte length>:<text>.
+        let transcript = "1:6:n = 2\n2:3:é\n";
+        assert_eq!(
+            end["transcript_sha256"],
+            crate::journal::sha256_hex(transcript.as_bytes())
+        );
+    }
+
+    #[test]
+    fn test_failed_run_is_sealed_with_its_error() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join(".vaern");
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        runtime.set_journal_home(Some(home.clone()));
+        let err = runtime
+            .eval("boom.js", "throw new Error('boom');")
+            .unwrap_err();
+        let records = journal_records(&home);
+        let end = records.last().unwrap();
+        assert_eq!(end["kind"], "run.end");
+        assert_eq!(end["exit_code"], 1);
+        assert_eq!(end["error"], err.to_string());
+    }
+
+    #[test]
+    fn test_journal_is_off_unless_a_home_is_set() {
+        let root = tempfile::tempdir().unwrap();
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        assert_eq!(runtime.eval("quiet.js", "console.log('x');").unwrap(), 0);
+        assert!(runtime.journal.borrow().is_none());
+        assert!(std::fs::read_dir(root.path()).unwrap().next().is_none());
     }
 
     #[test]
