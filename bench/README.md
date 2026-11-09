@@ -51,6 +51,23 @@ The release profile then gained `lto = "fat"` and `codegen-units = 1`. The same 
 
 Binary size, stripped: 9,427,456 bytes (0.0.6: 16,103,936, −6,676,480), 6,301,184 bytes under the 15 MiB budget. The cost is build time: a cold `cargo build --release` takes about 10 minutes on this machine instead of about 2.
 
+## Unreleased run journal, `vaern:ai` and replay against 0.0.6
+
+Re-run on 2026-11-09 on the same machine, after every `vaern run` started writing a journal. The 0.0.6 binary was built from the `v0.0.6` tag in the same session. Each row is one hyperfine call with 0.0.6 listed first, and startup and parallel HTTP were repeated with the new build first. The machine was busier than on 2026-11-07 (`node -e 0` took 80 ms, against 39 ms then), so σ is wider; compare within a row only. The journal goes to `$VAERN_HOME` on the local system disk.
+
+| Benchmark | Unreleased | Unreleased, `--no-journal` | 0.0.6 | Comparison | Peak RSS (new / 0.0.6) | Status |
+|---|---|---|---|---|---|---|
+| Startup and greeting | 26.4 ms ± 3.2 | 19.6 ms ± 3.0 | 19.8 ms ± 1.4 | `node -e 0`: 80.3 ms | 7.7 / 7.8 MB | **Loss with the journal, +6.6 ms** (+4.6 ms with the new build first); without it, within noise |
+| Loopback fetch and JSON parse | 32.6 ms ± 4.1 | 29.0 ms ± 5.8 | 30.9 ms ± 8.6 | | 9.6 / 10.3 MB | Within noise |
+| Arithmetic loop (1M) | 74.7 ms ± 8.8 | | 67.2 ms ± 11.3 | Node: 155.5 ms | 8.0 / 8.1 MB | +7.5 ms, within σ; about the journal's startup cost. Win vs Node |
+| Arithmetic loop (50M) | 2.336 s ± 0.139 | | 2.254 s ± 0.124 | Node: 0.435 s | | Within noise of 0.0.6; **loss, 5.4x slower than Node** |
+| Parallel HTTP (100 requests) | 77.9 ms ± 12.1 | | 70.2 ms ± 7.9 | | 17.1 / 17.7 MB | +7.7 ms (+3.7 ms with the new build first), within σ; about the journal's startup cost |
+| Idle HTTP server, CPU over 3 s | 0.0 ms | | 0.0 ms | | | Unchanged |
+
+The journal costs about 5 ms per run on this machine. Creating a run directory and file takes about 1.5 ms here and syncing one record about 1.8 ms more, measured on their own; the journal syncs once, at `run.end`, so that accounts for about 3 ms. The rest has not been profiled. `vaern run --no-journal` removes the cost.
+
+Binary size, stripped: 9,889,792 bytes (0.0.6: 16,103,936; the LTO build above: 9,427,456, +462,336 for the journal, `vaern:ai` and replay), 5,838,848 bytes under the 15 MiB budget.
+
 ## Reproduction commands
 
 Build first with `cargo build --release`. To compare two versions, pass both binaries to the same hyperfine call.
@@ -58,7 +75,7 @@ Build first with `cargo build --release`. To compare two versions, pass both bin
 ### Startup
 
 ```bash
-hyperfine -N --warmup 3 --runs 30 'target/release/vaern run examples/hello.ts' 'node -e 0'
+hyperfine -N --warmup 3 --runs 30 'target/release/vaern run examples/hello.ts' 'target/release/vaern run --no-journal examples/hello.ts' 'node -e 0'
 ```
 
 ### Loopback fetch
