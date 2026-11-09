@@ -42,13 +42,28 @@ numbers.
 | `run.start` | `vaern` (version), `script`, `script_sha256`, `argv` |
 | `module.load` | `path`, `sha256` of the source as read. One per module evaluated, the entry script first |
 | `console` | `fd` (1 stdout, 2 stderr), `text`: exactly what was written, newline included |
+| `fetch` | `eid`, `dur_us`, `req` {`method`, `url`, `headers`, `body`}, then `res` {`status`, `status_text`, `url` (after redirects), `headers`, `body`} or `error` {`stage`, `url`, `message`} |
+| `fs` | `eid`, `dur_us`, `req` {`op`, `path` as passed; writes add `len` and `sha256` of the data}, then `res` (`text` or `bytes` for reads, `{}` for writes) or `error` {`stage`, `code`, `path`, `message`} |
 | `run.end` | `exit_code`, `error` (when the run failed), `records` (count including this one), `transcript_sha256` |
 
 The transcript is the run's `console` records in order. `transcript_sha256`
 is SHA-256 over, for each of them, `<fd>:<UTF-8 byte length of text>:<text>`.
 
-This version records the run, its modules and its output. Network, file and
-model effects are not recorded yet.
+Effects (`fetch`, `fs`):
+- `eid` numbers effects in the order the script started them. The record
+  is written when the effect completes, so records appear in completion
+  order.
+- A body is stored as `{"utf8": text}` when it is valid UTF-8, else as
+  `{"b64": base64}`. Response bodies are stored whole, up to the 256 MiB
+  fetch limit, so a journal can be large.
+- The values of the `Authorization`, `Proxy-Authorization`, `Cookie`,
+  `Set-Cookie`, `X-Api-Key` and `Api-Key` headers are stored as
+  `"[redacted]"`. Secrets carried elsewhere, such as in a URL or a body, are
+  recorded as sent.
+- If an effect completes but its record cannot be written, the script gets
+  the journal error in place of the result.
+
+Incoming `serve()` requests are not recorded.
 
 ## Durability
 

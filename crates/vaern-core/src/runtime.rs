@@ -4,6 +4,7 @@
 //! of host globals (`console`, `process`, timers, `queueMicrotask`), module loading,
 //! and driving the event loop to completion using Tokio.
 
+use crate::effect_record::{Outcome, PendingEffect};
 use crate::error::{Result, VaernError};
 use crate::event::{
     EventReceiver, EventSender, FetchCompletion, FsCompletion, LoopEvent, StreamChunkSent,
@@ -51,6 +52,10 @@ struct SharedState {
     timers: HashMap<u32, TimerRecord>,
     abort_senders: HashMap<u32, tokio::sync::broadcast::Sender<()>>,
     pending_fetches: usize,
+    /// Next effect id, in dispatch order; see `effect_record`.
+    next_eid: u64,
+    /// Journalled effects in flight, keyed by kind and request id.
+    pending_effects: HashMap<(&'static str, u32), PendingEffect>,
     /// `vaern:fs` operations running on the blocking pool.
     pending_fs: usize,
     /// Production HTTP client shared by every fetch, built on the first one.
@@ -303,6 +308,26 @@ pub(crate) const HEAP_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 /// How long the pump waits for buffer space before treating the client as stalled.
 const STREAM_CHUNK_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Notes a dispatched effect so its completion can be journalled.
+fn track_effect(
+    state: &Rc<RefCell<SharedState>>,
+    kind: &'static str,
+    req_id: u32,
+    req: serde_json::Value,
+) {
+    let mut s = state.borrow_mut();
+    let eid = s.next_eid;
+    s.next_eid += 1;
+    s.pending_effects.insert(
+        (kind, req_id),
+        PendingEffect {
+            eid,
+            started: Instant::now(),
+            req,
+        },
+    );
+}
+
 /// The error for a chunk written after the client went away.
 fn stream_closed(req_id: u64) -> VaernError {
     VaernError::ServerStream {
@@ -418,6 +443,8 @@ impl QuickJsRuntime {
             timers: HashMap::new(),
             abort_senders: HashMap::new(),
             pending_fetches: 0,
+            next_eid: 0,
+            pending_effects: HashMap::new(),
             pending_fs: 0,
             fetch_client: None,
             events_tx,
@@ -618,6 +645,7 @@ impl QuickJsRuntime {
 
             // Native fetch start bridge
             let state_fetch = Rc::clone(&state);
+            let journal_fetch = Rc::clone(&self.journal);
             let tokio_handle_fetch = tokio_handle.clone();
             let fetch_start_fn = Function::new(
                 ctx.clone(),
@@ -666,6 +694,16 @@ impl QuickJsRuntime {
                     } else {
                         None
                     };
+
+                    if journal_fetch.borrow().is_some() {
+                        let req = crate::effect_record::fetch_request(
+                            &method,
+                            &url,
+                            &headers,
+                            body.as_deref(),
+                        );
+                        track_effect(&state_fetch, "fetch", req_id, req);
+                    }
 
                     let options = crate::fetch::FetchOptions {
                         method,
@@ -741,6 +779,7 @@ impl QuickJsRuntime {
             // is "bytes", since typed-array memory is reachable only through
             // `unsafe` accessors.
             let state_fs = Rc::clone(&state);
+            let journal_fs = Rc::clone(&self.journal);
             let tokio_handle_fs = tokio_handle.clone();
             let fs_start_fn = Function::new(
                 ctx.clone(),
@@ -773,6 +812,10 @@ impl QuickJsRuntime {
                             ));
                         }
                     };
+
+                    if journal_fs.borrow().is_some() {
+                        track_effect(&state_fs, "fs", req_id, crate::effect_record::fs_request(&op));
+                    }
 
                     let tx = state_fs.borrow().events_tx.clone();
                     state_fs.borrow_mut().pending_fs += 1;
@@ -2288,7 +2331,34 @@ impl QuickJsRuntime {
         })
     }
 
+    /// Writes the record for a completed effect. An error means the effect
+    /// happened but could not be recorded; the caller hands it to the script
+    /// in place of the result.
+    fn record_effect(
+        &self,
+        kind: &'static str,
+        req_id: u32,
+        outcome: Outcome,
+    ) -> Option<VaernError> {
+        let pending = self
+            .state
+            .borrow_mut()
+            .pending_effects
+            .remove(&(kind, req_id))?;
+        let mut slot = self.journal.borrow_mut();
+        let journal = slot.as_mut()?;
+        journal.append(kind, pending.finish(outcome)).err()
+    }
+
     fn dispatch_fetch_completion(&self, completion: FetchCompletion) {
+        let outcome = crate::effect_record::fetch_outcome(&completion.result);
+        let completion = match self.record_effect("fetch", completion.req_id, outcome) {
+            Some(err) => FetchCompletion {
+                req_id: completion.req_id,
+                result: Err(err),
+            },
+            None => completion,
+        };
         let _ = self.context.with(|ctx| -> rquickjs::Result<()> {
             let dispatch_fn: Function = ctx.globals().get("__vaern_dispatch_fetch")?;
             let info = Object::new(ctx.clone())?;
@@ -2358,6 +2428,14 @@ impl QuickJsRuntime {
 
     fn dispatch_fs_completion(&self, completion: FsCompletion) {
         let req_id = completion.req_id;
+        let outcome = crate::effect_record::fs_outcome(&completion.result);
+        let completion = match self.record_effect("fs", req_id, outcome) {
+            Some(err) => FsCompletion {
+                req_id,
+                result: Err(err),
+            },
+            None => completion,
+        };
         let unsettled = self.context.with(|ctx| {
             if Self::settle_fs(&ctx, completion).is_ok() {
                 return None;
@@ -3745,6 +3823,71 @@ mod tests {
             end["transcript_sha256"],
             crate::journal::sha256_hex(transcript.as_bytes())
         );
+    }
+
+    #[test]
+    fn test_fetch_and_fs_effects_are_journalled_with_secrets_redacted() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join(".vaern");
+        let data = root.path().join("data.txt");
+        let missing = root.path().join("missing.txt");
+        let code = format!(
+            r#"
+            import {{ serve }} from "vaern:http";
+            import {{ writeFile, readFile }} from "vaern:fs";
+            const server = serve(async (req) => new Response("pong:" + await req.text(),
+                {{ headers: {{ "set-cookie": "sid=secret-cookie" }} }}),
+                {{ port: 8993, hostname: "127.0.0.1" }});
+            const res = await fetch("http://127.0.0.1:8993/ping", {{
+                method: "POST",
+                headers: {{ authorization: "Bearer sk-secret-token", "x-trace": "t1" }},
+                body: new Uint8Array([0xff, 0x01]),
+            }});
+            await res.text();
+            await server.close();
+            await writeFile({data:?}, "hello");
+            await readFile({data:?}, "utf8");
+            await readFile({missing:?}).catch(() => {{}});
+            "#,
+            data = data.display().to_string(),
+            missing = missing.display().to_string(),
+        );
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        runtime.set_journal_home(Some(home.clone()));
+        assert_eq!(runtime.eval("effects.js", &code).unwrap(), 0);
+
+        let records = journal_records(&home);
+        let effects: Vec<&serde_json::Value> = records
+            .iter()
+            .filter(|r| r["kind"] == "fetch" || r["kind"] == "fs")
+            .collect();
+        assert_eq!(effects.len(), 4, "{records:#?}");
+        let eids: Vec<u64> = effects.iter().map(|r| r["eid"].as_u64().unwrap()).collect();
+        assert_eq!(eids, [0, 1, 2, 3]);
+
+        let fetch = effects[0];
+        assert_eq!(fetch["kind"], "fetch");
+        assert_eq!(fetch["req"]["method"], "POST");
+        assert_eq!(fetch["req"]["url"], "http://127.0.0.1:8993/ping");
+        assert_eq!(fetch["req"]["body"], serde_json::json!({ "b64": "/wE=" }));
+        assert_eq!(fetch["res"]["status"], 200);
+        assert_eq!(fetch["res"]["body"]["b64"], serde_json::Value::Null);
+        assert!(fetch["res"]["body"]["utf8"].as_str().unwrap().starts_with("pong:"));
+        assert!(fetch["dur_us"].as_u64().is_some());
+        let line = serde_json::to_string(&records).unwrap();
+        assert!(!line.contains("sk-secret-token"), "authorization leaked");
+        assert!(!line.contains("secret-cookie"), "set-cookie leaked");
+        assert!(line.contains(r#"["x-trace","t1"]"#), "{line}");
+
+        assert_eq!(effects[1]["req"]["op"], "write");
+        assert_eq!(effects[1]["req"]["len"], 5);
+        assert_eq!(
+            effects[1]["req"]["sha256"],
+            crate::journal::sha256_hex(b"hello")
+        );
+        assert_eq!(effects[2]["req"]["op"], "read_utf8");
+        assert_eq!(effects[2]["res"]["text"], "hello");
+        assert_eq!(effects[3]["error"]["code"], "ENOENT");
     }
 
     #[test]
