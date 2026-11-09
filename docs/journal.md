@@ -39,15 +39,16 @@ numbers.
 
 | kind | fields |
 |---|---|
-| `run.start` | `vaern` (version), `script`, `script_sha256`, `argv`, `random_seed` (32 hex digits: the four 32-bit words, in order, that seed `Math.random`) |
+| `run.start` | `vaern` (version), `script`, `script_sha256`, `argv`, `budget_caps` {`nano_usd`, `tokens`} (from `--budget-usd` and `--budget-tokens`; `null` when not given), `random_seed` (32 hex digits: the four 32-bit words, in order, that seed `Math.random`) |
 | `module.load` | `path`, `sha256` of the source as read. One per module evaluated, the entry script first |
 | `console` | `fd` (1 stdout, 2 stderr), `text`: exactly what was written, newline included |
-| `fetch` | `eid`, `dur_us`, `req` {`method`, `url`, `headers`, `body`}, then `res` {`status`, `status_text`, `url` (after redirects), `headers`, `body`} or `error` {`stage`, `url`, `message`} |
-| `fs` | `eid`, `dur_us`, `req` {`op`, `path` as passed; writes add `len` and `sha256` of the data}, then `res` (`text` or `bytes` for reads, `{}` for writes) or `error` {`stage`, `code`, `path`, `message`} |
-| `model.call` | `eid`, `dur_us`, `req` {`base_url`, `model`, `body`: the request body as sent}, then `res` {`status`, `body`: the response text as received (for a streamed call, the event stream as received), `usage` {`input_tokens`, `output_tokens`}, `charged_nano_usd`} or `error` {`stage`, `url`, `status`, `message`}. A call refused before dispatch (`stage` `config`) is not recorded |
+| `fetch` | `eid`, `dur_us`, `req` {`method`, `url`, `headers`, `body`}, then `res` {`status`, `status_text`, `url` (after redirects), `headers`, `body`} or `error` {`stage`, `url`, `message`, `action`} |
+| `fs` | `eid`, `dur_us`, `req` {`op`, `path` as passed; writes add `len` and `sha256` of the data}, then `res` (`text` or `bytes` for reads, `{}` for writes) or `error` {`stage`, `code`, `path`, `message`, `action`} |
+| `model.call` | `eid`, `dur_us`, `req` {`base_url`, `model`, `body`: the request body as sent}, then `res` {`status`, `body`: the response text as received (for a streamed call, the event stream as received), `usage` {`input_tokens`, `output_tokens`}, `charged_nano_usd`} or `error` {`stage`, `url`, `status`, `message`, `action`}. A call refused before dispatch (`stage` `config`) is not recorded |
 | `tool.call` | `eid`, `req` {`name`, `args`}. Written when the tool starts, so the effects it makes follow it |
 | `tool.result` | `eid` (the same as its `tool.call`), `dur_us`, `req` {`name`}, then `res` {`value`} or `error` {`stage`, `message`} |
 | `budget.reserve` | `rid`, `run`, `for` (`model.call` or `tool.call`), `nano_usd`, `tokens`, `remaining_nano_usd`, `remaining_tokens` (before this reserve; `null` without a limit). Synced to disk before the call is sent |
+| `ledger.open` | `name`, `spent_nano_usd`, `spent_tokens`: a named ledger's balance when this run opened it, unsettled reserves included |
 | `budget.settle` | `rid`, `run`, `nano_usd`, `tokens`: the amount charged for that reserve |
 | `run.end` | `exit_code`, `error` (when the run failed), `records` (count including this one), `transcript_sha256` |
 

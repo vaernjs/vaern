@@ -174,6 +174,11 @@ impl Budget {
         self.limits
     }
 
+    /// Settled charges plus reserves left unsettled by earlier runs.
+    pub fn spent(&self) -> Amount {
+        self.spent
+    }
+
     fn lower_to(&mut self, limits: Limits) {
         self.limits = limits;
     }
@@ -336,10 +341,21 @@ impl RunBudget {
             .clone()
     }
 
+    /// The caps from the command line.
+    pub fn caps(&self) -> Limits {
+        self.caps
+    }
+
     /// Applies a `budget()` call and returns what remains. Limits only go
     /// down: a script can lower its budget, never raise it above the caps
-    /// or an earlier call.
-    pub fn request(&mut self, name: Option<&str>, limits: Limits) -> Result<Limits> {
+    /// or an earlier call. Opening a named ledger records its balance in
+    /// `journal`, since the ledger itself moves on after the run.
+    pub fn request(
+        &mut self,
+        journal: Option<&mut Journal>,
+        name: Option<&str>,
+        limits: Limits,
+    ) -> Result<Limits> {
         let invalid = |message: String| {
             budget_error(
                 "INVALID",
@@ -370,6 +386,13 @@ impl RunBudget {
                     )));
                 };
                 let budget = Budget::named(home, name, lowered(self.caps, limits))?;
+                if let Some(journal) = journal {
+                    let mut fields = Map::new();
+                    fields.insert("name".into(), name.into());
+                    fields.insert("spent_nano_usd".into(), budget.spent().nano.into());
+                    fields.insert("spent_tokens".into(), budget.spent().tokens.into());
+                    journal.append("ledger.open", fields)?;
+                }
                 self.budget = Some(budget);
                 self.name = Some(name.to_string());
             }
@@ -560,7 +583,7 @@ mod tests {
             tokens: Some(50),
         };
         assert_eq!(
-            run.request(None, asked).unwrap(),
+            run.request(None, None, asked).unwrap(),
             Limits {
                 nano: Some(500),
                 tokens: Some(50)
@@ -570,9 +593,11 @@ mod tests {
             nano: Some(800),
             tokens: Some(40),
         };
-        assert_eq!(run.request(None, raised).unwrap().nano, Some(500));
+        assert_eq!(run.request(None, None, raised).unwrap().nano, Some(500));
         assert_eq!(run.remaining().tokens, Some(40));
-        let named = run.request(Some("late"), Limits::default()).unwrap_err();
+        let named = run
+            .request(None, Some("late"), Limits::default())
+            .unwrap_err();
         assert_eq!(refusal(named).0, "INVALID");
 
         let mut capped = RunBudget::default();
@@ -593,11 +618,14 @@ mod tests {
         capped.settle(None, "model.call", 1, None).unwrap();
         assert_eq!(capped.remaining().nano, Some(100));
         // The caps applied at the first reserve, so budget() may still lower them.
-        assert!(capped.request(None, caps).is_ok());
+        assert!(capped.request(None, None, caps).is_ok());
 
         let mut late = RunBudget::default();
         late.reserve(None, "model.call", 1, amount(1, 1)).unwrap();
-        assert_eq!(refusal(late.request(None, caps).unwrap_err()).0, "INVALID");
+        assert_eq!(
+            refusal(late.request(None, None, caps).unwrap_err()).0,
+            "INVALID"
+        );
     }
 
     #[test]

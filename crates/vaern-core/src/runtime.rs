@@ -1094,6 +1094,7 @@ impl QuickJsRuntime {
                 reason: format!("failed to create schema validate bridge: {err}"),
             })?;
             let budget_set = Rc::clone(&self.budget);
+            let journal_budget = Rc::clone(&self.journal);
             let budget_set_fn = Function::new(ctx.clone(), move |request: String| -> String {
                 let request: serde_json::Value =
                     serde_json::from_str(&request).unwrap_or(serde_json::Value::Null);
@@ -1102,7 +1103,11 @@ impl QuickJsRuntime {
                     tokens: request.get("tokens").and_then(serde_json::Value::as_u64),
                 };
                 let name = request.get("name").and_then(serde_json::Value::as_str);
-                match budget_set.borrow_mut().request(name, limits) {
+                let opened =
+                    budget_set
+                        .borrow_mut()
+                        .request(journal_budget.borrow_mut().as_mut(), name, limits);
+                match opened {
                     Ok(left) => serde_json::json!({
                         "remaining": { "nano": left.nano, "tokens": left.tokens },
                     }),
@@ -3237,6 +3242,11 @@ impl QuickJsRuntime {
         start.insert("script".into(), script.into());
         start.insert("script_sha256".into(), digest.clone().into());
         start.insert("argv".into(), self.options.argv.clone().into());
+        let caps = self.budget.borrow().caps();
+        start.insert(
+            "budget_caps".into(),
+            serde_json::json!({ "nano_usd": caps.nano, "tokens": caps.tokens }),
+        );
         start.insert(
             "random_seed".into(),
             seed.iter()
@@ -4825,6 +4835,50 @@ mod tests {
         );
         let ledger = crate::journal::verify(&home.join("budgets/team.jsonl")).unwrap();
         assert_eq!(ledger.records, 8);
+    }
+
+    #[test]
+    fn test_journal_keeps_caps_ledger_balances_and_error_actions_for_replay() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join(".vaern");
+        let script = model_stub(8993)
+            + r#"
+            import { model, budget } from "vaern:ai";
+            budget({ name: "kept", usd: 1 });
+            const at = (path) => model({ baseUrl: base + path, model: "m",
+                                         price: { inputPerMTok: 1, outputPerMTok: 1 } });
+            const ask = { messages: [{ role: "user", content: "x" }], maxTokens: 8 };
+            await at("/ok/v1").chat(ask);
+            await at("/fail/v1").chat(ask).catch(() => {});
+            await stub.close();
+            "#;
+        let caps = crate::budget::Limits {
+            nano: Some(2_000_000_000),
+            tokens: None,
+        };
+        let mut opened = Vec::new();
+        for _ in 0..2 {
+            let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+            runtime.set_journal_home(Some(home.clone()));
+            runtime.set_budget(caps, Some(home.clone()));
+            assert_eq!(runtime.eval("kept.js", &script).unwrap(), 0);
+            let records = journal_records(&home);
+            assert_eq!(
+                records[0]["budget_caps"],
+                serde_json::json!({ "nano_usd": 2_000_000_000u64, "tokens": null })
+            );
+            let open = records.iter().find(|r| r["kind"] == "ledger.open").unwrap();
+            assert_eq!(open["name"], "kept");
+            opened.push(open["spent_nano_usd"].as_u64().unwrap());
+            let failed = records
+                .iter()
+                .find(|r| r["kind"] == "model.call" && r["error"].is_object())
+                .unwrap();
+            assert!(failed["error"]["action"].as_str().unwrap().len() > 10);
+        }
+        // The second run opened the ledger with what the first left in it.
+        assert_eq!(opened[0], 0);
+        assert!(opened[1] > 0, "{opened:?}");
     }
 
     #[test]

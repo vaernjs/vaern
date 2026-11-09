@@ -154,6 +154,8 @@ pub fn model_outcome(result: &Result<ModelReply>, charged: u64) -> Outcome {
     }
 }
 
+/// An error as recorded: every field a replay needs to hand the script the
+/// same error again.
 fn error_value(err: &VaernError) -> Value {
     match err {
         VaernError::Model {
@@ -161,21 +163,25 @@ fn error_value(err: &VaernError) -> Value {
             url,
             status,
             message,
-            ..
-        } => json!({ "stage": stage, "url": url, "status": status, "message": message }),
+            action,
+        } => json!({
+            "stage": stage, "url": url, "status": status, "message": message, "action": action,
+        }),
         VaernError::Fetch {
             stage,
             url,
             message,
-            ..
-        } => json!({ "stage": stage, "url": url, "message": message }),
+            action,
+        } => json!({ "stage": stage, "url": url, "message": message, "action": action }),
         VaernError::Fs {
             stage,
             code,
             path,
             message,
-            ..
-        } => json!({ "stage": stage, "code": code, "path": path, "message": message }),
+            action,
+        } => json!({
+            "stage": stage, "code": code, "path": path, "message": message, "action": action,
+        }),
         other => json!({ "message": other.to_string() }),
     }
 }
