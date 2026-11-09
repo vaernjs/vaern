@@ -2526,17 +2526,37 @@ impl QuickJsRuntime {
             None => result,
         };
         let info = match result {
-            Ok(reply) => serde_json::json!({
-                "reqId": req_id,
-                "ok": true,
-                "text": reply.text,
-                "finishReason": reply.finish_reason,
-                "inputTokens": reply.input_tokens,
-                "outputTokens": reply.output_tokens,
-                "chargedNano": charged,
-                "eid": eid,
-                "toolCalls": reply.tool_calls,
-            }),
+            // The reply is recorded and charged whether or not it matches the
+            // schema: the call happened and was billed either way.
+            Ok(reply) => match crate::ai::structured(&call, &reply) {
+                Ok(json) => serde_json::json!({
+                    "reqId": req_id,
+                    "ok": true,
+                    "text": reply.text,
+                    "json": json,
+                    "finishReason": reply.finish_reason,
+                    "inputTokens": reply.input_tokens,
+                    "outputTokens": reply.output_tokens,
+                    "chargedNano": charged,
+                    "eid": eid,
+                    "toolCalls": reply.tool_calls,
+                }),
+                Err(mismatch) => serde_json::json!({
+                    "reqId": req_id,
+                    "ok": false,
+                    "stage": "schema",
+                    "url": call.endpoint,
+                    "status": reply.status,
+                    "path": mismatch.path,
+                    "message": format!(
+                        "the reply does not match the schema at {}: {}",
+                        mismatch.path, mismatch.message
+                    ),
+                    "action": "Retry, simplify the schema, or use a model that supports structured output.",
+                    "chargedNano": charged,
+                    "eid": eid,
+                }),
+            },
             Err(err) => {
                 let mut info = model_error_info(err);
                 if let Some(fields) = info.as_object_mut() {
@@ -4053,7 +4073,8 @@ mod tests {
     }
 
     /// An OpenAI-compatible stub on `port`. `/ok/` answers with usage,
-    /// `/nousage/` without it, `/fail/` with a 500 and `/junk/` with text.
+    /// `/nousage/` without it, `/fail/` with a 500, `/junk/` with text, and
+    /// `/echo/` with the first message's content as the reply.
     fn model_stub(port: u16) -> String {
         format!(
             r#"
@@ -4064,8 +4085,10 @@ mod tests {
                 seen.push({{ url: req.url, auth: req.headers.get("authorization"), body }});
                 if (req.url.includes("/fail/")) return new Response("overloaded", {{ status: 500 }});
                 if (req.url.includes("/junk/")) return new Response("<html>");
+                const content = req.url.includes("/echo/")
+                    ? body.messages[0].content : "hi " + body.messages[0].content;
                 const reply = {{
-                    choices: [{{ message: {{ role: "assistant", content: "hi " + body.messages[0].content }},
+                    choices: [{{ message: {{ role: "assistant", content }},
                                  finish_reason: "stop" }}],
                 }};
                 if (req.url.includes("/ok/")) reply.usage = {{ prompt_tokens: 20, completion_tokens: 5 }};
@@ -4122,6 +4145,54 @@ mod tests {
         assert!(call["res"]["body"].as_str().unwrap().contains("hi there"));
         let line = serde_json::to_string(&records).unwrap();
         assert!(!line.contains("sk-model-secret"), "the API key leaked");
+    }
+
+    #[test]
+    fn test_schema_replies_are_parsed_checked_and_still_charged_on_mismatch() {
+        let code = model_stub(8990)
+            + r#"
+            import { model, ModelError } from "vaern:ai";
+            const m = model({ baseUrl: base + "/echo/v1", model: "m",
+                              price: { inputPerMTok: 1, outputPerMTok: 1 } });
+            const schema = { type: "object", properties: { n: { type: "integer" } },
+                             required: ["n"], additionalProperties: false };
+            const say = (content, s = schema) => m.chat({ messages: [{ role: "user", content }], schema: s });
+
+            const ok = await say('{"n": 3}');
+            if (ok.json?.n !== 3 || ok.text !== '{"n": 3}') throw new Error(JSON.stringify(ok));
+            const format = seen[0].body.response_format;
+            if (format.type !== "json_schema" || format.json_schema.name !== "reply"
+                || format.json_schema.strict !== true || format.json_schema.schema.required[0] !== "n") {
+                throw new Error(JSON.stringify(format));
+            }
+            const plain = await m.chat({ messages: [{ role: "user", content: "x" }] });
+            if ("json" in plain) throw new Error("json without a schema");
+
+            const wrong = await say('{"n": "3"}').catch((e) => e);
+            if (!(wrong instanceof ModelError) || wrong.stage !== "schema" || wrong.path !== "$.n"
+                || !(wrong.costUsd > 0)) throw wrong;
+            const prose = await say("sure, here it is").catch((e) => e);
+            if (prose.stage !== "schema" || prose.path !== "$") throw prose;
+
+            const sent = seen.length;
+            const refused = await say("{}", { type: "string", pattern: "x" }).catch((e) => e);
+            if (refused.stage !== "config" || !refused.message.includes("pattern")) throw refused;
+            if (seen.length !== sent) throw new Error("a refused schema was sent");
+            await stub.close();
+            console.log("schema checked");
+            "#;
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join(".vaern");
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        runtime.set_journal_home(Some(home.clone()));
+        assert_eq!(runtime.eval("schema.js", &code).unwrap(), 0);
+        let records = journal_records(&home);
+        let last_console = records.iter().rfind(|r| r["kind"] == "console").unwrap();
+        assert_eq!(last_console["text"], "schema checked\n");
+        // Mismatched replies are journalled as completed calls.
+        let calls = records.iter().filter(|r| r["kind"] == "model.call");
+        assert!(calls.clone().all(|r| r["res"]["status"] == 200));
+        assert_eq!(calls.count(), 4);
     }
 
     #[test]

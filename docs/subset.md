@@ -336,12 +336,21 @@ reply.text; reply.usage; reply.costUsd; reply.finishReason; reply.effect;
   as `Authorization: Bearer <key>` and never written to the journal.
   `price` is USD per million tokens for input and output (default 0).
   `maxOutputTokens` defaults to 1024; `timeoutMs` to 60000.
-- `chat({ messages, maxTokens, temperature, responseFormat, tools })`:
+- `chat({ messages, maxTokens, temperature, schema, schemaName, responseFormat, tools })`:
   `messages` is passed through as given. `max_tokens` is always sent:
   `maxTokens` when set, else the model's `maxOutputTokens`. `responseFormat`
-  is sent as `response_format` and `tools` as `tools`, unchanged; neither is
-  checked by the runtime yet.
-- The result: `text` (the first choice's content, `""` when absent), `usage`
+  is sent as `response_format` and `tools` as `tools`, unchanged.
+- `schema` asks for structured output: it is sent as
+  `response_format: { type: "json_schema", json_schema: { name: schemaName ?? "reply", schema, strict: true } }`,
+  and the reply's text is parsed as JSON and checked against `schema` before
+  the script sees it. The parsed value is the result's `json`. Only these
+  keywords are understood: `type` (a name or a list of names), `properties`,
+  `required`, `items`, `enum`, `additionalProperties` (`true` or `false`),
+  `title` and `description`. A schema with any other keyword is refused with
+  stage `config` and is not sent. `schema` and `responseFormat` cannot be
+  combined.
+- The result: `text` (the first choice's content, `""` when absent), `json`
+  (only with `schema`), `usage`
   `{ inputTokens, outputTokens }` as the server reported them (`null` when
   it did not), `costUsd`, `finishReason`, and `effect`, the call's `eid` in
   the journal (`null` when journalling is off).
@@ -352,12 +361,15 @@ reply.text; reply.usage; reply.costUsd; reply.finishReason; reply.effect;
 - A failure rejects with a `ModelError` whose `stage` is `config` (bad
   options; nothing was sent), `connect` (no response), `http` (a non-2xx
   status, with `status` set and up to 500 bytes of the body in the
-  message), `parse` (the reply is not an OpenAI-style completion) or
-  `journal` (the reply arrived but could not be recorded). It also carries
-  `url` and `action`.
+  message), `parse` (the reply is not an OpenAI-style completion), `schema`
+  (the reply is not JSON or does not match `schema`; `path` names the place,
+  such as `$.items[2].name`) or `journal` (the reply arrived but could not
+  be recorded). It also carries `url` and `action`. A `schema` error also
+  carries `costUsd` and `effect`: the call was made and is charged.
 
-Absent: streaming, embeddings, other endpoints, retries, and validation of
-`responseFormat` against a schema.
+Absent: streaming, embeddings, other endpoints, retries, schema keywords
+outside the list above, and checking of replies requested with
+`responseFormat`.
 
 ## Limits
 

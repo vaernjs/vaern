@@ -57,6 +57,8 @@ pub struct PreparedCall {
     pub body: Value,
     pub max_tokens: u64,
     pub config: ModelConfig,
+    /// The schema the reply must match, when the call asked for one.
+    pub schema: Option<Value>,
 }
 
 /// What the provider answered.
@@ -166,11 +168,34 @@ pub fn prepare(config_json: &str, call_json: &str) -> Result<PreparedCall> {
             body.insert(to.to_string(), value.clone());
         }
     }
+    let schema = call.get("schema").filter(|s| !s.is_null()).cloned();
+    if let Some(schema) = &schema {
+        if body.contains_key("response_format") {
+            return Err(bad(
+                "pass either schema or responseFormat, not both".to_string()
+            ));
+        }
+        crate::ai_schema::check_schema(schema)
+            .map_err(|err| bad(format!("schema at {}: {}", err.path, err.message)))?;
+        let name = match call.get("schemaName") {
+            None | Some(Value::Null) => "reply".to_string(),
+            Some(Value::String(name)) if !name.is_empty() => name.clone(),
+            Some(_) => return Err(bad("schemaName must be a non-empty string".to_string())),
+        };
+        body.insert(
+            "response_format".to_string(),
+            json!({
+                "type": "json_schema",
+                "json_schema": { "name": name, "schema": schema, "strict": true },
+            }),
+        );
+    }
     Ok(PreparedCall {
         endpoint: format!("{}/chat/completions", base_url.trim_end_matches('/')),
         body: Value::Object(body),
         max_tokens,
         config,
+        schema,
     })
 }
 
@@ -292,6 +317,29 @@ pub fn estimate_input_tokens(call: &PreparedCall) -> u64 {
 /// full output cap, at the model's prices.
 pub fn reserve_nano(call: &PreparedCall) -> u64 {
     charge_nano(&call.config, estimate_input_tokens(call), call.max_tokens)
+}
+
+/// The reply's text parsed as JSON and checked against the call's schema.
+/// `Ok(None)` when the call asked for no schema.
+pub fn structured(
+    call: &PreparedCall,
+    reply: &ModelReply,
+) -> std::result::Result<Option<Value>, crate::ai_schema::SchemaMismatch> {
+    let Some(schema) = &call.schema else {
+        return Ok(None);
+    };
+    let not_json = |message: String| crate::ai_schema::SchemaMismatch {
+        path: "$".to_string(),
+        message,
+    };
+    let text = reply
+        .text
+        .as_deref()
+        .ok_or_else(|| not_json("the reply has no text".to_string()))?;
+    let value: Value = serde_json::from_str(text)
+        .map_err(|err| not_json(format!("the reply is not JSON: {err}")))?;
+    crate::ai_schema::validate(&value, schema)?;
+    Ok(Some(value))
 }
 
 /// The journal's `req` for a call: everything sent except the key.

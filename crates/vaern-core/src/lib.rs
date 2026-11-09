@@ -6,6 +6,7 @@
 //! - [`ModuleLoader`]: Trait resolving and loading relative local ES modules from disk.
 
 pub mod ai;
+mod ai_schema;
 mod blank_strip;
 mod effect_record;
 pub mod error;

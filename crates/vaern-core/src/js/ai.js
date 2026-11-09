@@ -13,6 +13,12 @@
             this.status = info.status || undefined;
             this.url = info.url || undefined;
             this.action = info.action;
+            if (info.path !== undefined) this.path = info.path;
+            // A reply that failed its schema was still billed.
+            if (info.chargedNano !== undefined) {
+                this.costUsd = info.chargedNano / 1e9;
+                this.effect = info.eid;
+            }
         }
     }
 
@@ -47,6 +53,8 @@
             maxTokens: options.maxTokens,
             temperature: options.temperature,
             responseFormat: options.responseFormat,
+            schema: options.schema,
+            schemaName: options.schemaName,
             tools: options.tools,
         });
         return new Promise((resolve, reject) => {
@@ -81,13 +89,15 @@
         return Object.freeze({
             async chat(callOptions) {
                 const r = await start(config, objectArg("chat", callOptions));
-                return {
+                const result = {
                     text: r.text ?? "",
                     usage: { inputTokens: r.inputTokens, outputTokens: r.outputTokens },
                     costUsd: r.chargedNano / 1e9,
                     finishReason: r.finishReason ?? null,
                     effect: r.eid,
                 };
+                if (r.json !== null) result.json = r.json;
+                return result;
             },
         });
     }
