@@ -10,6 +10,10 @@
  *   - publishing over an existing version
  *
  * Exit 1 blocks the publish.
+ *
+ * `--allow-published` reports an already published version as a warning.
+ * CI on main passes it: between releases the version on main is the one last
+ * released, so the check can only fail there. Publishing runs without it.
  */
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -18,6 +22,7 @@ import process from "node:process";
 
 const errors = [];
 const warnings = [];
+const allowPublished = process.argv.slice(2).includes("--allow-published");
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const pkgDir = path.resolve(import.meta.dirname, "..", "packages", "vaern");
 
@@ -104,7 +109,9 @@ try {
     stdio: ["ignore", "pipe", "ignore"],
   });
   const published = JSON.parse(out || "[]");
-  if (published.includes(main.version)) {
+  if (published.includes(main.version) && allowPublished) {
+    warnings.push(`${main.name}@${main.version} is already published; the next release needs a version bump`);
+  } else if (published.includes(main.version)) {
     errors.push(`${main.name}@${main.version} is ALREADY published. npm never allows reusing a version number — bump it.`);
   }
 } catch {

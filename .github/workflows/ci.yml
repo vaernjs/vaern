@@ -31,8 +31,10 @@ jobs:
       - name: Use repository git hooks
         run: git config core.hooksPath .githooks
 
+      # main carries the last released version until the release commit bumps
+      # it; the release workflow runs the gate without the flag.
       - name: Validate pre-publish gate
-        run: node scripts/check-publish.mjs
+        run: node scripts/check-publish.mjs --allow-published
 
       - name: Validate public repository gate
         run: node scripts/check-public.mjs
