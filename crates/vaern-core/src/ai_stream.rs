@@ -208,6 +208,29 @@ pub async fn send(
     })
 }
 
+/// The deltas and reply of a recorded stream, derived again from the event
+/// text it recorded, for a replay.
+pub fn replay(status: u16, raw: &str) -> std::result::Result<(Vec<String>, ModelReply), String> {
+    let mut reader = SseReader::default();
+    let mut state = StreamState::default();
+    let mut deltas = Vec::new();
+    for data in reader.push(raw.as_bytes()) {
+        if let Some(delta) = state.apply(&data).map_err(|(_, message)| message)? {
+            deltas.push(delta);
+        }
+    }
+    let reply = ModelReply {
+        status,
+        raw: raw.to_string(),
+        text: Some(state.text),
+        finish_reason: state.finish_reason,
+        input_tokens: state.input_tokens,
+        output_tokens: state.output_tokens,
+        tool_calls: Value::Null,
+    };
+    Ok((deltas, reply))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

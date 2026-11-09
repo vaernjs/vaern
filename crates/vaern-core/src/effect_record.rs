@@ -64,6 +64,26 @@ pub fn bytes_value(bytes: &[u8]) -> Value {
     }
 }
 
+/// The bytes behind a [`bytes_value`], or `None` when it is not one.
+pub fn bytes_of(value: &Value) -> Option<Vec<u8>> {
+    if let Some(text) = value.get("utf8").and_then(Value::as_str) {
+        return Some(text.as_bytes().to_vec());
+    }
+    unbase64(value.get("b64")?.as_str()?)
+}
+
+/// Header pairs as recorded. A redacted value stays `"[redacted]"`.
+pub fn headers_of(value: &Value) -> Vec<(String, String)> {
+    let pair = |pair: &Value| {
+        let name = pair.get(0)?.as_str()?;
+        Some((name.to_string(), pair.get(1)?.as_str()?.to_string()))
+    };
+    value
+        .as_array()
+        .map(|pairs| pairs.iter().filter_map(pair).collect())
+        .unwrap_or_default()
+}
+
 /// Header pairs in order, secrets redacted.
 pub fn headers_value(headers: &[(String, String)]) -> Value {
     Value::Array(
@@ -208,6 +228,35 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
+/// The inverse of [`base64`]; `None` for text it could not have produced.
+fn unbase64(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(4) {
+        return None;
+    }
+    let digit = |c: u8| match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    };
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    for quad in text.as_bytes().chunks(4) {
+        let pad = quad.iter().rev().take_while(|c| **c == b'=').count();
+        if pad > 2 {
+            return None;
+        }
+        let mut n = 0u32;
+        for c in &quad[..4 - pad] {
+            n = (n << 6) | u32::from(digit(*c)?);
+        }
+        n <<= 6 * pad as u32;
+        out.extend_from_slice(&n.to_be_bytes()[1..4 - pad]);
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,6 +274,16 @@ mod tests {
         ] {
             assert_eq!(base64(input.as_bytes()), expected);
         }
+    }
+
+    #[test]
+    fn test_recorded_bytes_decode_to_what_was_recorded() {
+        for len in 0..40usize {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 37 + 200) as u8).collect();
+            assert_eq!(bytes_of(&bytes_value(&bytes)), Some(bytes));
+        }
+        assert_eq!(bytes_of(&json!({ "b64": "Zm9=v" })), None);
+        assert_eq!(bytes_of(&json!({ "b64": "a===" })), None);
     }
 
     #[test]
