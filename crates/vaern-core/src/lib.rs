@@ -9,6 +9,7 @@ pub mod ai;
 mod ai_schema;
 mod ai_stream;
 mod blank_strip;
+pub mod budget;
 mod effect_record;
 pub mod error;
 pub mod event;

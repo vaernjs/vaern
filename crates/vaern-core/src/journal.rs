@@ -98,6 +98,44 @@ impl Journal {
         })
     }
 
+    /// Opens an existing chained file to append to it, creating it when it
+    /// does not exist. The chain is verified first and continues from its
+    /// last record. A partial final line is cut off: the write that left it
+    /// never returned, so nothing that depended on it was done.
+    pub(crate) fn resume(path: &Path) -> Result<Journal> {
+        // An append-only handle cannot truncate on Windows, so the torn line
+        // is cut through a write handle before the append handle is opened.
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|err| create_error(path, &err))?;
+        let verified = verify(path)?;
+        if verified.torn_tail {
+            let bytes = std::fs::read(path).map_err(|err| create_error(path, &err))?;
+            let keep = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+            writer
+                .set_len(keep as u64)
+                .and_then(|()| writer.sync_data())
+                .map_err(|err| write_error(path, &err.to_string()))?;
+        }
+        drop(writer);
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .map_err(|err| create_error(path, &err))?;
+        Ok(Journal {
+            file,
+            path: path.to_path_buf(),
+            run_id: String::new(),
+            next_seq: verified.records,
+            prev: verified.final_hash,
+            transcript: ring::digest::Context::new(&ring::digest::SHA256),
+            sealed: false,
+        })
+    }
+
     /// The id `vaern replay` and `vaern journal verify` accept.
     pub fn run_id(&self) -> &str {
         &self.run_id

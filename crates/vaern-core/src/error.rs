@@ -113,6 +113,19 @@ pub enum VaernError {
         action: String,
     },
 
+    /// A budget refused a reservation or could not be opened. `code` is
+    /// `RESERVE_EXCEEDS_REMAINING` (with `unit`, `reserve` and `remaining`
+    /// in nano-USD or tokens), `LEDGER_BUSY`, `INVALID` or `LEDGER`.
+    #[error("budget {code}: {message}. {action}")]
+    Budget {
+        code: String,
+        unit: Option<String>,
+        reserve: u64,
+        remaining: u64,
+        message: String,
+        action: String,
+    },
+
     /// The effect journal could not be created, written or read. `stage` is
     /// `create`, `write`, `read` or `locate`.
     #[error("journal {stage} failed for '{path}': {reason}. {action}")]
