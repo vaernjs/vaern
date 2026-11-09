@@ -46,6 +46,12 @@ for (const [name, size] of [["exact.bin", readCap], ["over.bin", readCap + 1]]) 
   fs.truncateSync(file, size);
 }
 
+const aiOffline =
+  '{"usd":0.001,"tokens":50}\n' +
+  "RESERVE_EXCEEDS_REMAINING tokens 141 50\n" +
+  "42\n" +
+  "args arguments at $.n: expected integer, found string\n";
+
 const cases = [
   {
     name: "--version reports 0.0.6",
@@ -226,6 +232,30 @@ const cases = [
     stdout: "",
     stderrIncludes: ["InternalError: out of memory", "heap_limit.js:3:"],
     stderrExcludes: ["panicked"],
+  },
+  {
+    name: "ai_offline.ts refuses a model call over budget and runs tools, journalled",
+    args: ["run", "ai_offline.ts"],
+    env: { VAERN_HOME: "out/home" },
+    code: 0,
+    stdout: aiOffline,
+    stderr: "",
+  },
+  {
+    name: "replay latest reproduces ai_offline.ts from its journal",
+    args: ["replay", "latest"],
+    env: { VAERN_HOME: "out/home" },
+    code: 0,
+    stdout: aiOffline,
+    stderrIncludes: ["reproduced: 4 console records, exit code 0"],
+  },
+  {
+    name: "replay of an unknown run id fails with the next step",
+    args: ["replay", "no-such-run"],
+    env: { VAERN_HOME: "out/home" },
+    code: 1,
+    stdout: "",
+    stderrIncludes: ["'no-such-run' is not a run id", "or `latest`"],
   },
 ];
 
