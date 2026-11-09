@@ -39,6 +39,10 @@ swc_ecma_visit = "29.0"
 swc_ecma_transforms_typescript = "56.0"
 swc_ecma_codegen = "32.0"
 
+# SHA-256 for the effect journal's hash chain. Already compiled in as the
+# rustls crypto provider, so it adds no code to the binary.
+ring = "0.17"
+
 # package.json for node_modules resolution; already built for swc. Key order
 # is preserved because exports conditions are matched in declaration order.
 serde_json = { version = "1.0", features = ["preserve_order"] }

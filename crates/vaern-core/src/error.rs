@@ -102,6 +102,25 @@ pub enum VaernError {
     )]
     SourceTooLarge { path: String, limit_mib: u64 },
 
+    /// The effect journal could not be created, written or read. `stage` is
+    /// `create`, `write`, `read` or `locate`.
+    #[error("journal {stage} failed for '{path}': {reason}. {action}")]
+    Journal {
+        stage: String,
+        path: String,
+        reason: String,
+        action: String,
+    },
+
+    /// A journal whose hash chain or record sequence does not verify.
+    #[error("journal '{path}' fails verification at record {seq}: {reason}. {action}")]
+    JournalTampered {
+        path: String,
+        seq: u64,
+        reason: String,
+        action: String,
+    },
+
     /// A streamed HTTP response chunk could not be handed to the connection.
     #[error("response stream for server request {req_id} failed: {message}. {action}")]
     ServerStream {

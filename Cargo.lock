@@ -1959,6 +1959,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "rcgen",
+ "ring",
  "rquickjs",
  "rustls",
  "serde_json",

@@ -10,6 +10,7 @@ pub mod error;
 pub mod event;
 pub mod fetch;
 pub mod fs;
+pub mod journal;
 pub mod module_loader;
 pub mod runtime;
 pub mod server;
