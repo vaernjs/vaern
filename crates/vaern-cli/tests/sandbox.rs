@@ -215,6 +215,42 @@ fn budget_flags_cap_what_a_script_can_ask_for() -> TestResult {
 }
 
 #[test]
+fn replay_reproduces_a_run_and_stops_where_it_diverges() -> TestResult {
+    let home = journal_home("replay")?;
+    let recorded = vaern_home(&["run", "hello.ts"], &home)?;
+    let replayed = vaern_home(&["replay", "latest"], &home)?;
+    assert_eq!(
+        replayed.status.code(),
+        Some(0),
+        "{}",
+        text(&replayed.stderr)
+    );
+    assert_eq!(text(&replayed.stdout), text(&recorded.stdout));
+    assert!(text(&replayed.stderr).contains("reproduced: 1 console records, exit code 0"));
+
+    // The environment is read live: a different value is a divergence.
+    let with_value = |value: &str, args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_vaern"))
+            .args(args)
+            .current_dir(sandbox_dir())
+            .env("VAERN_HOME", &home)
+            .env("VAERN_SANDBOX_VALUE", value)
+            .output()
+    };
+    with_value("recorded", &["run", "env_test.ts"])?;
+    let diverged = with_value("changed", &["replay", "latest"])?;
+    assert_eq!(diverged.status.code(), Some(1));
+    assert_eq!(text(&diverged.stdout), "");
+    let stderr = text(&diverged.stderr);
+    assert!(stderr.contains("diverged at record"), "{stderr}");
+    assert!(
+        stderr.contains(r#"expected stdout "Env: recorded\n""#),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
 fn no_journal_writes_nothing() -> TestResult {
     let home = journal_home("off")?;
     let out = vaern_home(&["run", "--no-journal", "hello.ts"], &home)?;

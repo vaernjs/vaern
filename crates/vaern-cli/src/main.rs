@@ -2,12 +2,12 @@
 //!
 //! Owns argument parsing, help output, version reporting, launching the
 //! native runtime engine to execute TypeScript/JavaScript files, and the
-//! commands that read run journals.
+//! commands that read and replay run journals.
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use vaern_core::{QuickJsRuntime, Runtime, RuntimeOptions, budget, journal};
+use vaern_core::{QuickJsRuntime, Runtime, RuntimeOptions, budget, journal, replay};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -41,6 +41,13 @@ enum Commands {
         /// Arguments passed to the script
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// Run a recorded script again with every effect served from its
+    /// journal; exit 0 when it prints the same transcript and ends the same
+    /// way, 1 at the first difference
+    Replay {
+        /// Run id from .vaern/runs, or `latest`
+        id: String,
     },
     /// Inspect run journals
     Journal {
@@ -143,6 +150,25 @@ fn verify(id: &str) -> ExitCode {
     }
 }
 
+/// Replays run `id` from the directory it was recorded in: the script and
+/// module paths in its journal are read as they were given.
+fn replay(id: &str) -> ExitCode {
+    let plan = match journal::locate(&journal_home(), id) {
+        Ok(path) => replay::Plan::load(&path),
+        Err(err) => Err(err),
+    };
+    let outcome = match plan {
+        Ok(plan) => match QuickJsRuntime::new(RuntimeOptions {
+            argv: plan.argv.clone(),
+        }) {
+            Ok(mut runtime) => runtime.replay(plan),
+            Err(err) => Err(err),
+        },
+        Err(err) => Err(err),
+    };
+    ExitCode::from(replay::report(&outcome) as u8)
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
@@ -159,6 +185,7 @@ fn main() -> ExitCode {
             };
             run(no_journal, caps, file, args)
         }
+        Commands::Replay { id } => replay(&id),
         Commands::Journal {
             command: JournalCommand::Verify { id },
         } => verify(&id),

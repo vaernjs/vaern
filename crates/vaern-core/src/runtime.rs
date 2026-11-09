@@ -79,6 +79,10 @@ struct SharedState {
     /// Rejected promises with no handler yet, keyed by promise identity, in
     /// rejection order. A handler attached later removes only its own entry.
     pending_rejections: Vec<(u64, String)>,
+    /// Event-loop turns so far. Outcomes handed over in one turn all reach
+    /// the script before any promise callback runs, which decides the order
+    /// their callbacks interleave; effect records keep it for replay.
+    turn: u64,
 }
 
 /// Identity key for a promise. `Value` hashes its tag and raw bits, so equal
@@ -483,6 +487,7 @@ pub struct QuickJsRuntime {
     journal: JournalSlot,
     /// The run's budget, shared with the bridges that reserve and settle.
     budget: BudgetSlot,
+    replay: ReplaySlot,
     _tokio_rt: tokio::runtime::Runtime,
 }
 
@@ -492,6 +497,10 @@ type JournalSlot = Rc<RefCell<Option<Journal>>>;
 
 /// The run's budget; see `budget::RunBudget`.
 type BudgetSlot = Rc<RefCell<crate::budget::RunBudget>>;
+
+/// The replay in progress, if this run is one. While it is set, effects are
+/// served from the recorded journal and nothing leaves the process.
+type ReplaySlot = Rc<RefCell<Option<crate::replay::Replay>>>;
 
 impl QuickJsRuntime {
     /// Creates and initializes a new QuickJS runtime instance with host globals.
@@ -534,6 +543,7 @@ impl QuickJsRuntime {
             stream_sends_waiting: HashSet::new(),
             unhandled_error: None,
             pending_rejections: Vec::new(),
+            turn: 0,
         }));
         let transpiler = SwcTranspiler;
 
@@ -565,6 +575,7 @@ impl QuickJsRuntime {
             journal_home: None,
             journal: Rc::new(RefCell::new(None)),
             budget: Rc::new(RefCell::new(crate::budget::RunBudget::default())),
+            replay: Rc::new(RefCell::new(None)),
             _tokio_rt: tokio_rt,
         };
 
@@ -613,11 +624,18 @@ impl QuickJsRuntime {
             // The text is journalled before it is written, so a transcript
             // never lacks output the terminal showed.
             let journal_print = Rc::clone(&self.journal);
+            let replay_print = Rc::clone(&self.replay);
             let print_fn = Function::new(
                 ctx.clone(),
                 move |ctx: Ctx<'_>, target: i32, msg: String| -> rquickjs::Result<()> {
+                    let fd = if target == 0 { 1 } else { 2 };
+                    // A replay prints only what matches the transcript.
+                    if let Some(replay) = replay_print.borrow_mut().as_mut()
+                        && !replay.console(fd, &format!("{msg}\n"))
+                    {
+                        return Ok(());
+                    }
                     if let Some(journal) = journal_print.borrow_mut().as_mut() {
-                        let fd = if target == 0 { 1 } else { 2 };
                         journal
                             .console(fd, &format!("{msg}\n"))
                             .map_err(|err| rquickjs::Exception::throw_message(&ctx, &err.to_string()))?;
@@ -644,7 +662,12 @@ impl QuickJsRuntime {
             // Native exit bridge behind `process.exit`. It flushes both streams
             // first because `std::process::exit` skips destructors.
             let journal_exit = Rc::clone(&self.journal);
+            let replay_exit = Rc::clone(&self.replay);
             let exit_fn = Function::new(ctx.clone(), move |code: i32| {
+                if let Some(replay) = replay_exit.borrow_mut().as_mut() {
+                    let outcome = replay.finish(Ok(code));
+                    exit_process(crate::replay::report(&outcome));
+                }
                 // The process ends here, so this is the run's outcome.
                 if let Some(journal) = journal_exit.borrow_mut().as_mut()
                     && let Err(err) = journal.seal(code, None)
@@ -726,6 +749,7 @@ impl QuickJsRuntime {
             // Native fetch start bridge
             let state_fetch = Rc::clone(&state);
             let journal_fetch = Rc::clone(&self.journal);
+            let replay_fetch = Rc::clone(&self.replay);
             let tokio_handle_fetch = tokio_handle.clone();
             let fetch_start_fn = Function::new(
                 ctx.clone(),
@@ -775,6 +799,17 @@ impl QuickJsRuntime {
                         None
                     };
 
+                    if let Some(replay) = replay_fetch.borrow_mut().as_mut() {
+                        let req = crate::effect_record::fetch_request(
+                            &method,
+                            &url,
+                            &headers,
+                            body.as_deref(),
+                        );
+                        replay.dispatch("fetch", req_id, &req, None);
+                        state_fetch.borrow_mut().pending_fetches += 1;
+                        return Ok(());
+                    }
                     if journal_fetch.borrow().is_some() {
                         let req = crate::effect_record::fetch_request(
                             &method,
@@ -852,6 +887,7 @@ impl QuickJsRuntime {
             // `unsafe` accessors.
             let state_fs = Rc::clone(&state);
             let journal_fs = Rc::clone(&self.journal);
+            let replay_fs = Rc::clone(&self.replay);
             let tokio_handle_fs = tokio_handle.clone();
             let fs_start_fn = Function::new(
                 ctx.clone(),
@@ -885,6 +921,12 @@ impl QuickJsRuntime {
                         }
                     };
 
+                    if let Some(replay) = replay_fs.borrow_mut().as_mut() {
+                        let req = crate::effect_record::fs_request(&op);
+                        replay.dispatch("fs", req_id, &req, None);
+                        state_fs.borrow_mut().pending_fs += 1;
+                        return Ok(());
+                    }
                     if journal_fs.borrow().is_some() {
                         track_effect(&state_fs, "fs", req_id, crate::effect_record::fs_request(&op));
                     }
@@ -913,6 +955,7 @@ impl QuickJsRuntime {
             let state_ai = Rc::clone(&state);
             let journal_ai = Rc::clone(&self.journal);
             let budget_ai = Rc::clone(&self.budget);
+            let replay_ai = Rc::clone(&self.replay);
             let tokio_handle_ai = tokio_handle.clone();
             let ai_start_fn = Function::new(
                 ctx.clone(),
@@ -921,9 +964,13 @@ impl QuickJsRuntime {
                         Ok(call) => call,
                         Err(err) => return Some(model_error_info(err).to_string()),
                     };
-                    let client = match shared_client(&state_ai) {
-                        Ok(client) => client,
-                        Err(err) => return Some(model_error_info(err).to_string()),
+                    // A replay builds no client: it never connects.
+                    let client = match replay_ai.borrow().is_some() {
+                        true => None,
+                        false => match shared_client(&state_ai) {
+                            Ok(client) => Some(client),
+                            Err(err) => return Some(model_error_info(err).to_string()),
+                        },
                     };
                     // The reserve is on disk before anything is sent; a call
                     // that does not fit never opens a connection.
@@ -941,6 +988,20 @@ impl QuickJsRuntime {
                     if let Err(err) = reserved {
                         return Some(model_error_info(err).to_string());
                     }
+                    let Some(client) = client else {
+                        let req = crate::ai::request_record(&call);
+                        let eid = replay_ai.borrow_mut().as_mut().map(|replay| {
+                            replay.dispatch("model.call", req_id, &req, Some(call))
+                        });
+                        let mut s = state_ai.borrow_mut();
+                        if let Some(eid) = eid {
+                            let started = Instant::now();
+                            let pending = PendingEffect { eid, started, req };
+                            s.pending_effects.insert(("model.call", req_id), pending);
+                        }
+                        s.pending_models += 1;
+                        return None;
+                    };
                     if journal_ai.borrow().is_some() {
                         let req = crate::ai::request_record(&call);
                         track_effect(&state_ai, "model.call", req_id, req);
@@ -982,6 +1043,7 @@ impl QuickJsRuntime {
             let state_tool = Rc::clone(&state);
             let journal_tool = Rc::clone(&self.journal);
             let budget_tool = Rc::clone(&self.budget);
+            let replay_tool = Rc::clone(&self.replay);
             let tool_start_fn = Function::new(
                 ctx.clone(),
                 move |req_id: u32, name: String, args: String, cost_nano: f64| -> String {
@@ -1001,11 +1063,21 @@ impl QuickJsRuntime {
                                 .to_string();
                         }
                     }
+                    let args = serde_json::from_str(&args).unwrap_or(serde_json::Value::Null);
+                    if let Some(replay) = replay_tool.borrow_mut().as_mut() {
+                        let req = serde_json::json!({ "name": name, "args": args });
+                        let eid = replay.dispatch("tool.call", req_id, &req, None);
+                        let started = Instant::now();
+                        let req = serde_json::json!({ "name": name });
+                        let pending = PendingEffect { eid, started, req };
+                        let mut s = state_tool.borrow_mut();
+                        s.pending_effects.insert(("tool.result", req_id), pending);
+                        return serde_json::json!({ "eid": eid }).to_string();
+                    }
                     let mut slot = journal_tool.borrow_mut();
                     let Some(journal) = slot.as_mut() else {
                         return serde_json::json!({ "eid": null }).to_string();
                     };
-                    let args = serde_json::from_str(&args).unwrap_or(serde_json::Value::Null);
                     let eid = state_tool.borrow().next_eid;
                     let mut fields = serde_json::Map::new();
                     fields.insert("eid".into(), eid.into());
@@ -1161,9 +1233,14 @@ impl QuickJsRuntime {
             let state_srv = Rc::clone(&state);
             let tokio_handle_srv = tokio_handle.clone();
             let active_srv_list = self.active_servers_list.clone();
+            let replay_srv = Rc::clone(&self.replay);
             let server_start_fn = Function::new(
                 ctx.clone(),
                 move |server_id: u32, hostname: String, port: u16| -> rquickjs::Result<String> {
+                    if let Some(replay) = replay_srv.borrow_mut().as_mut() {
+                        let error = replay.refuse("serve()");
+                        return Ok(serde_json::json!({ "ok": false, "error": error }).to_string());
+                    }
                     let bind_res = tokio_handle_srv.block_on(async {
                         crate::server::bind_listener(&hostname, port).await
                     });
@@ -2654,14 +2731,15 @@ impl QuickJsRuntime {
         req_id: u32,
         outcome: Outcome,
     ) -> Option<VaernError> {
-        let pending = self
-            .state
-            .borrow_mut()
-            .pending_effects
-            .remove(&(kind, req_id))?;
+        let (pending, turn) = {
+            let mut s = self.state.borrow_mut();
+            (s.pending_effects.remove(&(kind, req_id))?, s.turn)
+        };
         let mut slot = self.journal.borrow_mut();
         let journal = slot.as_mut()?;
-        journal.append(kind, pending.finish(outcome)).err()
+        let mut fields = pending.finish(outcome);
+        fields.insert("turn".into(), turn.into());
+        journal.append(kind, fields).err()
     }
 
     fn dispatch_fetch_completion(&self, completion: FetchCompletion) {
@@ -3060,6 +3138,20 @@ impl QuickJsRuntime {
             while let Ok(event) = self.events_rx.try_recv() {
                 self.handle_event(event);
             }
+            // A replay hands back recorded outcomes in the order the run
+            // completed them, a recorded turn's worth at a time.
+            if let Some(replay) = self.replay.borrow_mut().as_mut() {
+                replay.begin_turn();
+            }
+            loop {
+                let replayed = self
+                    .replay
+                    .borrow_mut()
+                    .as_mut()
+                    .and_then(|r| r.next_event());
+                let Some(event) = replayed else { break };
+                self.handle_event(event);
+            }
 
             // Drain all pending microtasks
             while self.qjs_runtime.is_job_pending() {
@@ -3070,6 +3162,7 @@ impl QuickJsRuntime {
                     });
                 }
             }
+            self.state.borrow_mut().turn += 1;
 
             let fatal = {
                 let mut s = self.state.borrow_mut();
@@ -3086,6 +3179,14 @@ impl QuickJsRuntime {
                     file: file.to_string(),
                     message,
                 });
+            }
+            let divergence = self
+                .replay
+                .borrow_mut()
+                .as_mut()
+                .and_then(|r| r.take_divergence());
+            if let Some(divergence) = divergence {
+                return Err(divergence);
             }
 
             // Inspect active timers, pending fetch status, and active servers
@@ -3156,6 +3257,15 @@ impl QuickJsRuntime {
                         });
                     }
                 }
+            } else if let Some(replay) = self.replay.borrow_mut().as_mut()
+                && !has_active_servers
+                && (replay.has_work() || (has_pending_fetches && min_deadline.is_none()))
+            {
+                // Nothing arrives on the channel during a replay, so waiting
+                // on it with no timer due would never end.
+                if !replay.has_work() {
+                    replay.stall();
+                }
             } else {
                 // Park until a Tokio task sends work or the nearest timer is
                 // due. Every fetch, server request and server close arrives as
@@ -3222,6 +3332,29 @@ impl QuickJsRuntime {
     /// and sets where named budget ledgers live.
     pub fn set_budget(&mut self, caps: crate::budget::Limits, home: Option<PathBuf>) {
         self.budget.borrow_mut().configure(caps, home);
+    }
+
+    /// Replays a recorded run: its sources must be unchanged, every effect
+    /// is served from its journal, and the transcript and outcome must
+    /// match. Construct the runtime with the plan's `argv`.
+    pub fn replay(&mut self, plan: crate::replay::Plan) -> Result<crate::replay::Summary> {
+        plan.check_sources()?;
+        self.journal_home = None;
+        self.budget
+            .borrow_mut()
+            .replay(plan.caps, plan.ledgers.clone());
+        let seed = plan.seed;
+        let script = PathBuf::from(&plan.script);
+        *self.replay.borrow_mut() = Some(crate::replay::Replay::new(plan));
+        self.seed_random(seed)?;
+        let outcome = self.run_file_inner(&script);
+        let mut slot = self.replay.borrow_mut();
+        match slot.as_mut() {
+            Some(replay) => replay.finish(outcome),
+            None => Err(VaernError::EngineInit {
+                reason: "the replay state was lost during the run".into(),
+            }),
+        }
     }
 
     /// Opens the run's journal and records `run.start` and the entry module.
@@ -4968,6 +5101,234 @@ mod tests {
             let high = f64::from(next() >> 5);
             let low = f64::from(next() >> 6);
             assert_eq!(value, (high * 67108864.0 + low) / 9007199254740992.0);
+        }
+    }
+
+    /// Answers HTTP requests with canned `(path, content type, body)`
+    /// replies. Each group's connections are all accepted first, then
+    /// answered in the group's order, 30 ms apart, so a request sent later
+    /// can complete first, in a later event-loop turn.
+    fn canned_http(
+        groups: Vec<Vec<(&'static str, &'static str, String)>>,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, Read};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            for group in groups {
+                let mut waiting = Vec::new();
+                for _ in 0..group.len() {
+                    let (stream, _) = listener.accept().unwrap();
+                    let mut reader = std::io::BufReader::new(stream);
+                    let mut request_line = String::new();
+                    reader.read_line(&mut request_line).unwrap();
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        let lower = line.to_ascii_lowercase();
+                        if let Some(value) = lower.strip_prefix("content-length:") {
+                            length = value.trim().parse().unwrap();
+                        }
+                        if line == "\r\n" {
+                            break;
+                        }
+                    }
+                    reader.read_exact(&mut vec![0; length]).unwrap();
+                    waiting.push((request_line, reader));
+                }
+                for (path, content_type, body) in group {
+                    let at = waiting
+                        .iter()
+                        .position(|(line, _)| line.split(' ').nth(1) == Some(path))
+                        .unwrap();
+                    let (_, mut reader) = waiting.remove(at);
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    reader.get_mut().write_all(reply.as_bytes()).unwrap();
+                    std::thread::sleep(Duration::from_millis(30));
+                }
+            }
+        });
+        (port, server)
+    }
+
+    fn replay_latest(home: &Path) -> Result<crate::replay::Summary> {
+        let path = crate::journal::locate(home, "latest")?;
+        let plan = crate::replay::Plan::load(&path)?;
+        let argv = plan.argv.clone();
+        QuickJsRuntime::new(RuntimeOptions { argv })?.replay(plan)
+    }
+
+    #[test]
+    fn test_replay_reproduces_the_transcript_byte_for_byte_without_any_io() {
+        let chat = r#"{"choices":[{"message":{"content":"hello"},"finish_reason":"stop"}],
+                       "usage":{"prompt_tokens":5,"completion_tokens":2}}"#;
+        let stream = "data: {\"choices\":[{\"delta\":{\"content\":\"str\"}}]}\n\n\
+                      data: {\"choices\":[{\"delta\":{\"content\":\"eam\"},\"finish_reason\":\"stop\"}]}\n\n\
+                      data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n\
+                      data: [DONE]\n\n";
+        let (port, stub) = canned_http(vec![
+            vec![("/v1/chat/completions", "application/json", chat.to_string())],
+            vec![(
+                "/v1/chat/completions",
+                "text/event-stream",
+                stream.to_string(),
+            )],
+            // Two requests at once, the one sent second answered first.
+            vec![
+                ("/t", "text/plain", "tool".to_string()),
+                ("/a", "text/plain", "plain".to_string()),
+            ],
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join(".vaern");
+        let out = root.path().join("out.txt");
+        let main = root.path().join("main.js");
+        let script = r#"
+            import { model, tool, budget } from "vaern:ai";
+            import { readFile, writeFile } from "vaern:fs";
+            const base = "http://127.0.0.1:PORT";
+            budget({ usd: 0.5 });
+            const m = model({ baseUrl: base + "/v1", model: "m",
+                              price: { inputPerMTok: 1, outputPerMTok: 2 } });
+            const r = await m.chat({ messages: [{ role: "user", content: "hi" }], maxTokens: 16 });
+            console.log(r.text, r.effect, r.costUsd, Math.random());
+            for await (const e of m.stream({ messages: [{ role: "user", content: "go" }], maxTokens: 16 })) {
+                console.log(JSON.stringify(e));
+            }
+            const lookup = tool({ name: "lookup", run: async () => (await fetch(base + "/t")).text() });
+            const landed = (t) => (console.log("landed " + t), t);
+            const both = await Promise.all([
+                fetch(base + "/a").then((r) => r.text()).then(landed),
+                lookup.call({}).then(landed),
+            ]);
+            console.log(both.join("+"), JSON.stringify(budget.remaining()));
+            await writeFile("OUT", both.join(""));
+            console.error(await readFile("OUT", "utf8"));
+            process.exitCode = 3;
+            "#
+        .replace("PORT", &port.to_string())
+        .replace("OUT", &out.display().to_string().replace('\\', "/"));
+        std::fs::write(&main, script).unwrap();
+
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        runtime.set_journal_home(Some(home.clone()));
+        runtime.set_budget(
+            crate::budget::Limits {
+                nano: Some(400_000_000),
+                tokens: None,
+            },
+            Some(home.clone()),
+        );
+        assert_eq!(runtime.run_file(&main).unwrap(), 3);
+        stub.join().unwrap();
+        let recorded: Vec<_> = journal_records(&home)
+            .into_iter()
+            .filter(|r| r["kind"] == "console")
+            .collect();
+        assert_eq!(recorded.len(), 8, "{recorded:#?}");
+        std::fs::remove_file(&out).unwrap();
+
+        // The stub is gone and the file deleted: everything comes from the
+        // journal, and the transcript matches byte for byte.
+        let summary = replay_latest(&home).unwrap();
+        assert_eq!((summary.console, summary.exit_code), (8, 3));
+        assert!(!out.exists(), "the replay wrote a file");
+    }
+
+    #[test]
+    fn test_replay_stops_at_a_divergence_a_changed_source_or_serve() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join(".vaern");
+        let main = root.path().join("main.js");
+        let record = |source: &str| {
+            std::fs::write(&main, source).unwrap();
+            let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+            runtime.set_journal_home(Some(home.clone()));
+            assert_eq!(runtime.run_file(&main).unwrap(), 0);
+        };
+
+        // The clock is read live, so a script that prints it diverges there.
+        record(
+            "console.log('steady');\n\
+             await new Promise((resolve) => setTimeout(resolve, 3));\n\
+             console.log(Date.now());\n",
+        );
+        let seq = journal_records(&home)
+            .iter()
+            .filter(|r| r["kind"] == "console")
+            .nth(1)
+            .unwrap()["seq"]
+            .as_u64()
+            .unwrap();
+        match replay_latest(&home) {
+            Err(VaernError::ReplayDivergence {
+                seq: at, expected, ..
+            }) => {
+                assert_eq!(at, seq);
+                assert!(expected.starts_with("stdout \"1"), "{expected}");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // A request that differs from the recorded one stops the replay at
+        // that effect, before its recorded outcome is handed back.
+        let stamp = root.path().join("stamp.txt").display().to_string();
+        record(&format!(
+            "import {{ writeFile }} from 'vaern:fs';\n\
+             await new Promise((resolve) => setTimeout(resolve, 3));\n\
+             await writeFile({stamp:?}, String(Date.now()));\n"
+        ));
+        let write = journal_records(&home)
+            .into_iter()
+            .find(|r| r["kind"] == "fs")
+            .unwrap();
+        match replay_latest(&home) {
+            Err(VaernError::ReplayDivergence { seq, actual, .. }) => {
+                assert_eq!(Some(seq), write["seq"].as_u64());
+                assert!(actual.starts_with("fs "), "{actual}");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // So does an outcome that differs, with the transcript intact.
+        std::fs::write(
+            &main,
+            "await new Promise((resolve) => setTimeout(resolve, 3));\n\
+             throw new Error('at ' + Date.now());\n",
+        )
+        .unwrap();
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        runtime.set_journal_home(Some(home.clone()));
+        assert!(runtime.run_file(&main).is_err());
+        match replay_latest(&home) {
+            Err(VaernError::ReplayDivergence {
+                expected, actual, ..
+            }) => {
+                assert!(expected.starts_with("exit code 1 with error"), "{expected}");
+                assert_ne!(expected, actual);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        record("console.log('a');\n");
+        std::fs::write(&main, "console.log('b');\n").unwrap();
+        assert!(matches!(
+            replay_latest(&home),
+            Err(VaernError::ReplaySourceChanged { .. })
+        ));
+
+        record(
+            "import { serve } from 'vaern:http';\n\
+             const s = serve(() => new Response('x'), { port: 0 });\n\
+             await s.close();\n",
+        );
+        match replay_latest(&home) {
+            Err(VaernError::Replay { code, .. }) => assert_eq!(code, "UNSUPPORTED"),
+            other => panic!("{other:?}"),
         }
     }
 
