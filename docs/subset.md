@@ -40,6 +40,7 @@ web or Node.js behaviour of the same name.
   extension included. There is no extension or `index` lookup.
 - `vaern:http`, which exports `serve`.
 - `vaern:fs`, which exports `readFile`, `writeFile` and `appendFile`.
+- `vaern:ai`, which exports `model` and `ModelError`.
 - Packages already installed in `node_modules`, imported by name (`pkg`,
   `@scope/pkg`, `pkg/sub`). Static and dynamic `import()` both work.
 
@@ -309,6 +310,54 @@ returns a promise; the work runs off the JavaScript thread.
 Absent: synchronous and callback variants, `stat`, `readdir`, `mkdir`, `rm`,
 `rename`, file handles, streams, `file:` URLs as paths, and the `node:fs`
 name.
+
+## vaern:ai
+
+Chat completions against any OpenAI-compatible endpoint
+(`POST <baseUrl>/chat/completions`), on a cloud service or on localhost. No
+provider is built in.
+
+```ts
+import { model } from "vaern:ai";
+
+const m = model({
+  baseUrl: "http://127.0.0.1:11434/v1",  // or VAERN_AI_BASE_URL
+  model: "llama3.2",
+  apiKey: undefined,                      // or VAERN_AI_API_KEY
+  price: { inputPerMTok: 0, outputPerMTok: 0 },
+  maxOutputTokens: 512,
+});
+const reply = await m.chat({ messages: [{ role: "user", content: "Hi" }] });
+reply.text; reply.usage; reply.costUsd; reply.finishReason; reply.effect;
+```
+
+- `model(options)`: `baseUrl` and `model` are required; `baseUrl` falls back
+  to `VAERN_AI_BASE_URL` and `apiKey` to `VAERN_AI_API_KEY`. The key is sent
+  as `Authorization: Bearer <key>` and never written to the journal.
+  `price` is USD per million tokens for input and output (default 0).
+  `maxOutputTokens` defaults to 1024; `timeoutMs` to 60000.
+- `chat({ messages, maxTokens, temperature, responseFormat, tools })`:
+  `messages` is passed through as given. `max_tokens` is always sent:
+  `maxTokens` when set, else the model's `maxOutputTokens`. `responseFormat`
+  is sent as `response_format` and `tools` as `tools`, unchanged; neither is
+  checked by the runtime yet.
+- The result: `text` (the first choice's content, `""` when absent), `usage`
+  `{ inputTokens, outputTokens }` as the server reported them (`null` when
+  it did not), `costUsd`, `finishReason`, and `effect`, the call's `eid` in
+  the journal (`null` when journalling is off).
+- `costUsd` is computed by the runtime from the reported usage and `price`.
+  When the server reports no usage, the call is charged its estimate: input
+  bytes / 3 + 16 per message, plus the full `max_tokens`. This is an
+  estimate; what a provider bills can differ.
+- A failure rejects with a `ModelError` whose `stage` is `config` (bad
+  options; nothing was sent), `connect` (no response), `http` (a non-2xx
+  status, with `status` set and up to 500 bytes of the body in the
+  message), `parse` (the reply is not an OpenAI-style completion) or
+  `journal` (the reply arrived but could not be recorded). It also carries
+  `url` and `action`.
+
+Absent: streaming, embeddings, other endpoints, retries, and validation of
+`responseFormat` against a schema.
 
 ## Limits
 

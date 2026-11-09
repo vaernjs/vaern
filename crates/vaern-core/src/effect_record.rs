@@ -1,5 +1,5 @@
-//! Journal records for effects that leave the process: `fetch` and `vaern:fs`
-//! now; model and tool calls use the same shape.
+//! Journal records for effects that leave the process: `fetch`, `vaern:fs`
+//! and `vaern:ai` model calls; tool calls use the same shape.
 //!
 //! Each effect gets an `eid` from one counter in dispatch order, and one
 //! record written when it completes: `{eid, dur_us, req, res}` or
@@ -10,6 +10,7 @@
 //! Secrets never reach the journal: the request and response headers listed
 //! in [`REDACTED_HEADERS`] are stored as `"[redacted]"`.
 
+use crate::ai::ModelReply;
 use crate::error::{Result, VaernError};
 use crate::fetch::FetchResponse;
 use crate::fs::{FsOp, FsOutput, WriteMode};
@@ -136,8 +137,32 @@ pub fn fs_outcome(result: &Result<FsOutput>) -> Outcome {
     }
 }
 
+/// A model call's result. `charged` is the nano-USD the call was charged:
+/// from reported usage, or the reservation when the server reported none.
+pub fn model_outcome(result: &Result<ModelReply>, charged: u64) -> Outcome {
+    match result {
+        Ok(reply) => Outcome::Response(json!({
+            "status": reply.status,
+            "body": reply.raw,
+            "usage": {
+                "input_tokens": reply.input_tokens,
+                "output_tokens": reply.output_tokens,
+            },
+            "charged_nano_usd": charged,
+        })),
+        Err(err) => Outcome::Error(error_value(err)),
+    }
+}
+
 fn error_value(err: &VaernError) -> Value {
     match err {
+        VaernError::Model {
+            stage,
+            url,
+            status,
+            message,
+            ..
+        } => json!({ "stage": stage, "url": url, "status": status, "message": message }),
         VaernError::Fetch {
             stage,
             url,

@@ -7,7 +7,8 @@
 use crate::effect_record::{Outcome, PendingEffect};
 use crate::error::{Result, VaernError};
 use crate::event::{
-    EventReceiver, EventSender, FetchCompletion, FsCompletion, LoopEvent, StreamChunkSent,
+    EventReceiver, EventSender, FetchCompletion, FsCompletion, LoopEvent, ModelCompletion,
+    StreamChunkSent,
 };
 use crate::journal::Journal;
 use crate::module_loader::{FsModuleLoader, ModuleLoader};
@@ -58,6 +59,8 @@ struct SharedState {
     pending_effects: HashMap<(&'static str, u32), PendingEffect>,
     /// `vaern:fs` operations running on the blocking pool.
     pending_fs: usize,
+    /// `vaern:ai` model calls in flight.
+    pending_models: usize,
     /// Production HTTP client shared by every fetch, built on the first one.
     /// Reusing it keeps connections alive and resumes TLS sessions.
     fetch_client: Option<crate::fetch::HttpClient>,
@@ -105,7 +108,7 @@ impl Resolver for VaernModuleResolver {
         name: &str,
         _attributes: Option<ImportAttributes<'js>>,
     ) -> rquickjs::Result<String> {
-        if name == "vaern:http" || name == "vaern:fs" {
+        if name == "vaern:http" || name == "vaern:fs" || name == "vaern:ai" {
             return Ok(name.to_string());
         }
         let referrer_path = if base.is_empty() {
@@ -210,6 +213,15 @@ impl Loader for VaernModuleLoader {
                 "const { readFile, writeFile, appendFile } = globalThis.__vaern_fs;\n\
                  export { readFile, writeFile, appendFile };\n\
                  export default { readFile, writeFile, appendFile };",
+            );
+        }
+        if name == "vaern:ai" {
+            return Module::declare(
+                ctx.clone(),
+                name,
+                "const { model, ModelError } = globalThis.__vaern_ai;\n\
+                 export { model, ModelError };\n\
+                 export default { model, ModelError };",
             );
         }
         let content = FsModuleLoader
@@ -326,6 +338,41 @@ fn track_effect(
             req,
         },
     );
+}
+
+/// The shared HTTP client, built on first use. Fetch and model calls share
+/// it so they share kept-alive connections and TLS sessions.
+fn shared_client(state: &Rc<RefCell<SharedState>>) -> Result<crate::fetch::HttpClient> {
+    let mut s = state.borrow_mut();
+    match &s.fetch_client {
+        Some(client) => Ok(client.clone()),
+        None => crate::fetch::build_http_client().inspect(|client| {
+            s.fetch_client = Some(client.clone());
+        }),
+    }
+}
+
+/// A model call failure in the shape `ModelError` is built from.
+fn model_error_info(err: VaernError) -> serde_json::Value {
+    match err {
+        VaernError::Model {
+            stage,
+            url,
+            status,
+            message,
+            action,
+        } => serde_json::json!({
+            "stage": stage, "url": url, "status": status, "message": message, "action": action,
+        }),
+        VaernError::Journal { .. } => serde_json::json!({
+            "stage": "journal", "url": "", "status": 0, "message": err.to_string(),
+            "action": "The call completed but could not be recorded; check the journal directory.",
+        }),
+        other => serde_json::json!({
+            "stage": "connect", "url": "", "status": 0, "message": other.to_string(),
+            "action": "Inspect the error details.",
+        }),
+    }
 }
 
 /// The error for a chunk written after the client went away.
@@ -446,6 +493,7 @@ impl QuickJsRuntime {
             next_eid: 0,
             pending_effects: HashMap::new(),
             pending_fs: 0,
+            pending_models: 0,
             fetch_client: None,
             events_tx,
             active_servers: 0,
@@ -725,15 +773,7 @@ impl QuickJsRuntime {
                     };
 
                     let tx = state_fetch.borrow().events_tx.clone();
-                    let client = {
-                        let mut s = state_fetch.borrow_mut();
-                        match &s.fetch_client {
-                            Some(client) => Ok(client.clone()),
-                            None => crate::fetch::build_http_client().inspect(|client| {
-                                s.fetch_client = Some(client.clone());
-                            }),
-                        }
-                    };
+                    let client = shared_client(&state_fetch);
                     state_fetch.borrow_mut().pending_fetches += 1;
 
                     match client {
@@ -833,6 +873,49 @@ impl QuickJsRuntime {
                 .set("__vaern_fs_start", fs_start_fn)
                 .map_err(|err| VaernError::EngineInit {
                     reason: format!("failed to register fs bridge: {err}"),
+                })?;
+
+            // Native vaern:ai bridge. Returns null once the call is dispatched,
+            // or the JSON of a ModelError when the options are refused, so
+            // nothing is sent and nothing is journalled for a bad call.
+            let state_ai = Rc::clone(&state);
+            let journal_ai = Rc::clone(&self.journal);
+            let tokio_handle_ai = tokio_handle.clone();
+            let ai_start_fn = Function::new(
+                ctx.clone(),
+                move |req_id: u32, config: String, call: String| -> Option<String> {
+                    let call = match crate::ai::prepare(&config, &call) {
+                        Ok(call) => call,
+                        Err(err) => return Some(model_error_info(err).to_string()),
+                    };
+                    let client = match shared_client(&state_ai) {
+                        Ok(client) => client,
+                        Err(err) => return Some(model_error_info(err).to_string()),
+                    };
+                    if journal_ai.borrow().is_some() {
+                        let req = crate::ai::request_record(&call);
+                        track_effect(&state_ai, "model.call", req_id, req);
+                    }
+                    let tx = state_ai.borrow().events_tx.clone();
+                    state_ai.borrow_mut().pending_models += 1;
+                    tokio_handle_ai.spawn(async move {
+                        let result = crate::ai::send(&client, &call).await;
+                        let _ = tx.send(LoopEvent::ModelDone(Box::new(ModelCompletion {
+                            req_id,
+                            call,
+                            result,
+                        })));
+                    });
+                    None
+                },
+            )
+            .map_err(|err| VaernError::EngineInit {
+                reason: format!("failed to create model call bridge: {err}"),
+            })?;
+            globals
+                .set("__vaern_ai_start", ai_start_fn)
+                .map_err(|err| VaernError::EngineInit {
+                    reason: format!("failed to register model call bridge: {err}"),
                 })?;
 
             // Native abort signal bridge
@@ -2283,6 +2366,10 @@ impl QuickJsRuntime {
                 .map_err(|err| VaernError::EngineInit {
                     reason: format!("failed to initialize JavaScript environment: {err}"),
                 })?;
+            ctx.eval::<(), _>(include_str!("js/ai.js"))
+                .map_err(|err| VaernError::EngineInit {
+                    reason: format!("failed to initialize vaern:ai: {err}"),
+                })?;
 
             // Populate process.argv
             let argv_arr = Array::new(ctx.clone()).map_err(|err| VaernError::EngineInit {
@@ -2410,6 +2497,67 @@ impl QuickJsRuntime {
             dispatch_fn.call::<_, ()>((info,))?;
             Ok(())
         });
+    }
+
+    /// Settles a model call's promise. The charge comes from reported usage;
+    /// a reply without usage is charged what the call could have cost.
+    fn dispatch_model_completion(&self, completion: Box<ModelCompletion>) {
+        let ModelCompletion {
+            req_id,
+            call,
+            result,
+        } = *completion;
+        let eid = self
+            .state
+            .borrow()
+            .pending_effects
+            .get(&("model.call", req_id))
+            .map(|pending| pending.eid);
+        let charged = match &result {
+            Ok(reply) => match (reply.input_tokens, reply.output_tokens) {
+                (Some(input), Some(output)) => crate::ai::charge_nano(&call.config, input, output),
+                _ => crate::ai::reserve_nano(&call),
+            },
+            Err(_) => 0,
+        };
+        let outcome = crate::effect_record::model_outcome(&result, charged);
+        let result = match self.record_effect("model.call", req_id, outcome) {
+            Some(err) => Err(err),
+            None => result,
+        };
+        let info = match result {
+            Ok(reply) => serde_json::json!({
+                "reqId": req_id,
+                "ok": true,
+                "text": reply.text,
+                "finishReason": reply.finish_reason,
+                "inputTokens": reply.input_tokens,
+                "outputTokens": reply.output_tokens,
+                "chargedNano": charged,
+                "eid": eid,
+                "toolCalls": reply.tool_calls,
+            }),
+            Err(err) => {
+                let mut info = model_error_info(err);
+                if let Some(fields) = info.as_object_mut() {
+                    fields.insert("reqId".into(), req_id.into());
+                    fields.insert("ok".into(), false.into());
+                }
+                info
+            }
+        };
+        let delivered = self.context.with(|ctx| -> rquickjs::Result<()> {
+            let dispatch: Function = ctx.globals().get("__vaern_dispatch_model")?;
+            dispatch.call::<_, ()>((info.to_string(),))
+        });
+        if let Err(err) = delivered {
+            let mut s = self.state.borrow_mut();
+            if s.unhandled_error.is_none() {
+                s.unhandled_error = Some(format!(
+                    "vaern:ai call {req_id} could not be delivered to the script: {err}"
+                ));
+            }
+        }
     }
 
     /// The full resolution error behind a failed import, when `message` is
@@ -2604,6 +2752,13 @@ impl QuickJsRuntime {
                 }
                 self.dispatch_fs_completion(completion);
             }
+            LoopEvent::ModelDone(completion) => {
+                {
+                    let mut s = self.state.borrow_mut();
+                    s.pending_models = s.pending_models.saturating_sub(1);
+                }
+                self.dispatch_model_completion(completion);
+            }
             LoopEvent::ServerClosed(closed_server_id) => {
                 if self.state.borrow().active_servers > 0 {
                     self.state.borrow_mut().active_servers -= 1;
@@ -2663,8 +2818,10 @@ impl QuickJsRuntime {
                 let s = self.state.borrow();
                 // File operations and stream chunks waiting for the client keep
                 // the loop alive the same way a fetch does.
-                let pending_fetches =
-                    s.pending_fetches > 0 || s.pending_fs > 0 || !s.stream_sends_waiting.is_empty();
+                let pending_fetches = s.pending_fetches > 0
+                    || s.pending_fs > 0
+                    || s.pending_models > 0
+                    || !s.stream_sends_waiting.is_empty();
                 let active_timers = !s.timers.is_empty();
                 let active_servers = s.active_servers > 0;
                 if !pending_fetches && !active_timers && !active_servers {
@@ -3893,6 +4050,124 @@ mod tests {
         assert_eq!(effects[2]["req"]["op"], "read_utf8");
         assert_eq!(effects[2]["res"]["text"], "hello");
         assert_eq!(effects[3]["error"]["code"], "ENOENT");
+    }
+
+    /// An OpenAI-compatible stub on `port`. `/ok/` answers with usage,
+    /// `/nousage/` without it, `/fail/` with a 500 and `/junk/` with text.
+    fn model_stub(port: u16) -> String {
+        format!(
+            r#"
+            import {{ serve }} from "vaern:http";
+            globalThis.seen = [];
+            const stub = serve(async (req) => {{
+                const body = await req.json();
+                seen.push({{ url: req.url, auth: req.headers.get("authorization"), body }});
+                if (req.url.includes("/fail/")) return new Response("overloaded", {{ status: 500 }});
+                if (req.url.includes("/junk/")) return new Response("<html>");
+                const reply = {{
+                    choices: [{{ message: {{ role: "assistant", content: "hi " + body.messages[0].content }},
+                                 finish_reason: "stop" }}],
+                }};
+                if (req.url.includes("/ok/")) reply.usage = {{ prompt_tokens: 20, completion_tokens: 5 }};
+                return new Response(JSON.stringify(reply),
+                    {{ headers: {{ "content-type": "application/json" }} }});
+            }}, {{ port: {port}, hostname: "127.0.0.1" }});
+            const base = "http://127.0.0.1:{port}";
+            "#
+        )
+    }
+
+    #[test]
+    fn test_model_chat_is_metered_and_journalled_without_the_key() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join(".vaern");
+        let code = model_stub(8992)
+            + r#"
+            import { model, ModelError } from "vaern:ai";
+            const m = model({
+                baseUrl: base + "/ok/v1/", model: "stub-1", apiKey: "sk-model-secret",
+                price: { inputPerMTok: 0.15, outputPerMTok: 0.6 }, maxOutputTokens: 64,
+            });
+            const r = await m.chat({ messages: [{ role: "user", content: "there" }] });
+            if (r.text !== "hi there" || r.finishReason !== "stop") throw new Error(JSON.stringify(r));
+            if (r.usage.inputTokens !== 20 || r.usage.outputTokens !== 5) throw new Error("usage");
+            // 20 x 150 + 5 x 600 nano-USD.
+            if (r.costUsd !== 6000 / 1e9) throw new Error("cost " + r.costUsd);
+            const sent = seen[0];
+            if (!sent.url.endsWith("/ok/v1/chat/completions")) throw new Error(sent.url);
+            if (sent.auth !== "Bearer sk-model-secret") throw new Error("auth " + sent.auth);
+            if (sent.body.model !== "stub-1" || sent.body.max_tokens !== 64) throw new Error("body");
+            // Refused before dispatch: nothing is sent and nothing journalled.
+            const refused = await m.chat({ messages: [] }).catch((e) => e);
+            if (!(refused instanceof ModelError) || refused.stage !== "config") throw refused;
+            if (seen.length !== 1) throw new Error("a refused call was sent");
+            await stub.close();
+            "#;
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        runtime.set_journal_home(Some(home.clone()));
+        assert_eq!(runtime.eval("model.js", &code).unwrap(), 0);
+
+        let records = journal_records(&home);
+        let calls: Vec<&serde_json::Value> = records
+            .iter()
+            .filter(|r| r["kind"] == "model.call")
+            .collect();
+        assert_eq!(calls.len(), 1, "{records:#?}");
+        let call = calls[0];
+        assert_eq!(call["req"]["base_url"], "http://127.0.0.1:8992/ok/v1/");
+        assert_eq!(call["req"]["body"]["max_tokens"], 64);
+        assert_eq!(call["res"]["status"], 200);
+        assert_eq!(call["res"]["usage"]["input_tokens"], 20);
+        assert_eq!(call["res"]["charged_nano_usd"], 6000);
+        assert!(call["res"]["body"].as_str().unwrap().contains("hi there"));
+        let line = serde_json::to_string(&records).unwrap();
+        assert!(!line.contains("sk-model-secret"), "the API key leaked");
+    }
+
+    #[test]
+    fn test_model_errors_name_their_stage_and_unreported_usage_is_charged() {
+        let code = model_stub(8991)
+            + r#"
+            import { model, ModelError } from "vaern:ai";
+            const price = { inputPerMTok: 1, outputPerMTok: 1 };
+            const ask = (path) => model({ baseUrl: base + path, model: "m", price })
+                .chat({ messages: [{ role: "user", content: "x" }], maxTokens: 10 });
+            const stageOf = (p) => p.then(() => "resolved", (e) => e instanceof ModelError
+                ? e.stage + ":" + (e.status ?? "-") : "other:" + e);
+            const got = [
+                await stageOf(ask("/fail/v1")),
+                await stageOf(ask("/junk/v1")),
+                await stageOf(model({ model: "m" }).chat({ messages: [{ role: "user", content: "x" }] })),
+            ].join(",");
+            if (got !== "http:500,parse:200,config:-") throw new Error(got);
+            // No usage reported: the call is charged its reservation, at least
+            // the full output cap of 10 tokens at 1 USD per million.
+            const r = await ask("/nousage/v1");
+            if (r.usage.inputTokens !== null || !(r.costUsd >= 10 / 1e6)) throw new Error(JSON.stringify(r));
+            await stub.close();
+            // With the stub closed, only the call in flight keeps the run alive.
+            const refused = await stageOf(model({ baseUrl: "http://127.0.0.1:1/v1", model: "m" })
+                .chat({ messages: [{ role: "user", content: "x" }] }));
+            if (refused !== "connect:-") throw new Error(refused);
+            console.log("model errors checked");
+            "#;
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join(".vaern");
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        runtime.set_journal_home(Some(home.clone()));
+        assert_eq!(runtime.eval("model_errors.js", &code).unwrap(), 0);
+
+        let records = journal_records(&home);
+        // The script ran to its last line rather than stopping at an await.
+        let last_console = records.iter().rfind(|r| r["kind"] == "console").unwrap();
+        assert_eq!(last_console["text"], "model errors checked\n");
+        let stages: Vec<&str> = records
+            .iter()
+            .filter(|r| r["kind"] == "model.call")
+            .map(|r| r["error"]["stage"].as_str().unwrap_or("ok"))
+            .collect();
+        // The config failure was refused before dispatch and is not recorded.
+        assert_eq!(stages, ["http", "parse", "ok", "connect"], "{records:#?}");
     }
 
     #[test]

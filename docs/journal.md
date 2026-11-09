@@ -44,12 +44,13 @@ numbers.
 | `console` | `fd` (1 stdout, 2 stderr), `text`: exactly what was written, newline included |
 | `fetch` | `eid`, `dur_us`, `req` {`method`, `url`, `headers`, `body`}, then `res` {`status`, `status_text`, `url` (after redirects), `headers`, `body`} or `error` {`stage`, `url`, `message`} |
 | `fs` | `eid`, `dur_us`, `req` {`op`, `path` as passed; writes add `len` and `sha256` of the data}, then `res` (`text` or `bytes` for reads, `{}` for writes) or `error` {`stage`, `code`, `path`, `message`} |
+| `model.call` | `eid`, `dur_us`, `req` {`base_url`, `model`, `body`: the request body as sent}, then `res` {`status`, `body`: the response text as received, `usage` {`input_tokens`, `output_tokens`}, `charged_nano_usd`} or `error` {`stage`, `url`, `status`, `message`}. A call refused before dispatch (`stage` `config`) is not recorded |
 | `run.end` | `exit_code`, `error` (when the run failed), `records` (count including this one), `transcript_sha256` |
 
 The transcript is the run's `console` records in order. `transcript_sha256`
 is SHA-256 over, for each of them, `<fd>:<UTF-8 byte length of text>:<text>`.
 
-Effects (`fetch`, `fs`):
+Effects (`fetch`, `fs`, `model.call`):
 - `eid` numbers effects in the order the script started them. The record
   is written when the effect completes, so records appear in completion
   order.
@@ -60,6 +61,10 @@ Effects (`fetch`, `fs`):
   `Set-Cookie`, `X-Api-Key` and `Api-Key` headers are stored as
   `"[redacted]"`. Secrets carried elsewhere, such as in a URL or a body, are
   recorded as sent.
+- Money is integer nano-USD (10^-9 USD). `charged_nano_usd` is computed
+  from the reported usage, or is the call's estimate when the server
+  reported none (see `vaern:ai` in the runtime subset).
+- The API key of a model call is not recorded.
 - If an effect completes but its record cannot be written, the script gets
   the journal error in place of the result.
 

@@ -22,6 +22,13 @@ pub struct FsCompletion {
     pub result: Result<FsOutput>,
 }
 
+/// Outcome of a `vaern:ai` model call, with the call it answers.
+pub struct ModelCompletion {
+    pub req_id: u32,
+    pub call: crate::ai::PreparedCall,
+    pub result: Result<crate::ai::ModelReply>,
+}
+
 /// Outcome of a streamed response chunk that had to wait for buffer space.
 pub struct StreamChunkSent {
     pub req_id: u64,
@@ -32,6 +39,7 @@ pub struct StreamChunkSent {
 pub enum LoopEvent {
     FetchDone(FetchCompletion),
     FsDone(FsCompletion),
+    ModelDone(Box<ModelCompletion>),
     StreamChunkSent(StreamChunkSent),
     ServerRequest(ServerIncomingRequest),
     ServerClosed(u32),
