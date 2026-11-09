@@ -102,6 +102,17 @@ pub enum VaernError {
     )]
     SourceTooLarge { path: String, limit_mib: u64 },
 
+    /// A `vaern:ai` model call failed. `stage` is `config`, `connect`, `http`,
+    /// `parse` or `schema`; `status` is the HTTP status, 0 when there was none.
+    #[error("model call failed at stage '{stage}' for '{url}': {message}. {action}")]
+    Model {
+        stage: String,
+        url: String,
+        status: u16,
+        message: String,
+        action: String,
+    },
+
     /// The effect journal could not be created, written or read. `stage` is
     /// `create`, `write`, `read` or `locate`.
     #[error("journal {stage} failed for '{path}': {reason}. {action}")]

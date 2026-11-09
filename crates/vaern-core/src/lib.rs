@@ -5,6 +5,7 @@
 //! - [`Runtime`]: Execution trait encapsulating the QuickJS JavaScript engine and event loop.
 //! - [`ModuleLoader`]: Trait resolving and loading relative local ES modules from disk.
 
+pub mod ai;
 mod blank_strip;
 mod effect_record;
 pub mod error;
