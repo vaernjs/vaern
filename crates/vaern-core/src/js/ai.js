@@ -22,6 +22,16 @@
         }
     }
 
+    class ToolError extends Error {
+        constructor(tool, stage, message, extra) {
+            super(message);
+            this.name = "ToolError";
+            this.tool = tool;
+            this.stage = stage;
+            if (extra) Object.assign(this, extra);
+        }
+    }
+
     // The native side hands results over as JSON text: the reply carries the
     // provider's tool calls as nested JSON, and one parse here is simpler
     // than building nested objects through the bridge.
@@ -165,6 +175,9 @@
                 const r = await start(config, objectArg("chat", callOptions));
                 const result = summary(r);
                 if (r.json !== null) result.json = r.json;
+                if (Array.isArray(r.toolCalls) && r.toolCalls.length > 0) {
+                    result.toolCalls = r.toolCalls;
+                }
                 return result;
             },
             stream(callOptions) {
@@ -173,5 +186,82 @@
         });
     }
 
-    globalThis.__vaern_ai = Object.freeze({ model, ModelError });
+    const TOOL_NAME = /^[a-zA-Z0-9_-]{1,64}$/;
+    let nextToolCall = 1;
+    const parsed = (json) => (json ? JSON.parse(json) : null);
+
+    function tool(options) {
+        objectArg("tool", options);
+        const { name, run } = options;
+        const description = options.description ?? "";
+        if (typeof name !== "string" || !TOOL_NAME.test(name)) {
+            throw new TypeError("tool: name must be 1 to 64 letters, digits, '_' or '-'");
+        }
+        if (typeof run !== "function") throw new TypeError(`tool ${name}: run must be a function`);
+        if (typeof description !== "string") {
+            throw new TypeError(`tool ${name}: description must be a string`);
+        }
+        const parameters = options.parameters ?? { type: "object", properties: {} };
+        const paramsJson = JSON.stringify(parameters);
+        const problem = parsed(__vaern_schema_check(paramsJson));
+        if (problem) {
+            throw new TypeError(`tool ${name}: parameters at ${problem.path}: ${problem.message}`);
+        }
+        if (parameters.type !== "object") {
+            throw new TypeError(`tool ${name}: parameters must describe an object`);
+        }
+        const costUsd = options.cost?.usd ?? 0;
+        if (typeof costUsd !== "number" || !Number.isFinite(costUsd) || costUsd < 0) {
+            throw new TypeError(`tool ${name}: cost.usd must be a number, 0 or more`);
+        }
+
+        // Arguments and results cross as JSON copies, so run() sees what the
+        // journal records and the caller gets what a replay would return.
+        async function call(args) {
+            const argsJson = JSON.stringify(args ?? {});
+            const mismatch = parsed(__vaern_schema_validate(argsJson, paramsJson));
+            if (mismatch) {
+                throw new ToolError(name, "args",
+                    `arguments at ${mismatch.path}: ${mismatch.message}`, { path: mismatch.path });
+            }
+            const reqId = nextToolCall++;
+            const started = JSON.parse(__vaern_tool_start(reqId, name, argsJson));
+            if (started.error) throw new ToolError(name, "journal", started.error);
+            const finish = (ok, outcomeJson) => {
+                const failed = parsed(__vaern_tool_finish(reqId, ok, outcomeJson));
+                if (failed) throw new ToolError(name, "journal", failed.error, { effect: started.eid });
+            };
+            let value;
+            try {
+                value = await run(JSON.parse(argsJson));
+            } catch (err) {
+                const message = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+                finish(false, JSON.stringify({ stage: "run", message }));
+                throw new ToolError(name, "run", message, { cause: err, effect: started.eid });
+            }
+            let resultJson;
+            try {
+                resultJson = JSON.stringify(value);
+            } catch {
+                resultJson = undefined;
+            }
+            if (resultJson === undefined) {
+                const message = "the result is not JSON-serialisable";
+                finish(false, JSON.stringify({ stage: "result", message }));
+                throw new ToolError(name, "result", message, { effect: started.eid });
+            }
+            finish(true, resultJson);
+            return JSON.parse(resultJson);
+        }
+
+        return Object.freeze({
+            name,
+            description,
+            parameters,
+            cost: Object.freeze({ usd: costUsd }),
+            call,
+        });
+    }
+
+    globalThis.__vaern_ai = Object.freeze({ model, ModelError, tool, ToolError });
 })();

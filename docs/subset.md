@@ -40,7 +40,7 @@ web or Node.js behaviour of the same name.
   extension included. There is no extension or `index` lookup.
 - `vaern:http`, which exports `serve`.
 - `vaern:fs`, which exports `readFile`, `writeFile` and `appendFile`.
-- `vaern:ai`, which exports `model` and `ModelError`.
+- `vaern:ai`, which exports `model`, `ModelError`, `tool` and `ToolError`.
 - Packages already installed in `node_modules`, imported by name (`pkg`,
   `@scope/pkg`, `pkg/sub`). Static and dynamic `import()` both work.
 
@@ -382,6 +382,34 @@ for await (const ev of m.stream({ messages: [{ role: "user", content: "Hi" }] })
   such as `$.items[2].name`) or `journal` (the reply arrived but could not
   be recorded). It also carries `url` and `action`. A `schema` error also
   carries `costUsd` and `effect`: the call was made and is charged.
+
+### Tools
+
+```ts
+import { tool } from "vaern:ai";
+
+const add = tool({
+  name: "add",                        // 1-64 of [a-zA-Z0-9_-]
+  description: "Adds two numbers.",
+  parameters: { type: "object", properties: { a: { type: "number" }, b: { type: "number" } },
+                required: ["a", "b"], additionalProperties: false },
+  run: async ({ a, b }) => ({ sum: a + b }),
+});
+await add.call({ a: 2, b: 3 });       // { sum: 5 }
+```
+
+- `parameters` uses the schema subset above and must describe an object;
+  it defaults to an object with no properties. A bad name, schema or
+  `cost.usd` throws `TypeError` from `tool()`.
+- `call(args)` checks `args` against `parameters`, then runs `run`.
+  Arguments and the result are passed as JSON copies: `run` gets a copy of
+  `args`, and `call` resolves to a copy of what `run` returned.
+- A failure rejects with a `ToolError` carrying `tool` and `stage`: `args`
+  (the arguments do not match; `path` names the place, and `run` was not
+  called), `run` (`run` threw; the message is `Name: message` and `cause`
+  is what was thrown), `result` (the result is not JSON-serialisable) or
+  `journal`.
+- `cost: { usd }` is accepted and stored; it is not used yet.
 
 Absent: cancelling a call in flight, embeddings, other endpoints, retries, schema keywords
 outside the list above, and checking of replies requested with

@@ -219,9 +219,9 @@ impl Loader for VaernModuleLoader {
             return Module::declare(
                 ctx.clone(),
                 name,
-                "const { model, ModelError } = globalThis.__vaern_ai;\n\
-                 export { model, ModelError };\n\
-                 export default { model, ModelError };",
+                "const { model, ModelError, tool, ToolError } = globalThis.__vaern_ai;\n\
+                 export { model, ModelError, tool, ToolError };\n\
+                 export default { model, ModelError, tool, ToolError };",
             );
         }
         let content = FsModuleLoader
@@ -925,6 +925,109 @@ impl QuickJsRuntime {
                 .map_err(|err| VaernError::EngineInit {
                     reason: format!("failed to register model call bridge: {err}"),
                 })?;
+
+            // Tool effects. A tool's run() is script code, so the prelude
+            // reports when it starts and ends. The start is recorded at once,
+            // so whatever the tool does follows its tool.call in the journal.
+            // Both bridges return the JSON of a journal failure, or null.
+            let state_tool = Rc::clone(&state);
+            let journal_tool = Rc::clone(&self.journal);
+            let tool_start_fn = Function::new(
+                ctx.clone(),
+                move |req_id: u32, name: String, args: String| -> String {
+                    let mut slot = journal_tool.borrow_mut();
+                    let Some(journal) = slot.as_mut() else {
+                        return serde_json::json!({ "eid": null }).to_string();
+                    };
+                    let args = serde_json::from_str(&args).unwrap_or(serde_json::Value::Null);
+                    let eid = state_tool.borrow().next_eid;
+                    let mut fields = serde_json::Map::new();
+                    fields.insert("eid".into(), eid.into());
+                    fields.insert(
+                        "req".into(),
+                        serde_json::json!({ "name": name, "args": args }),
+                    );
+                    if let Err(err) = journal.append("tool.call", fields) {
+                        return serde_json::json!({ "error": err.to_string() }).to_string();
+                    }
+                    let mut s = state_tool.borrow_mut();
+                    s.next_eid += 1;
+                    s.pending_effects.insert(
+                        ("tool.result", req_id),
+                        PendingEffect {
+                            eid,
+                            started: Instant::now(),
+                            req: serde_json::json!({ "name": name }),
+                        },
+                    );
+                    serde_json::json!({ "eid": eid }).to_string()
+                },
+            )
+            .map_err(|err| VaernError::EngineInit {
+                reason: format!("failed to create tool start bridge: {err}"),
+            })?;
+            let state_tool = Rc::clone(&state);
+            let journal_tool = Rc::clone(&self.journal);
+            let tool_finish_fn = Function::new(
+                ctx.clone(),
+                move |req_id: u32, ok: bool, outcome: String| -> Option<String> {
+                    let pending = state_tool
+                        .borrow_mut()
+                        .pending_effects
+                        .remove(&("tool.result", req_id))?;
+                    let value = serde_json::from_str(&outcome).unwrap_or(serde_json::Value::Null);
+                    let outcome = if ok {
+                        Outcome::Response(serde_json::json!({ "value": value }))
+                    } else {
+                        Outcome::Error(value)
+                    };
+                    let mut slot = journal_tool.borrow_mut();
+                    let journal = slot.as_mut()?;
+                    journal
+                        .append("tool.result", pending.finish(outcome))
+                        .err()
+                        .map(|err| serde_json::json!({ "error": err.to_string() }).to_string())
+                },
+            )
+            .map_err(|err| VaernError::EngineInit {
+                reason: format!("failed to create tool finish bridge: {err}"),
+            })?;
+            // Tool arguments are checked with the same schema subset as
+            // structured replies. Each returns {path, message} JSON, or null.
+            let schema_check_fn = Function::new(ctx.clone(), |schema: String| -> Option<String> {
+                let schema = serde_json::from_str(&schema).unwrap_or(serde_json::Value::Null);
+                crate::ai_schema::check_schema(&schema)
+                    .err()
+                    .map(|e| serde_json::json!({ "path": e.path, "message": e.message }).to_string())
+            })
+            .map_err(|err| VaernError::EngineInit {
+                reason: format!("failed to create schema check bridge: {err}"),
+            })?;
+            let schema_validate_fn = Function::new(
+                ctx.clone(),
+                |value: String, schema: String| -> Option<String> {
+                    let value = serde_json::from_str(&value).unwrap_or(serde_json::Value::Null);
+                    let schema = serde_json::from_str(&schema).unwrap_or(serde_json::Value::Null);
+                    crate::ai_schema::validate(&value, &schema).err().map(|e| {
+                        serde_json::json!({ "path": e.path, "message": e.message }).to_string()
+                    })
+                },
+            )
+            .map_err(|err| VaernError::EngineInit {
+                reason: format!("failed to create schema validate bridge: {err}"),
+            })?;
+            for (name, bridge) in [
+                ("__vaern_tool_start", tool_start_fn),
+                ("__vaern_tool_finish", tool_finish_fn),
+                ("__vaern_schema_check", schema_check_fn),
+                ("__vaern_schema_validate", schema_validate_fn),
+            ] {
+                globals
+                    .set(name, bridge)
+                    .map_err(|err| VaernError::EngineInit {
+                        reason: format!("failed to register {name}: {err}"),
+                    })?;
+            }
 
             // Native abort signal bridge
             let state_abort = Rc::clone(&state);
@@ -4290,6 +4393,81 @@ mod tests {
         assert!(full.ends_with("data: [DONE]\n\n"), "{full}");
         assert_eq!(calls[0]["res"]["charged_nano_usd"], 7000);
         assert_eq!(calls[2]["error"]["stage"], "parse");
+    }
+
+    #[test]
+    fn test_tool_calls_check_arguments_and_journal_start_and_result() {
+        let code = r#"
+            import { tool, ToolError } from "vaern:ai";
+            const add = tool({
+                name: "add", description: "Adds two numbers.",
+                parameters: { type: "object", properties: { a: { type: "number" }, b: { type: "number" } },
+                              required: ["a", "b"], additionalProperties: false },
+                run: async ({ a, b }) => ({ sum: a + b }),
+            });
+            const r = await add.call({ a: 2, b: 3 });
+            if (r.sum !== 5) throw new Error(JSON.stringify(r));
+
+            const bad = await add.call({ a: "2", b: 3 }).catch((e) => e);
+            if (!(bad instanceof ToolError) || bad.stage !== "args" || bad.path !== "$.a") throw bad;
+
+            const boom = tool({ name: "boom", run: async () => { throw new RangeError("nope"); } });
+            const failed = await boom.call({}).catch((e) => e);
+            if (failed.stage !== "run" || failed.message !== "RangeError: nope"
+                || failed.cause.message !== "nope" || failed.tool !== "boom") throw failed;
+
+            const odd = tool({ name: "odd", run: async () => () => 1 });
+            const unserialisable = await odd.call({}).catch((e) => e);
+            if (unserialisable.stage !== "result") throw unserialisable;
+
+            const refusals = [
+                () => tool({ name: "two words", run() {} }),
+                () => tool({ name: "t" }),
+                () => tool({ name: "t", parameters: { type: "object", properties: { x: { format: "date" } } }, run() {} }),
+                () => tool({ name: "t", parameters: { type: "string" }, run() {} }),
+                () => tool({ name: "t", cost: { usd: -1 }, run() {} }),
+            ].map((make) => { try { make(); return "made"; } catch (e) { return e.name; } });
+            if (refusals.join() !== "TypeError,TypeError,TypeError,TypeError,TypeError") {
+                throw new Error(refusals.join());
+            }
+            console.log("tools checked");
+        "#;
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join(".vaern");
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        runtime.set_journal_home(Some(home.clone()));
+        assert_eq!(runtime.eval("tools.js", code).unwrap(), 0);
+
+        let records = journal_records(&home);
+        let last_console = records.iter().rfind(|r| r["kind"] == "console").unwrap();
+        assert_eq!(last_console["text"], "tools checked\n");
+        let tools: Vec<&serde_json::Value> = records
+            .iter()
+            .filter(|r| r["kind"] == "tool.call" || r["kind"] == "tool.result")
+            .collect();
+        // Arguments that fail their schema never start the tool.
+        let kinds: Vec<&str> = tools.iter().map(|r| r["kind"].as_str().unwrap()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "tool.call",
+                "tool.result",
+                "tool.call",
+                "tool.result",
+                "tool.call",
+                "tool.result"
+            ]
+        );
+        assert_eq!(
+            tools[0]["req"],
+            serde_json::json!({ "name": "add", "args": { "a": 2, "b": 3 } })
+        );
+        assert_eq!(tools[1]["eid"], tools[0]["eid"]);
+        assert_eq!(tools[1]["res"]["value"], serde_json::json!({ "sum": 5 }));
+        assert!(tools[1]["dur_us"].as_u64().is_some());
+        assert_eq!(tools[3]["error"]["stage"], "run");
+        assert_eq!(tools[3]["error"]["message"], "RangeError: nope");
+        assert_eq!(tools[5]["error"]["stage"], "result");
     }
 
     #[test]

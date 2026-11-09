@@ -45,12 +45,14 @@ numbers.
 | `fetch` | `eid`, `dur_us`, `req` {`method`, `url`, `headers`, `body`}, then `res` {`status`, `status_text`, `url` (after redirects), `headers`, `body`} or `error` {`stage`, `url`, `message`} |
 | `fs` | `eid`, `dur_us`, `req` {`op`, `path` as passed; writes add `len` and `sha256` of the data}, then `res` (`text` or `bytes` for reads, `{}` for writes) or `error` {`stage`, `code`, `path`, `message`} |
 | `model.call` | `eid`, `dur_us`, `req` {`base_url`, `model`, `body`: the request body as sent}, then `res` {`status`, `body`: the response text as received (for a streamed call, the event stream as received), `usage` {`input_tokens`, `output_tokens`}, `charged_nano_usd`} or `error` {`stage`, `url`, `status`, `message`}. A call refused before dispatch (`stage` `config`) is not recorded |
+| `tool.call` | `eid`, `req` {`name`, `args`}. Written when the tool starts, so the effects it makes follow it |
+| `tool.result` | `eid` (the same as its `tool.call`), `dur_us`, `req` {`name`}, then `res` {`value`} or `error` {`stage`, `message`} |
 | `run.end` | `exit_code`, `error` (when the run failed), `records` (count including this one), `transcript_sha256` |
 
 The transcript is the run's `console` records in order. `transcript_sha256`
 is SHA-256 over, for each of them, `<fd>:<UTF-8 byte length of text>:<text>`.
 
-Effects (`fetch`, `fs`, `model.call`):
+Effects (`fetch`, `fs`, `model.call`, and a tool call's two records):
 - `eid` numbers effects in the order the script started them. The record
   is written when the effect completes, so records appear in completion
   order.
@@ -67,6 +69,8 @@ Effects (`fetch`, `fs`, `model.call`):
 - The API key of a model call is not recorded.
 - If an effect completes but its record cannot be written, the script gets
   the journal error in place of the result.
+
+Tool arguments that do not match the tool's `parameters` are refused before the tool starts and are not recorded. Effects made inside a tool's `run` are recorded as usual; nothing in their records links them to the tool call.
 
 Incoming `serve()` requests are not recorded.
 
