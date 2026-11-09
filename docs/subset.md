@@ -40,7 +40,8 @@ web or Node.js behaviour of the same name.
   extension included. There is no extension or `index` lookup.
 - `vaern:http`, which exports `serve`.
 - `vaern:fs`, which exports `readFile`, `writeFile` and `appendFile`.
-- `vaern:ai`, which exports `model`, `ModelError`, `tool` and `ToolError`.
+- `vaern:ai`, which exports `model`, `ModelError`, `tool`, `ToolError`,
+  `agent` and `AgentError`.
 - Packages already installed in `node_modules`, imported by name (`pkg`,
   `@scope/pkg`, `pkg/sub`). Static and dynamic `import()` both work.
 
@@ -410,6 +411,36 @@ await add.call({ a: 2, b: 3 });       // { sum: 5 }
   is what was thrown), `result` (the result is not JSON-serialisable) or
   `journal`.
 - `cost: { usd }` is accepted and stored; it is not used yet.
+
+### Agents
+
+```ts
+import { agent } from "vaern:ai";
+
+const a = agent({ model: m, system: "Be brief.", tools: [add], maxSteps: 8 });
+const out = await a.run("What is 2 + 3?");
+out.text; out.steps; out.usage; out.costUsd;
+```
+
+- `run(input)` takes a string (sent as the user message) or a list of
+  messages. It calls the model with the tools in OpenAI function format.
+  A reply without tool calls is the answer. Otherwise each tool call runs
+  in order through the tool's `call`, its result goes back as a `tool`
+  message (JSON text), and the model is called again.
+- A tool whose `run` throws does not end the run: `Error: <message>` goes
+  back as the tool's result. An unknown tool, arguments that are not JSON
+  or that do not match `parameters` go back the same way once per run; the
+  second time, `run` rejects with that `ToolError`.
+- `maxSteps` (default 8) bounds the number of model calls. Reaching it
+  rejects with an `AgentError` whose `code` is `STEP_LIMIT` and whose
+  `steps` lists what happened.
+- The result: `text` (the final reply), `steps` (`{ type: "model", text,
+  toolCalls, costUsd, effect }` and `{ type: "tool", name, args, result }`
+  or `{ type: "tool", name, error }`, in order), and `usage` and `costUsd`
+  summed over the model calls. `maxTokens` and `temperature` given to
+  `agent()` are passed to every model call.
+- Model calls and tool runs are journalled as usual: `model.call`,
+  `tool.call` and `tool.result`.
 
 Absent: cancelling a call in flight, embeddings, other endpoints, retries, schema keywords
 outside the list above, and checking of replies requested with

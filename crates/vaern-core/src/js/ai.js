@@ -32,6 +32,15 @@
         }
     }
 
+    class AgentError extends Error {
+        constructor(code, message, steps) {
+            super(message);
+            this.name = "AgentError";
+            this.code = code;
+            this.steps = steps;
+        }
+    }
+
     // The native side hands results over as JSON text: the reply carries the
     // provider's tool calls as nested JSON, and one parse here is simpler
     // than building nested objects through the bridge.
@@ -263,5 +272,113 @@
         });
     }
 
-    globalThis.__vaern_ai = Object.freeze({ model, ModelError, tool, ToolError });
+    // The agent loop: a reply without tool calls is the answer; otherwise
+    // each call runs in order and its result goes back as a tool message.
+    // maxSteps bounds the number of model calls.
+    function agent(options) {
+        objectArg("agent", options);
+        const m = options.model;
+        if (!m || typeof m.chat !== "function") {
+            throw new TypeError("agent: model must be a value returned by model()");
+        }
+        const system = options.system;
+        if (system !== undefined && typeof system !== "string") {
+            throw new TypeError("agent: system must be a string");
+        }
+        const tools = options.tools ?? [];
+        if (!Array.isArray(tools)) throw new TypeError("agent: tools must be a list");
+        const byName = new Map();
+        for (const t of tools) {
+            if (!t || typeof t.call !== "function" || typeof t.name !== "string") {
+                throw new TypeError("agent: each tool must be a value returned by tool()");
+            }
+            if (byName.has(t.name)) throw new TypeError(`agent: two tools are named ${t.name}`);
+            byName.set(t.name, t);
+        }
+        const maxSteps = options.maxSteps ?? 8;
+        if (!Number.isInteger(maxSteps) || maxSteps < 1) {
+            throw new TypeError("agent: maxSteps must be a whole number above 0");
+        }
+        const definitions = tools.map((t) => ({
+            type: "function",
+            function: { name: t.name, description: t.description, parameters: t.parameters },
+        }));
+
+        async function run(input) {
+            const messages = [];
+            if (system) messages.push({ role: "system", content: system });
+            if (typeof input === "string") messages.push({ role: "user", content: input });
+            else if (Array.isArray(input)) messages.push(...input);
+            else throw new TypeError("agent.run: input must be a string or a list of messages");
+            const steps = [];
+            const usage = { inputTokens: 0, outputTokens: 0 };
+            let costUsd = 0;
+            let corrected = false;
+
+            // An unknown tool or bad arguments go back to the model once to
+            // correct; a second time ends the run with that ToolError.
+            const refuse = (refusal) => {
+                if (corrected) throw refusal;
+                corrected = true;
+                steps.push({ type: "tool", name: refusal.tool, error: refusal.message });
+                return `Error: ${refusal.message}`;
+            };
+            const invoke = async (call) => {
+                const name = call?.function?.name;
+                const t = byName.get(name);
+                if (!t) {
+                    return refuse(new ToolError(String(name), "args",
+                        `the model called an unknown tool '${name}'`));
+                }
+                let args;
+                try {
+                    args = JSON.parse(call.function.arguments || "{}");
+                } catch {
+                    return refuse(new ToolError(name, "args", "the model's arguments are not JSON"));
+                }
+                try {
+                    const result = await t.call(args);
+                    steps.push({ type: "tool", name, args, result });
+                    return JSON.stringify(result);
+                } catch (err) {
+                    if (!(err instanceof ToolError)) throw err;
+                    if (err.stage === "args") return refuse(err);
+                    if (err.stage !== "run") throw err;
+                    steps.push({ type: "tool", name, args, error: err.message });
+                    return `Error: ${err.message}`;
+                }
+            };
+
+            for (let calls = 0; ; calls++) {
+                if (calls === maxSteps) {
+                    throw new AgentError("STEP_LIMIT",
+                        `the agent made ${maxSteps} model calls without a final answer`, steps);
+                }
+                const reply = await m.chat({
+                    messages,
+                    tools: definitions.length > 0 ? definitions : undefined,
+                    maxTokens: options.maxTokens,
+                    temperature: options.temperature,
+                });
+                usage.inputTokens += reply.usage.inputTokens ?? 0;
+                usage.outputTokens += reply.usage.outputTokens ?? 0;
+                costUsd += reply.costUsd;
+                const toolCalls = reply.toolCalls ?? [];
+                steps.push({ type: "model", text: reply.text, toolCalls: toolCalls.length,
+                             costUsd: reply.costUsd, effect: reply.effect });
+                if (toolCalls.length === 0) return { text: reply.text, steps, usage, costUsd };
+                messages.push({ role: "assistant", content: reply.text === "" ? null : reply.text,
+                                tool_calls: toolCalls });
+                for (const call of toolCalls) {
+                    messages.push({ role: "tool", tool_call_id: call.id, content: await invoke(call) });
+                }
+            }
+        }
+
+        return Object.freeze({ run });
+    }
+
+    globalThis.__vaern_ai = Object.freeze({
+        model, ModelError, tool, ToolError, agent, AgentError,
+    });
 })();

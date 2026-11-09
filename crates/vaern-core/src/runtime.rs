@@ -219,9 +219,10 @@ impl Loader for VaernModuleLoader {
             return Module::declare(
                 ctx.clone(),
                 name,
-                "const { model, ModelError, tool, ToolError } = globalThis.__vaern_ai;\n\
-                 export { model, ModelError, tool, ToolError };\n\
-                 export default { model, ModelError, tool, ToolError };",
+                "const { model, ModelError, tool, ToolError, agent, AgentError } =\n\
+                     globalThis.__vaern_ai;\n\
+                 export { model, ModelError, tool, ToolError, agent, AgentError };\n\
+                 export default { model, ModelError, tool, ToolError, agent, AgentError };",
             );
         }
         let content = FsModuleLoader
@@ -4201,7 +4202,9 @@ mod tests {
     /// `/nousage/` without it, `/fail/` with a 500, `/junk/` with text, and
     /// `/echo/` with the first message's content as the reply. `/sse/`
     /// streams that content word by word, and `/sse-cut/` stops before the
-    /// stream is finished.
+    /// stream is finished. `/agent/` plays a tool-calling model: it calls a
+    /// tool chosen by the user message until a tool result comes back, and
+    /// for "loop" and "bad" it never stops calling.
     fn model_stub(port: u16) -> String {
         format!(
             r#"
@@ -4212,6 +4215,25 @@ mod tests {
                 seen.push({{ url: req.url, auth: req.headers.get("authorization"), body }});
                 if (req.url.includes("/fail/")) return new Response("overloaded", {{ status: 500 }});
                 if (req.url.includes("/junk/")) return new Response("<html>");
+                if (req.url.includes("/agent/")) {{
+                    const last = body.messages[body.messages.length - 1];
+                    const ask = body.messages.find((m) => m.role === "user").content;
+                    const callTool = (name, args) => ({{ choices: [{{ finish_reason: "tool_calls",
+                        message: {{ role: "assistant", content: null, tool_calls: [{{
+                            id: "c" + body.messages.length, type: "function",
+                            function: {{ name, arguments: args }} }}] }} }}] }});
+                    let reply;
+                    if (last.role === "tool" && ask !== "loop" && ask !== "bad") {{
+                        reply = {{ choices: [{{ finish_reason: "stop",
+                            message: {{ role: "assistant", content: "result: " + last.content }} }}] }};
+                    }} else if (ask === "bad") reply = callTool("add", '{{"a":"x","b":1}}');
+                    else if (ask === "unknown") reply = callTool("nosuch", "{{}}");
+                    else if (ask === "boom") reply = callTool("boom", "{{}}");
+                    else reply = callTool("add", '{{"a":2,"b":3}}');
+                    reply.usage = {{ prompt_tokens: 10, completion_tokens: 2 }};
+                    return new Response(JSON.stringify(reply),
+                        {{ headers: {{ "content-type": "application/json" }} }});
+                }}
                 if (req.url.includes("/sse")) {{
                     const words = body.messages[0].content.split(" ");
                     const event = (data) => "data: " + JSON.stringify(data) + "\n\n";
@@ -4468,6 +4490,71 @@ mod tests {
         assert_eq!(tools[3]["error"]["stage"], "run");
         assert_eq!(tools[3]["error"]["message"], "RangeError: nope");
         assert_eq!(tools[5]["error"]["stage"], "result");
+    }
+
+    #[test]
+    fn test_agent_round_trips_tool_calls_and_stops_at_its_step_limit() {
+        let code = model_stub(8988)
+            + r#"
+            import { model, tool, agent, AgentError, ToolError } from "vaern:ai";
+            const m = model({ baseUrl: base + "/agent/v1", model: "m",
+                              price: { inputPerMTok: 1, outputPerMTok: 1 } });
+            const add = tool({ name: "add", description: "Adds.",
+                parameters: { type: "object", properties: { a: { type: "number" }, b: { type: "number" } },
+                              required: ["a", "b"] },
+                run: async ({ a, b }) => ({ sum: a + b }) });
+            const boom = tool({ name: "boom", run: async () => { throw new Error("broken"); } });
+            const a = agent({ model: m, system: "Be brief.", tools: [add, boom], maxSteps: 3 });
+
+            const out = await a.run("add");
+            if (out.text !== 'result: {"sum":5}') throw new Error(out.text);
+            if (out.steps.map((s) => s.type).join() !== "model,tool,model") throw new Error("steps");
+            if (out.steps[1].result.sum !== 5) throw new Error("tool step");
+            if (out.usage.inputTokens !== 20 || out.usage.outputTokens !== 4
+                || out.costUsd !== 24000 / 1e9) throw new Error(JSON.stringify(out));
+            if (seen[0].body.tools[0].function.name !== "add") throw new Error("tools not sent");
+            const second = seen[1].body.messages;
+            if (second.map((x) => x.role).join() !== "system,user,assistant,tool"
+                || second[3].tool_call_id !== second[2].tool_calls[0].id) {
+                throw new Error(JSON.stringify(second));
+            }
+
+            const failed = await a.run("boom");
+            if (failed.text !== "result: Error: Error: broken") throw new Error(failed.text);
+            const unknown = await a.run("unknown");
+            if (!unknown.text.startsWith("result: Error: the model called an unknown tool")) {
+                throw new Error(unknown.text);
+            }
+            const bad = await a.run("bad").catch((e) => e);
+            if (!(bad instanceof ToolError) || bad.stage !== "args" || bad.path !== "$.a") throw bad;
+            const loop = await a.run("loop").catch((e) => e);
+            if (!(loop instanceof AgentError) || loop.code !== "STEP_LIMIT"
+                || loop.steps.filter((s) => s.type === "model").length !== 3) throw loop;
+
+            const refusals = [
+                () => agent({ model: {} }),
+                () => agent({ model: m, tools: [add, add] }),
+                () => agent({ model: m, maxSteps: 0 }),
+            ].map((make) => { try { make(); return "made"; } catch (e) { return e.name; } });
+            if (refusals.join() !== "TypeError,TypeError,TypeError") throw new Error(refusals.join());
+            await stub.close();
+            console.log("agents checked");
+            "#;
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join(".vaern");
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        runtime.set_journal_home(Some(home.clone()));
+        assert_eq!(runtime.eval("agent.js", &code).unwrap(), 0);
+
+        let records = journal_records(&home);
+        let last_console = records.iter().rfind(|r| r["kind"] == "console").unwrap();
+        assert_eq!(last_console["text"], "agents checked\n");
+        let count = |kind: &str| records.iter().filter(|r| r["kind"] == kind).count();
+        // add 2, boom 2, unknown 2, bad 2 and loop 3 model calls; tools ran
+        // once each for add and boom and three times for loop.
+        assert_eq!(count("model.call"), 11);
+        assert_eq!(count("tool.call"), 5);
+        assert_eq!(count("tool.result"), 5);
     }
 
     #[test]
