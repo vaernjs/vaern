@@ -241,6 +241,11 @@ Absent: `AbortSignal.any`, `throwIfAborted` and the `onabort` property.
 QuickJS-ng provides the standard ECMAScript built-ins, plus `performance.now`,
 `atob`, `btoa`, `WeakRef` and `FinalizationRegistry`.
 
+In a journalled run, `Math.random` is xoshiro128** seeded with 128 bits
+from the operating system, and the seed is recorded in the journal's
+`run.start`. It is not suitable for cryptography, and neither is the
+engine's generator, which is used when the journal is off.
+
 Absent: `crypto` (including `getRandomValues` and `randomUUID`),
 `structuredClone`, `Blob`, `File`, `FormData`, `EventTarget`, `Event`,
 `WebSocket`, `navigator`, `Buffer` and `global`.

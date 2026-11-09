@@ -341,6 +341,20 @@ fn track_effect(
     );
 }
 
+/// 128 bits from the operating system for a journalled run's `Math.random`.
+fn random_seed() -> std::result::Result<[u32; 4], String> {
+    use ring::rand::SecureRandom;
+    let mut bytes = [0u8; 16];
+    ring::rand::SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| "the system random source is unavailable".to_string())?;
+    let mut seed = [0u32; 4];
+    for (word, chunk) in seed.iter_mut().zip(bytes.as_chunks::<4>().0) {
+        *word = u32::from_le_bytes(*chunk);
+    }
+    Ok(seed)
+}
+
 /// The shared HTTP client, built on first use. Fetch and model calls share
 /// it so they share kept-alive connections and TLS sessions.
 fn shared_client(state: &Rc<RefCell<SharedState>>) -> Result<crate::fetch::HttpClient> {
@@ -2574,6 +2588,10 @@ impl QuickJsRuntime {
                 .map_err(|err| VaernError::EngineInit {
                     reason: format!("failed to initialize vaern:ai: {err}"),
                 })?;
+            ctx.eval::<(), _>(include_str!("js/random.js"))
+                .map_err(|err| VaernError::EngineInit {
+                    reason: format!("failed to initialize the seeded Math.random: {err}"),
+                })?;
 
             // Populate process.argv
             let argv_arr = Array::new(ctx.clone()).map_err(|err| VaernError::EngineInit {
@@ -3207,19 +3225,46 @@ impl QuickJsRuntime {
             return Ok(());
         };
         let mut journal = Journal::create(home)?;
+        let seed = random_seed().map_err(|reason| VaernError::Journal {
+            stage: "create".into(),
+            path: journal.path().display().to_string(),
+            reason,
+            action: "The system random source failed; retry, or run with --no-journal.".into(),
+        })?;
         let digest = crate::journal::sha256_hex(source.as_bytes());
         let mut start = serde_json::Map::new();
         start.insert("vaern".into(), env!("CARGO_PKG_VERSION").into());
         start.insert("script".into(), script.into());
         start.insert("script_sha256".into(), digest.clone().into());
         start.insert("argv".into(), self.options.argv.clone().into());
+        start.insert(
+            "random_seed".into(),
+            seed.iter()
+                .map(|word| format!("{word:08x}"))
+                .collect::<String>()
+                .into(),
+        );
         journal.append("run.start", start)?;
+        self.seed_random(seed)?;
         let mut module = serde_json::Map::new();
         module.insert("path".into(), script.into());
         module.insert("sha256".into(), digest.into());
         journal.append("module.load", module)?;
         *self.journal.borrow_mut() = Some(journal);
         Ok(())
+    }
+
+    /// Replaces `Math.random` with the generator in `js/random.js`, seeded
+    /// with the four words recorded in `run.start`.
+    fn seed_random(&self, seed: [u32; 4]) -> Result<()> {
+        self.context
+            .with(|ctx| {
+                let seed_fn: Function = ctx.globals().get("__vaern_seed_random")?;
+                seed_fn.call::<_, ()>((seed[0], seed[1], seed[2], seed[3]))
+            })
+            .map_err(|err| VaernError::EngineInit {
+                reason: format!("failed to seed Math.random: {err}"),
+            })
     }
 
     /// Seals the journal with the run's outcome. A run that succeeded but
@@ -4826,6 +4871,50 @@ mod tests {
             .collect();
         // The config failure was refused before dispatch and is not recorded.
         assert_eq!(stages, ["http", "parse", "ok", "connect"], "{records:#?}");
+    }
+
+    #[test]
+    fn test_math_random_draws_from_the_seed_in_run_start() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join(".vaern");
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        runtime.set_journal_home(Some(home.clone()));
+        let code = "for (let i = 0; i < 3; i++) console.log(String(Math.random()));";
+        assert_eq!(runtime.eval("random.js", code).unwrap(), 0);
+
+        let records = journal_records(&home);
+        let hex = records[0]["random_seed"].as_str().unwrap();
+        assert_eq!(hex.len(), 32);
+        let mut s = [0u32; 4];
+        for (i, word) in s.iter_mut().enumerate() {
+            *word = u32::from_str_radix(&hex[i * 8..i * 8 + 8], 16).unwrap();
+        }
+        if s == [0; 4] {
+            s[0] = 1;
+        }
+        // Reference xoshiro128**, two outputs per 53-bit result.
+        let mut next = || {
+            let result = s[1].wrapping_mul(5).rotate_left(7).wrapping_mul(9);
+            let t = s[1] << 9;
+            s[2] ^= s[0];
+            s[3] ^= s[1];
+            s[1] ^= s[2];
+            s[0] ^= s[3];
+            s[2] ^= t;
+            s[3] = s[3].rotate_left(11);
+            result
+        };
+        let drawn: Vec<f64> = records
+            .iter()
+            .filter(|r| r["kind"] == "console")
+            .map(|r| r["text"].as_str().unwrap().trim().parse().unwrap())
+            .collect();
+        assert_eq!(drawn.len(), 3);
+        for value in drawn {
+            let high = f64::from(next() >> 5);
+            let low = f64::from(next() >> 6);
+            assert_eq!(value, (high * 67108864.0 + low) / 9007199254740992.0);
+        }
     }
 
     #[test]

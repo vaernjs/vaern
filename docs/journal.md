@@ -39,7 +39,7 @@ numbers.
 
 | kind | fields |
 |---|---|
-| `run.start` | `vaern` (version), `script`, `script_sha256`, `argv` |
+| `run.start` | `vaern` (version), `script`, `script_sha256`, `argv`, `random_seed` (32 hex digits: the four 32-bit words, in order, that seed `Math.random`) |
 | `module.load` | `path`, `sha256` of the source as read. One per module evaluated, the entry script first |
 | `console` | `fd` (1 stdout, 2 stderr), `text`: exactly what was written, newline included |
 | `fetch` | `eid`, `dur_us`, `req` {`method`, `url`, `headers`, `body`}, then `res` {`status`, `status_text`, `url` (after redirects), `headers`, `body`} or `error` {`stage`, `url`, `message`} |
