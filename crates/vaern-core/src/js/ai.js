@@ -32,6 +32,24 @@
         }
     }
 
+    // reserve and remaining are in USD for unit "usd", tokens otherwise.
+    class BudgetError extends Error {
+        constructor(info) {
+            super(info.message);
+            this.name = "BudgetError";
+            this.code = info.code;
+            this.action = info.action;
+            if (info.unit) {
+                const scale = info.unit === "usd" ? 1e9 : 1;
+                this.unit = info.unit;
+                this.reserve = info.reserve / scale;
+                this.remaining = info.remaining / scale;
+            }
+        }
+    }
+
+    const failure = (info) => (info.budget ? new BudgetError(info) : new ModelError(info));
+
     class AgentError extends Error {
         constructor(code, message, steps) {
             super(message);
@@ -50,7 +68,7 @@
         if (!waiter) return;
         pending.delete(info.reqId);
         if (info.ok) waiter.resolve(info);
-        else waiter.reject(new ModelError(info));
+        else waiter.reject(failure(info));
     };
 
     globalThis.__vaern_model_delta = (reqId, delta) => {
@@ -94,7 +112,7 @@
             }
             if (refused) {
                 pending.delete(reqId);
-                reject(new ModelError(JSON.parse(refused)));
+                reject(failure(JSON.parse(refused)));
             }
         });
     }
@@ -234,7 +252,9 @@
                     `arguments at ${mismatch.path}: ${mismatch.message}`, { path: mismatch.path });
             }
             const reqId = nextToolCall++;
-            const started = JSON.parse(__vaern_tool_start(reqId, name, argsJson));
+            const started = JSON.parse(
+                __vaern_tool_start(reqId, name, argsJson, Math.round(costUsd * 1e9)));
+            if (started.budget) throw new BudgetError(started.budget);
             if (started.error) throw new ToolError(name, "journal", started.error);
             const finish = (ok, outcomeJson) => {
                 const failed = parsed(__vaern_tool_finish(reqId, ok, outcomeJson));
@@ -378,7 +398,37 @@
         return Object.freeze({ run });
     }
 
+    const remainingOf = (left) => ({
+        usd: left.nano === null ? null : left.nano / 1e9,
+        tokens: left.tokens,
+    });
+
+    // Sets or lowers the run's budget and returns what remains. Limits only
+    // go down; see budget::RunBudget for the rules.
+    function budget(options = {}) {
+        objectArg("budget", options);
+        const { name, usd, tokens } = options;
+        if (name !== undefined && typeof name !== "string") {
+            throw new TypeError("budget: name must be a string");
+        }
+        if (usd !== undefined && (typeof usd !== "number" || !Number.isFinite(usd) || usd < 0)) {
+            throw new TypeError("budget: usd must be a number, 0 or more");
+        }
+        if (tokens !== undefined && (!Number.isSafeInteger(tokens) || tokens < 0)) {
+            throw new TypeError("budget: tokens must be a whole number, 0 or more");
+        }
+        const reply = JSON.parse(__vaern_budget_set(JSON.stringify({
+            name,
+            nano: usd === undefined ? null : Math.round(usd * 1e9),
+            tokens: tokens ?? null,
+        })));
+        if (reply.error) throw new BudgetError(reply.error);
+        return remainingOf(reply.remaining);
+    }
+    budget.remaining = () => remainingOf(JSON.parse(__vaern_budget_remaining()));
+    Object.freeze(budget);
+
     globalThis.__vaern_ai = Object.freeze({
-        model, ModelError, tool, ToolError, agent, AgentError,
+        model, ModelError, tool, ToolError, agent, AgentError, budget, BudgetError,
     });
 })();

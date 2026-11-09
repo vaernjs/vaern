@@ -19,7 +19,7 @@ use crate::error::{Result, VaernError};
 use crate::journal::Journal;
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Limits for one run. `None` leaves a unit unlimited.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -174,6 +174,10 @@ impl Budget {
         self.limits
     }
 
+    fn lower_to(&mut self, limits: Limits) {
+        self.limits = limits;
+    }
+
     /// What is left after spending and the reserves still open. `None` for
     /// a unit without a limit.
     pub fn remaining(&self) -> Limits {
@@ -277,6 +281,156 @@ impl Budget {
             journal.append("budget.settle", fields)?;
         }
         Ok(())
+    }
+}
+
+/// The lower of two limits, where `None` is no limit.
+fn lower(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, None) => a,
+        (None, b) => b,
+    }
+}
+
+fn lowered(a: Limits, b: Limits) -> Limits {
+    Limits {
+        nano: lower(a.nano, b.nano),
+        tokens: lower(a.tokens, b.tokens),
+    }
+}
+
+/// A run's budget as the runtime holds it: the caps from the command line,
+/// where named ledgers live, the budget once one applies, and the reserve
+/// behind each call in flight.
+#[derive(Default)]
+pub struct RunBudget {
+    caps: Limits,
+    home: Option<PathBuf>,
+    budget: Option<Budget>,
+    name: Option<String>,
+    run: Option<String>,
+    dispatched: bool,
+    open: HashMap<(&'static str, u32), (u64, Amount)>,
+}
+
+impl RunBudget {
+    /// Caps a script cannot raise, and the home for named ledgers.
+    pub fn configure(&mut self, caps: Limits, home: Option<PathBuf>) {
+        self.caps = caps;
+        self.home = home;
+    }
+
+    /// Ledger records name the run: the journal's id, or one made up when
+    /// the journal is off, so two runs never share reserve ids.
+    fn run_id(&mut self, journal: Option<&Journal>) -> String {
+        self.run
+            .get_or_insert_with(|| {
+                journal
+                    .map(|j| j.run_id().to_string())
+                    .filter(|id| !id.is_empty())
+                    .unwrap_or_else(|| {
+                        format!("{}-p{}", crate::journal::run_id_now(), std::process::id())
+                    })
+            })
+            .clone()
+    }
+
+    /// Applies a `budget()` call and returns what remains. Limits only go
+    /// down: a script can lower its budget, never raise it above the caps
+    /// or an earlier call.
+    pub fn request(&mut self, name: Option<&str>, limits: Limits) -> Result<Limits> {
+        let invalid = |message: String| {
+            budget_error(
+                "INVALID",
+                message,
+                "Call budget() once, before the first model call or tool run, and use one name per run.",
+            )
+        };
+        if self.budget.is_none() && self.dispatched {
+            return Err(invalid(
+                "budget() was called after a model call or tool run had started".to_string(),
+            ));
+        }
+        match (name, self.name.as_deref()) {
+            (Some(name), Some(current)) if name != current => {
+                return Err(invalid(format!(
+                    "this run already uses the budget '{current}'"
+                )));
+            }
+            (Some(name), None) if self.budget.is_some() => {
+                return Err(invalid(format!(
+                    "the budget '{name}' must be named in the first budget() call"
+                )));
+            }
+            (Some(name), None) => {
+                let Some(home) = self.home.as_deref() else {
+                    return Err(invalid(format!(
+                        "the budget '{name}' needs a ledger directory; `vaern run` provides one"
+                    )));
+                };
+                let budget = Budget::named(home, name, lowered(self.caps, limits))?;
+                self.budget = Some(budget);
+                self.name = Some(name.to_string());
+            }
+            _ => match self.budget.as_mut() {
+                Some(budget) => budget.lower_to(lowered(budget.limits(), limits)),
+                None => self.budget = Some(Budget::new(lowered(self.caps, limits))),
+            },
+        }
+        Ok(self.remaining())
+    }
+
+    /// What remains; `None` per unit without a limit.
+    pub fn remaining(&self) -> Limits {
+        match &self.budget {
+            Some(budget) => budget.remaining(),
+            None => self.caps,
+        }
+    }
+
+    /// Reserves `amount` for call `req_id` of `kind` before it is
+    /// dispatched. Without a budget or caps there is nothing to reserve.
+    pub fn reserve(
+        &mut self,
+        journal: Option<&mut Journal>,
+        kind: &'static str,
+        req_id: u32,
+        amount: Amount,
+    ) -> Result<()> {
+        self.dispatched = true;
+        if self.budget.is_none() {
+            if self.caps == Limits::default() {
+                return Ok(());
+            }
+            self.budget = Some(Budget::new(self.caps));
+        }
+        let run = self.run_id(journal.as_deref());
+        let Some(budget) = self.budget.as_mut() else {
+            return Ok(());
+        };
+        let rid = budget.reserve(journal, &run, kind, amount)?;
+        self.open.insert((kind, req_id), (rid, amount));
+        Ok(())
+    }
+
+    /// Settles call `req_id` with its actual charge. `None`, for a reply
+    /// without usage or a failed call, keeps the whole reserve charged.
+    pub fn settle(
+        &mut self,
+        journal: Option<&mut Journal>,
+        kind: &'static str,
+        req_id: u32,
+        charge: Option<Amount>,
+    ) -> Result<()> {
+        let Some((rid, reserved)) = self.open.remove(&(kind, req_id)) else {
+            return Ok(());
+        };
+        let run = self.run_id(journal.as_deref());
+        match self.budget.as_mut() {
+            Some(budget) => budget.settle(journal, &run, rid, charge.unwrap_or(reserved)),
+            None => Ok(()),
+        }
     }
 }
 
@@ -391,6 +545,59 @@ mod tests {
         assert_eq!(other.remaining(), LIMITS);
         let bad = Budget::named(home.path(), "../x", LIMITS).err().unwrap();
         assert_eq!(refusal(bad).0, "INVALID");
+    }
+
+    #[test]
+    fn test_run_budgets_only_go_down_and_must_come_first() {
+        let caps = Limits {
+            nano: Some(500),
+            tokens: None,
+        };
+        let mut run = RunBudget::default();
+        run.configure(caps, None);
+        let asked = Limits {
+            nano: Some(9000),
+            tokens: Some(50),
+        };
+        assert_eq!(
+            run.request(None, asked).unwrap(),
+            Limits {
+                nano: Some(500),
+                tokens: Some(50)
+            }
+        );
+        let raised = Limits {
+            nano: Some(800),
+            tokens: Some(40),
+        };
+        assert_eq!(run.request(None, raised).unwrap().nano, Some(500));
+        assert_eq!(run.remaining().tokens, Some(40));
+        let named = run.request(Some("late"), Limits::default()).unwrap_err();
+        assert_eq!(refusal(named).0, "INVALID");
+
+        let mut capped = RunBudget::default();
+        capped.configure(caps, None);
+        capped
+            .reserve(None, "model.call", 1, amount(400, 0))
+            .unwrap();
+        assert_eq!(
+            refusal(
+                capped
+                    .reserve(None, "model.call", 2, amount(101, 0))
+                    .unwrap_err()
+            )
+            .0,
+            "RESERVE_EXCEEDS_REMAINING"
+        );
+        // No usage reported: the reserve stays charged.
+        capped.settle(None, "model.call", 1, None).unwrap();
+        assert_eq!(capped.remaining().nano, Some(100));
+        // The caps applied at the first reserve, so budget() may still lower them.
+        assert!(capped.request(None, caps).is_ok());
+
+        let mut late = RunBudget::default();
+        late.reserve(None, "model.call", 1, amount(1, 1)).unwrap();
+        assert_eq!(refusal(late.request(None, caps).unwrap_err()).0, "INVALID");
     }
 
     #[test]

@@ -219,10 +219,10 @@ impl Loader for VaernModuleLoader {
             return Module::declare(
                 ctx.clone(),
                 name,
-                "const { model, ModelError, tool, ToolError, agent, AgentError } =\n\
+                "const { model, ModelError, tool, ToolError, agent, AgentError, budget, BudgetError } =\n\
                      globalThis.__vaern_ai;\n\
-                 export { model, ModelError, tool, ToolError, agent, AgentError };\n\
-                 export default { model, ModelError, tool, ToolError, agent, AgentError };",
+                 export { model, ModelError, tool, ToolError, agent, AgentError, budget, BudgetError };\n\
+                 export default { model, ModelError, tool, ToolError, agent, AgentError, budget, BudgetError };",
             );
         }
         let content = FsModuleLoader
@@ -365,6 +365,17 @@ fn model_error_info(err: VaernError) -> serde_json::Value {
         } => serde_json::json!({
             "stage": stage, "url": url, "status": status, "message": message, "action": action,
         }),
+        VaernError::Budget {
+            code,
+            unit,
+            reserve,
+            remaining,
+            message,
+            action,
+        } => serde_json::json!({
+            "budget": true, "stage": "budget", "code": code, "unit": unit,
+            "reserve": reserve, "remaining": remaining, "message": message, "action": action,
+        }),
         VaernError::Journal { .. } => serde_json::json!({
             "stage": "journal", "url": "", "status": 0, "message": err.to_string(),
             "action": "The call completed but could not be recorded; check the journal directory.",
@@ -456,12 +467,17 @@ pub struct QuickJsRuntime {
     journal_home: Option<PathBuf>,
     /// The open journal, shared with the bridges that record effects.
     journal: JournalSlot,
+    /// The run's budget, shared with the bridges that reserve and settle.
+    budget: BudgetSlot,
     _tokio_rt: tokio::runtime::Runtime,
 }
 
 /// The run's journal, if one is open. Bridges append through it; it is
 /// `None` before the run starts and when journalling is off.
 type JournalSlot = Rc<RefCell<Option<Journal>>>;
+
+/// The run's budget; see `budget::RunBudget`.
+type BudgetSlot = Rc<RefCell<crate::budget::RunBudget>>;
 
 impl QuickJsRuntime {
     /// Creates and initializes a new QuickJS runtime instance with host globals.
@@ -534,6 +550,7 @@ impl QuickJsRuntime {
             active_servers_list,
             journal_home: None,
             journal: Rc::new(RefCell::new(None)),
+            budget: Rc::new(RefCell::new(crate::budget::RunBudget::default())),
             _tokio_rt: tokio_rt,
         };
 
@@ -881,6 +898,7 @@ impl QuickJsRuntime {
             // nothing is sent and nothing is journalled for a bad call.
             let state_ai = Rc::clone(&state);
             let journal_ai = Rc::clone(&self.journal);
+            let budget_ai = Rc::clone(&self.budget);
             let tokio_handle_ai = tokio_handle.clone();
             let ai_start_fn = Function::new(
                 ctx.clone(),
@@ -893,6 +911,22 @@ impl QuickJsRuntime {
                         Ok(client) => client,
                         Err(err) => return Some(model_error_info(err).to_string()),
                     };
+                    // The reserve is on disk before anything is sent; a call
+                    // that does not fit never opens a connection.
+                    let reserve = crate::budget::Amount {
+                        nano: crate::ai::reserve_nano(&call),
+                        tokens: crate::ai::estimate_input_tokens(&call)
+                            .saturating_add(call.max_tokens),
+                    };
+                    let reserved = budget_ai.borrow_mut().reserve(
+                        journal_ai.borrow_mut().as_mut(),
+                        "model.call",
+                        req_id,
+                        reserve,
+                    );
+                    if let Err(err) = reserved {
+                        return Some(model_error_info(err).to_string());
+                    }
                     if journal_ai.borrow().is_some() {
                         let req = crate::ai::request_record(&call);
                         track_effect(&state_ai, "model.call", req_id, req);
@@ -933,9 +967,26 @@ impl QuickJsRuntime {
             // Both bridges return the JSON of a journal failure, or null.
             let state_tool = Rc::clone(&state);
             let journal_tool = Rc::clone(&self.journal);
+            let budget_tool = Rc::clone(&self.budget);
             let tool_start_fn = Function::new(
                 ctx.clone(),
-                move |req_id: u32, name: String, args: String| -> String {
+                move |req_id: u32, name: String, args: String, cost_nano: f64| -> String {
+                    if cost_nano.is_finite() && cost_nano >= 1.0 {
+                        let reserve = crate::budget::Amount {
+                            nano: cost_nano as u64,
+                            tokens: 0,
+                        };
+                        let reserved = budget_tool.borrow_mut().reserve(
+                            journal_tool.borrow_mut().as_mut(),
+                            "tool.call",
+                            req_id,
+                            reserve,
+                        );
+                        if let Err(err) = reserved {
+                            return serde_json::json!({ "budget": model_error_info(err) })
+                                .to_string();
+                        }
+                    }
                     let mut slot = journal_tool.borrow_mut();
                     let Some(journal) = slot.as_mut() else {
                         return serde_json::json!({ "eid": null }).to_string();
@@ -969,9 +1020,20 @@ impl QuickJsRuntime {
             })?;
             let state_tool = Rc::clone(&state);
             let journal_tool = Rc::clone(&self.journal);
+            let budget_tool = Rc::clone(&self.budget);
             let tool_finish_fn = Function::new(
                 ctx.clone(),
                 move |req_id: u32, ok: bool, outcome: String| -> Option<String> {
+                    // A tool reports no usage: its declared cost stays charged.
+                    let settled = budget_tool.borrow_mut().settle(
+                        journal_tool.borrow_mut().as_mut(),
+                        "tool.call",
+                        req_id,
+                        None,
+                    );
+                    if let Err(err) = settled {
+                        return Some(serde_json::json!({ "error": err.to_string() }).to_string());
+                    }
                     let pending = state_tool
                         .borrow_mut()
                         .pending_effects
@@ -1017,7 +1079,37 @@ impl QuickJsRuntime {
             .map_err(|err| VaernError::EngineInit {
                 reason: format!("failed to create schema validate bridge: {err}"),
             })?;
+            let budget_set = Rc::clone(&self.budget);
+            let budget_set_fn = Function::new(ctx.clone(), move |request: String| -> String {
+                let request: serde_json::Value =
+                    serde_json::from_str(&request).unwrap_or(serde_json::Value::Null);
+                let limits = crate::budget::Limits {
+                    nano: request.get("nano").and_then(serde_json::Value::as_u64),
+                    tokens: request.get("tokens").and_then(serde_json::Value::as_u64),
+                };
+                let name = request.get("name").and_then(serde_json::Value::as_str);
+                match budget_set.borrow_mut().request(name, limits) {
+                    Ok(left) => serde_json::json!({
+                        "remaining": { "nano": left.nano, "tokens": left.tokens },
+                    }),
+                    Err(err) => serde_json::json!({ "error": model_error_info(err) }),
+                }
+                .to_string()
+            })
+            .map_err(|err| VaernError::EngineInit {
+                reason: format!("failed to create budget bridge: {err}"),
+            })?;
+            let budget_left = Rc::clone(&self.budget);
+            let budget_left_fn = Function::new(ctx.clone(), move || -> String {
+                let left = budget_left.borrow().remaining();
+                serde_json::json!({ "nano": left.nano, "tokens": left.tokens }).to_string()
+            })
+            .map_err(|err| VaernError::EngineInit {
+                reason: format!("failed to create budget remaining bridge: {err}"),
+            })?;
             for (name, bridge) in [
+                ("__vaern_budget_set", budget_set_fn),
+                ("__vaern_budget_remaining", budget_left_fn),
                 ("__vaern_tool_start", tool_start_fn),
                 ("__vaern_tool_finish", tool_finish_fn),
                 ("__vaern_schema_check", schema_check_fn),
@@ -2637,6 +2729,26 @@ impl QuickJsRuntime {
             Some(err) => Err(err),
             None => result,
         };
+        let charge = match &result {
+            Ok(reply) => match (reply.input_tokens, reply.output_tokens) {
+                (Some(input), Some(output)) => Some(crate::budget::Amount {
+                    nano: charged,
+                    tokens: input.saturating_add(output),
+                }),
+                _ => None,
+            },
+            Err(_) => None,
+        };
+        let settled = self.budget.borrow_mut().settle(
+            self.journal.borrow_mut().as_mut(),
+            "model.call",
+            req_id,
+            charge,
+        );
+        let result = match settled {
+            Err(err) => Err(err),
+            Ok(()) => result,
+        };
         let info = match result {
             // The reply is recorded and charged whether or not it matches the
             // schema: the call happened and was billed either way.
@@ -3081,6 +3193,12 @@ impl QuickJsRuntime {
     /// nothing.
     pub fn set_journal_home(&mut self, home: Option<PathBuf>) {
         self.journal_home = home;
+    }
+
+    /// Caps the run's budget (from `--budget-usd` and `--budget-tokens`)
+    /// and sets where named budget ledgers live.
+    pub fn set_budget(&mut self, caps: crate::budget::Limits, home: Option<PathBuf>) {
+        self.budget.borrow_mut().configure(caps, home);
     }
 
     /// Opens the run's journal and records `run.start` and the entry module.
@@ -4555,6 +4673,113 @@ mod tests {
         assert_eq!(count("model.call"), 11);
         assert_eq!(count("tool.call"), 5);
         assert_eq!(count("tool.result"), 5);
+    }
+
+    #[test]
+    fn test_a_reserve_that_does_not_fit_opens_no_connection() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        let code = format!(
+            r#"
+            import {{ model, tool, budget, BudgetError }} from "vaern:ai";
+            const left = budget({{ usd: 0.001, tokens: 5000 }});
+            if (left.usd !== 0.001 || left.tokens !== 5000) throw new Error(JSON.stringify(left));
+            const ask = {{ messages: [{{ role: "user", content: "hi" }}] }};
+            const base = "http://127.0.0.1:{port}/v1";
+            // 1000 output tokens at 10 USD per million reserve 0.01 USD.
+            const pricey = model({{ baseUrl: base, model: "m", timeoutMs: 500, maxOutputTokens: 1000,
+                                    price: {{ inputPerMTok: 1, outputPerMTok: 10 }} }});
+            const usd = await pricey.chat(ask).catch((e) => e);
+            if (!(usd instanceof BudgetError) || usd.code !== "RESERVE_EXCEEDS_REMAINING"
+                || usd.unit !== "usd" || !(usd.reserve >= 0.01) || usd.remaining !== 0.001) throw usd;
+            const wordy = model({{ baseUrl: base, model: "m", timeoutMs: 500, maxOutputTokens: 6000 }});
+            const tokens = await wordy.stream(ask).next().catch((e) => e);
+            if (tokens.unit !== "tokens" || tokens.remaining !== 5000) throw tokens;
+            const costly = tool({{ name: "costly", cost: {{ usd: 0.002 }},
+                                   run: async () => {{ throw new Error("ran"); }} }});
+            const ran = await costly.call({{}}).catch((e) => e);
+            if (!(ran instanceof BudgetError) || ran.unit !== "usd") throw ran;
+            // Raising is ignored; lowering applies.
+            if (budget({{ usd: 5 }}).usd !== 0.001 || budget({{ tokens: 10 }}).tokens !== 10) {{
+                throw new Error("limits");
+            }}
+            const late = (() => {{ try {{ budget({{ name: "late" }}); }} catch (e) {{ return e.code; }} }})();
+            if (late !== "INVALID") throw new Error(String(late));
+            console.log("refused");
+            "#
+        );
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join(".vaern");
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        runtime.set_journal_home(Some(home.clone()));
+        assert_eq!(runtime.eval("refuse.js", &code).unwrap(), 0);
+        let records = journal_records(&home);
+        let last_console = records.iter().rfind(|r| r["kind"] == "console").unwrap();
+        assert_eq!(last_console["text"], "refused\n");
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            0,
+            "a call that did not fit opened a connection"
+        );
+        assert!(!records.iter().any(|r| r["kind"] == "model.call"));
+    }
+
+    #[test]
+    fn test_budgets_settle_actual_usage_and_named_ledgers_carry_across_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join(".vaern");
+        let script = model_stub(8987)
+            + r#"
+            import { model, tool, budget } from "vaern:ai";
+            const before = budget({ name: "team", usd: 1, tokens: 1000 });
+            const m = model({ baseUrl: base + "/ok/v1", model: "m", maxOutputTokens: 64,
+                              price: { inputPerMTok: 0.15, outputPerMTok: 0.6 } });
+            await m.chat({ messages: [{ role: "user", content: "x" }] });
+            const priced = tool({ name: "priced", cost: { usd: 0.000001 }, run: async () => 1 });
+            await priced.call({});
+            const after = budget.remaining();
+            // 6000 nano-USD for the call and 1000 for the tool; 25 tokens.
+            if (Math.round((before.usd - after.usd) * 1e9) !== 7000 || before.tokens - after.tokens !== 25) {
+                throw new Error(JSON.stringify([before, after]));
+            }
+            console.log(JSON.stringify({ nano: Math.round(before.usd * 1e9), tokens: before.tokens }));
+            await stub.close();
+            "#;
+        for _ in 0..2 {
+            let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+            runtime.set_journal_home(Some(home.clone()));
+            runtime.set_budget(crate::budget::Limits::default(), Some(home.clone()));
+            assert_eq!(runtime.eval("budgeted.js", &script).unwrap(), 0);
+        }
+        // The second run started with what the first had spent.
+        let records = journal_records(&home);
+        let printed = records.iter().rfind(|r| r["kind"] == "console").unwrap();
+        assert_eq!(printed["text"], "{\"nano\":999993000,\"tokens\":975}\n");
+        let kinds: Vec<&str> = records
+            .iter()
+            .filter_map(|r| r["kind"].as_str().filter(|k| k.starts_with("budget.")))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "budget.reserve",
+                "budget.settle",
+                "budget.reserve",
+                "budget.settle"
+            ]
+        );
+        let ledger = crate::journal::verify(&home.join("budgets/team.jsonl")).unwrap();
+        assert_eq!(ledger.records, 8);
     }
 
     #[test]

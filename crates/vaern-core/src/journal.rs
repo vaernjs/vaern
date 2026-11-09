@@ -374,7 +374,7 @@ fn now_us() -> u64 {
 
 /// `YYYYMMDD-HHMMSS-xxxxxx`: the UTC start time, then six hex digits from the
 /// process id and the clock's sub-second part.
-fn run_id_now() -> String {
+pub(crate) fn run_id_now() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
