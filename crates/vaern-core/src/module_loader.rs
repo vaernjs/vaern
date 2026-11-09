@@ -20,6 +20,9 @@
 //! [`read_source`], which bounds the read before the text reaches the heap.
 
 use crate::error::{Result, VaernError};
+// Module names and stack traces show ordinary paths, with the same spelling
+// `vaern:fs` resolves to. UNC shares keep their `\\` form.
+use crate::fs::strip_verbatim;
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
 
@@ -451,19 +454,6 @@ fn stays_inside(target: &str) -> bool {
             Component::CurDir => true,
             _ => false,
         })
-}
-
-/// Drops the `\\?\` prefix Windows adds to canonical paths, so module names
-/// and stack traces show ordinary paths. UNC shares keep their `\\` form.
-fn strip_verbatim(path: PathBuf) -> PathBuf {
-    let text = path.to_string_lossy();
-    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-        return PathBuf::from(format!(r"\\{rest}"));
-    }
-    match text.strip_prefix(r"\\?\") {
-        Some(rest) => PathBuf::from(rest),
-        None => path,
-    }
 }
 
 #[cfg(test)]

@@ -276,13 +276,19 @@ returns a promise; the work runs off the JavaScript thread.
 - `appendFile(path, data)` creates the file or adds to its end.
 - A relative path resolves against the current working directory. Parent
   directories are not created.
+- Every path is resolved to the physical file it reaches before it is
+  opened: symbolic links are followed (including a link to a file that does
+  not exist yet), `..` is applied after them, and on Windows the `\\?\`
+  prefix is removed. `FsError.path` is that physical path, so a file can be
+  named with a different spelling than the one the script passed. More than
+  40 links in one path fails with `ELOOP`.
 - Files larger than 64 MiB, a quarter of the heap cap, are refused with
   `EFBIG` before any byte is read. A read under that limit whose result
   still does not fit in the heap rejects with `InternalError: out of
   memory`.
 - A failure rejects with an `FsError` whose `stage` is `resolve`, `open`,
   `read` or `write`, whose `code` is `ENOENT`, `EACCES`, `EEXIST`, `EISDIR`,
-  `ENOTDIR`, `EFBIG` or `EIO`, whose `path` is the absolute path, and whose
+  `ENOTDIR`, `EFBIG`, `ELOOP` or `EIO`, whose `path` is the physical path, and whose
   `action` says what to do next. A bad argument (a non-string path, an
   unsupported encoding or flag, data of another type) rejects with
   `TypeError`.

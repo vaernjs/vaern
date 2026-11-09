@@ -7,9 +7,11 @@
 //! only sees "os error 2" cannot tell a missing file from a missing parent.
 //!
 //! No policy is applied here: a path is opened with the permissions of the
-//! process. Policy hooks are reserved for the capability enforcer (P4,
-//! v0.1.1), which will check the absolute path returned by [`resolve`] before
-//! any open, so every operation already passes through that single point.
+//! process. [`resolve`] is the single point every operation passes through,
+//! and it returns the physical path the open will reach: symlinks followed,
+//! `..` applied after them, and Windows verbatim prefixes removed. A policy
+//! check on its result therefore sees the file the operating system opens,
+//! not a spelling that a link or a `..` can point somewhere else.
 
 use crate::error::{Result, VaernError};
 use std::io::{Read, Write};
@@ -74,11 +76,89 @@ pub fn run(op: FsOp) -> Result<FsOutput> {
     }
 }
 
-/// Turns a script-supplied path into the absolute path every later stage,
+/// Links followed while resolving one path before it fails with `ELOOP`,
+/// matching the usual operating-system limit.
+const MAX_LINK_HOPS: u32 = 40;
+
+/// Turns a script-supplied path into the physical path every later stage,
 /// and every error, refers to. Relative paths resolve against the current
 /// working directory.
+///
+/// The deepest part of the path that exists is canonicalized; the rest is
+/// appended unchanged, so a file about to be created still resolves. A link
+/// whose target does not exist yet is followed to that target, because a
+/// write through it creates the file there.
 pub fn resolve(path: &str) -> Result<PathBuf> {
-    std::path::absolute(path).map_err(|err| fs_error("resolve", Path::new(path), &err))
+    let absolute =
+        std::path::absolute(path).map_err(|err| fs_error("resolve", Path::new(path), &err))?;
+    physical(&absolute, 0)
+}
+
+fn physical(path: &Path, hops: u32) -> Result<PathBuf> {
+    if hops > MAX_LINK_HOPS {
+        return Err(VaernError::Fs {
+            stage: "resolve".to_string(),
+            code: "ELOOP".to_string(),
+            path: path.display().to_string(),
+            message: format!("more than {MAX_LINK_HOPS} symbolic links in the path"),
+            action: "Remove the link cycle, or pass a path that does not go through it."
+                .to_string(),
+        });
+    }
+    let mut existing = path;
+    let mut missing = Vec::new();
+    while std::fs::symlink_metadata(existing).is_err() {
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name.to_os_string());
+                existing = parent;
+            }
+            // `..` as the last component has no file name. Under a directory
+            // that does not exist, the open fails with ENOENT; say so here,
+            // since the path cannot be given a physical form.
+            _ => {
+                return Err(fs_error(
+                    "resolve",
+                    path,
+                    &std::io::Error::from(std::io::ErrorKind::NotFound),
+                ));
+            }
+        }
+    }
+
+    let base = match std::fs::canonicalize(existing) {
+        Ok(base) => strip_verbatim(base),
+        Err(err) => match std::fs::read_link(existing) {
+            // A dangling link: carry on from its target.
+            Ok(target) => {
+                let parent = existing.parent().unwrap_or(existing);
+                let mut next = parent.join(target);
+                for name in missing.iter().rev() {
+                    next.push(name);
+                }
+                return physical(&next, hops + 1);
+            }
+            Err(_) => return Err(fs_error("resolve", existing, &err)),
+        },
+    };
+    let mut resolved = base;
+    for name in missing.iter().rev() {
+        resolved.push(name);
+    }
+    Ok(resolved)
+}
+
+/// Removes the `\\?\` prefix Windows adds to canonical paths, so a path has
+/// one spelling whether or not it went through `canonicalize`.
+pub(crate) fn strip_verbatim(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) => PathBuf::from(rest),
+        None => path,
+    }
 }
 
 fn read(path: &Path) -> Result<Vec<u8>> {
@@ -191,7 +271,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("vaern-fs-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        // The physical spelling: errors name the path `resolve` returns, and
+        // the temp directory is itself a link on macOS and a short 8.3 name
+        // on some Windows accounts.
+        strip_verbatim(std::fs::canonicalize(&dir).unwrap())
     }
 
     fn code_of(err: VaernError) -> (String, String) {
@@ -299,6 +382,105 @@ mod tests {
             other => panic!("expected bytes, got {other:?}"),
         }
         std::fs::remove_file(&file).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn link_dir(target: &Path, link: &Path) {
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn link_dir(target: &Path, link: &Path) {
+        std::os::windows::fs::symlink_dir(target, link).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn link_file(target: &Path, link: &Path) {
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn link_file(target: &Path, link: &Path) {
+        std::os::windows::fs::symlink_file(target, link).unwrap();
+    }
+
+    fn real(path: &Path) -> PathBuf {
+        strip_verbatim(std::fs::canonicalize(path).unwrap())
+    }
+
+    #[test]
+    fn test_resolve_follows_links_before_a_policy_could_see_the_path() {
+        let dir = scratch("links");
+        let outside = dir.join("outside");
+        let project = dir.join("project");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(project.join("sub")).unwrap();
+        link_dir(&outside, &project.join("link"));
+
+        // An existing file reached through a link.
+        std::fs::write(outside.join("secret.txt"), b"s").unwrap();
+        let through = project.join("link").join("secret.txt");
+        assert_eq!(
+            resolve(&through.display().to_string()).unwrap(),
+            real(&outside).join("secret.txt")
+        );
+
+        // A file about to be created through a link.
+        let new = project.join("link").join("new.txt");
+        assert_eq!(
+            resolve(&new.display().to_string()).unwrap(),
+            real(&outside).join("new.txt")
+        );
+
+        // A dangling link to a file a write would create elsewhere.
+        link_file(&outside.join("later.txt"), &project.join("later"));
+        assert_eq!(
+            resolve(&project.join("later").display().to_string()).unwrap(),
+            real(&outside).join("later.txt")
+        );
+
+        // `..` inside the project is applied, and the result is one spelling.
+        let dotted = project.join("sub").join("..").join("a.txt");
+        assert_eq!(
+            resolve(&dotted.display().to_string()).unwrap(),
+            real(&project).join("a.txt")
+        );
+    }
+
+    #[test]
+    fn test_resolve_refuses_parent_steps_under_a_missing_directory() {
+        let dir = scratch("missing-parent");
+        let path = dir.join("nope").join("..");
+        let err = resolve(&path.display().to_string());
+        // Windows applies `..` before any lookup, as its own open does.
+        if cfg!(windows) {
+            assert_eq!(err.unwrap(), real(&dir));
+        } else {
+            assert_eq!(
+                code_of(err.unwrap_err()),
+                ("resolve".to_string(), "ENOENT".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_stops_at_a_link_cycle() {
+        let dir = scratch("cycle");
+        link_file(&dir.join("b"), &dir.join("a"));
+        link_file(&dir.join("a"), &dir.join("b"));
+        let err = resolve(&dir.join("a").display().to_string()).unwrap_err();
+        assert_eq!(code_of(err), ("resolve".to_string(), "ELOOP".to_string()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_verbatim_and_plain_spellings_resolve_alike() {
+        let dir = scratch("verbatim");
+        std::fs::write(dir.join("f.txt"), b"x").unwrap();
+        let plain = real(&dir).join("f.txt");
+        let verbatim = format!(r"\\?\{}", plain.display());
+        assert_eq!(resolve(&verbatim).unwrap(), plain);
+        assert_eq!(resolve(&plain.display().to_string()).unwrap(), plain);
     }
 
     #[test]
