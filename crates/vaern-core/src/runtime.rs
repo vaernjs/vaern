@@ -1095,6 +1095,12 @@ impl QuickJsRuntime {
                     Promise.resolve().then(cb);
                 };
 
+                // Resolves after one pass of the event loop, through the timer
+                // captured here so a script that replaces setTimeout does not
+                // change it.
+                const __setTimeoutOwn = globalThis.setTimeout;
+                const __yieldToEventLoop = () => new Promise((resolve) => __setTimeoutOwn(resolve, 0));
+
                 // QuickJS keeps only the frames in `stack`, so the name and
                 // message line is added here, as other runtimes print it.
                 function __formatError(err, depth) {
@@ -2124,8 +2130,18 @@ impl QuickJsRuntime {
                             if (response._isStream || (response.body && typeof response.body.getReader === 'function')) {
                                 __vaern_server_respond_stream_start(reqInfo.reqId, status, statusText, headersList);
                                 const reader = response.body.getReader();
+                                // Reads of an already-filled stream settle as
+                                // microtasks, so a fast client would let the
+                                // pump hold the thread for the whole body;
+                                // every 16 chunks it lets timers and other
+                                // events run.
+                                let sinceYield = 0;
                                 try {
                                     while (true) {
+                                        if (++sinceYield > 16) {
+                                            sinceYield = 0;
+                                            await __yieldToEventLoop();
+                                        }
                                         const { done, value } = await reader.read();
                                         if (done) {
                                             __vaern_server_respond_stream_chunk(reqInfo.reqId, "", true);
@@ -3043,6 +3059,41 @@ mod tests {
         let exit_code = runtime.eval("stalled_stream.ts", code).unwrap();
         client.join().unwrap();
         assert_eq!(exit_code, 0);
+    }
+
+    #[test]
+    fn test_streaming_a_queued_body_to_a_fast_client_lets_timers_run() {
+        // All 32 MiB is queued up front and the client keeps up, so the pump
+        // never waits for buffer room; without yielding it would hold the
+        // thread for the whole body (about 3 s in a debug build).
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        let code = r#"
+            import { serve } from "vaern:http";
+            let last = Date.now();
+            let maxGap = 0;
+            const ticker = setInterval(() => {
+                const now = Date.now();
+                maxGap = Math.max(maxGap, now - last);
+                last = now;
+            }, 10);
+            const chunk = new Uint8Array(64 * 1024);
+            const server = serve(() => new Response(new ReadableStream({
+                start(c) {
+                    for (let i = 0; i < 512; i++) c.enqueue(chunk);
+                    c.close();
+                },
+            })), { port: 8994, hostname: "127.0.0.1" });
+            const res = await fetch("http://127.0.0.1:8994/");
+            const body = await res.arrayBuffer();
+            maxGap = Math.max(maxGap, Date.now() - last);
+            clearInterval(ticker);
+            await server.close();
+            if (body.byteLength !== 512 * 64 * 1024 || maxGap > 1000) {
+                console.error(`${body.byteLength} bytes, timers stalled for ${maxGap} ms`);
+                process.exitCode = 1;
+            }
+        "#;
+        assert_eq!(runtime.eval("fast_stream.ts", code).unwrap(), 0);
     }
 
     #[test]
