@@ -628,19 +628,7 @@ impl QuickJsRuntime {
                       payload: String|
                       -> rquickjs::Result<()> {
                     let data = if kind == "bytes" {
-                        let mut bytes = Vec::with_capacity(payload.len());
-                        for ch in payload.chars() {
-                            match u8::try_from(u32::from(ch)) {
-                                Ok(byte) => bytes.push(byte),
-                                Err(_) => {
-                                    return Err(rquickjs::Exception::throw_type(
-                                        &ctx,
-                                        "vaern:fs: byte string holds a value above 0xFF",
-                                    ));
-                                }
-                            }
-                        }
-                        bytes
+                        crate::webapi::latin1_to_bytes(&ctx, &payload, "vaern:fs")?
                     } else {
                         payload.into_bytes()
                     };
@@ -917,16 +905,13 @@ impl QuickJsRuntime {
             let tokio_handle_chunk = tokio_handle.clone();
             let server_stream_chunk_fn = Function::new(
                 ctx.clone(),
-                move |req_id: f64, chunk_val: Value<'_>, is_done: bool| -> rquickjs::Result<bool> {
+                // The chunk arrives as a byte string (see webapi::latin1_to_bytes).
+                // It used to be a JS number array read back one element at a
+                // time, about 9 ms per 64 KiB in a debug build, all of it on
+                // the JavaScript thread while timers waited.
+                move |ctx: Ctx<'_>, req_id: f64, chunk: String, is_done: bool| -> rquickjs::Result<bool> {
                     let req_id_u64 = req_id as u64;
-                    let mut chunk_bytes = Vec::new();
-                    if let Some(arr) = chunk_val.as_array() {
-                        for i in 0..arr.len() {
-                            if let Ok(num) = arr.get::<u32>(i) {
-                                chunk_bytes.push(num as u8);
-                            }
-                        }
-                    }
+                    let chunk_bytes = crate::webapi::latin1_to_bytes(&ctx, &chunk, "response stream")?;
 
                     // Returns true when the chunk is queued. False means it is
                     // waiting for buffer space on a Tokio task, and JS must await
@@ -938,7 +923,7 @@ impl QuickJsRuntime {
                     {
                         if state_stream_chunk.borrow().stream_sends_waiting.contains(&req_id_u64) {
                             return Err(rquickjs::Exception::throw_message(
-                                chunk_val.ctx(),
+                                &ctx,
                                 "response stream: a chunk was written while the previous one was still waiting for the client; await each write",
                             ));
                         }
@@ -951,7 +936,7 @@ impl QuickJsRuntime {
                             Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
                                 state_stream_chunk.borrow_mut().server_stream_senders.remove(&req_id_u64);
                                 let err = stream_closed(req_id_u64);
-                                return Err(rquickjs::Exception::throw_message(chunk_val.ctx(), &err.to_string()));
+                                return Err(rquickjs::Exception::throw_message(&ctx, &err.to_string()));
                             }
                             Err(tokio::sync::mpsc::error::TrySendError::Full(())) => Some(chunk),
                         };
@@ -2066,18 +2051,18 @@ impl QuickJsRuntime {
                                     while (true) {
                                         const { done, value } = await reader.read();
                                         if (done) {
-                                            __vaern_server_respond_stream_chunk(reqInfo.reqId, [], true);
+                                            __vaern_server_respond_stream_chunk(reqInfo.reqId, "", true);
                                             break;
                                         }
                                         let chunkBytes;
                                         if (typeof value === 'string') {
-                                            chunkBytes = Array.from(new TextEncoder().encode(value));
+                                            chunkBytes = new TextEncoder().encode(value);
                                         } else if (value instanceof Uint8Array) {
-                                            chunkBytes = Array.from(value);
+                                            chunkBytes = value;
                                         } else {
-                                            chunkBytes = Array.from(new TextEncoder().encode(String(value)));
+                                            chunkBytes = new TextEncoder().encode(String(value));
                                         }
-                                        if (!__vaern_server_respond_stream_chunk(reqInfo.reqId, chunkBytes, false)) {
+                                        if (!__vaern_server_respond_stream_chunk(reqInfo.reqId, __latin1(chunkBytes), false)) {
                                             await new Promise((resolve, reject) => {
                                                 __streamWaits.set(reqInfo.reqId, { resolve, reject });
                                             });
@@ -2085,7 +2070,7 @@ impl QuickJsRuntime {
                                     }
                                 } catch (streamErr) {
                                     __vaern_print(1, `[ERROR] Stream read error: ${streamErr}`);
-                                    __vaern_server_respond_stream_chunk(reqInfo.reqId, [], true);
+                                    __vaern_server_respond_stream_chunk(reqInfo.reqId, "", true);
                                 }
                             } else {
                                 let bodyBytes = [];
@@ -3202,6 +3187,33 @@ mod tests {
             process.exitCode = bytes.join(",") === "255,0,195" ? 0 : 1;
         "#;
         assert_eq!(runtime.eval("binary_body.js", code).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_served_stream_carries_every_byte_value_and_view_offsets() {
+        // Chunks cross the bridge as byte strings; every value 0x00..0xFF must
+        // survive, and a view must contribute only its own window.
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        let code = r#"
+            import { serve } from "vaern:http";
+            const all = new Uint8Array(256 + 32);
+            for (let i = 0; i < all.length; i++) all[i] = (i - 16) & 0xff;
+            const server = serve(() => new Response(new ReadableStream({
+                start(c) {
+                    c.enqueue(all.subarray(16, 16 + 256));
+                    c.enqueue("é\u{1F600}");
+                    c.close();
+                },
+            })), { port: 8995, hostname: "127.0.0.1" });
+            const res = await fetch("http://127.0.0.1:8995/");
+            const got = new Uint8Array(await res.arrayBuffer());
+            await server.close();
+            const want = [...Array(256).keys(), ...new TextEncoder().encode("é\u{1F600}")];
+            const same = got.length === want.length && want.every((b, i) => got[i] === b);
+            if (!same) console.error(`got ${got.length} bytes: ${got.slice(0, 8).join(",")}...`);
+            process.exitCode = same ? 0 : 1;
+        "#;
+        assert_eq!(runtime.eval("byte_values.js", code).unwrap(), 0);
     }
 
     #[test]

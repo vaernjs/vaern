@@ -16,25 +16,37 @@ use rquickjs::function::Opt;
 use rquickjs::{Ctx, Function, Object, TypedArray};
 use url::{Url, form_urlencoded, quirks};
 
+/// Turns a byte string from the prelude's `__latin1` back into bytes.
+///
+/// rquickjs exposes typed-array memory only through `unsafe` accessors, so
+/// bytes cross the bridge as a string with one code unit per byte. `what`
+/// names the caller in the `TypeError` thrown for a code unit above 0xFF.
+pub(crate) fn latin1_to_bytes(
+    ctx: &Ctx<'_>,
+    latin1: &str,
+    what: &str,
+) -> rquickjs::Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(latin1.len());
+    for ch in latin1.chars() {
+        match u8::try_from(u32::from(ch)) {
+            Ok(byte) => bytes.push(byte),
+            Err(_) => {
+                return Err(rquickjs::Exception::throw_type(
+                    ctx,
+                    &format!("{what}: byte string holds a value above 0xFF"),
+                ));
+            }
+        }
+    }
+    Ok(bytes)
+}
+
 /// Registers the native helpers on the global object.
 pub fn register<'js>(ctx: &Ctx<'js>, globals: &Object<'js>) -> Result<()> {
-    // rquickjs exposes typed-array memory only through `unsafe` accessors, so
-    // the prelude passes bytes as a Latin-1 string, one code unit per byte.
     let decode = Function::new(
         ctx.clone(),
         |ctx: Ctx<'js>, latin1: String, fatal: bool| -> rquickjs::Result<String> {
-            let mut bytes = Vec::with_capacity(latin1.len());
-            for ch in latin1.chars() {
-                match u8::try_from(u32::from(ch)) {
-                    Ok(byte) => bytes.push(byte),
-                    Err(_) => {
-                        return Err(rquickjs::Exception::throw_type(
-                            &ctx,
-                            "TextDecoder.decode: byte string holds a value above 0xFF",
-                        ));
-                    }
-                }
-            }
+            let bytes = latin1_to_bytes(&ctx, &latin1, "TextDecoder.decode")?;
             if fatal {
                 String::from_utf8(bytes).map_err(|err| {
                     rquickjs::Exception::throw_type(
