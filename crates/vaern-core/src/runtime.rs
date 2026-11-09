@@ -122,6 +122,63 @@ impl Resolver for VaernModuleResolver {
 
 struct VaernModuleLoader {
     transpiler: SwcTranspiler,
+    /// Real paths of the working directory and the entry script's directory.
+    /// Parse errors in modules outside both keep their location and lose
+    /// their message, which can quote the offending token.
+    project_roots: Vec<PathBuf>,
+}
+
+impl VaernModuleLoader {
+    fn new(transpiler: SwcTranspiler, base_dir: &Path) -> Self {
+        let real = |path: &Path| {
+            std::fs::canonicalize(path)
+                .ok()
+                .map(crate::fs::strip_verbatim)
+        };
+        let project_roots = [std::env::current_dir().ok(), Some(base_dir.to_path_buf())]
+            .into_iter()
+            .flatten()
+            .filter_map(|dir| real(&dir))
+            .collect();
+        Self {
+            transpiler,
+            project_roots,
+        }
+    }
+
+    fn outside_project(&self, name: &str) -> bool {
+        match std::fs::canonicalize(name) {
+            Ok(path) => {
+                let path = crate::fs::strip_verbatim(path);
+                !self.project_roots.iter().any(|root| path.starts_with(root))
+            }
+            Err(_) => true,
+        }
+    }
+}
+
+/// The message for a module outside the project that fails to parse.
+fn redacted_parse_error(name: &str, location: Option<(usize, usize)>) -> rquickjs::Error {
+    let place = match location {
+        Some((line, col)) => format!(" at line {line}, column {col}"),
+        None => String::new(),
+    };
+    rquickjs::Error::new_loading_message(
+        name,
+        format!(
+            "the module failed to parse{place}; the parser's message is not shown for files outside the project, because it can quote their contents"
+        ),
+    )
+}
+
+/// `line:col` from the first stack line that ends with one.
+fn stack_location(stack: &str) -> Option<(usize, usize)> {
+    stack.lines().find_map(|line| {
+        let line = line.trim().trim_end_matches(')');
+        let (rest, col) = line.rsplit_once(':')?;
+        let (_, row) = rest.rsplit_once(':')?;
+        Some((row.parse().ok()?, col.parse().ok()?))
+    })
 }
 
 impl Loader for VaernModuleLoader {
@@ -150,14 +207,34 @@ impl Loader for VaernModuleLoader {
         let content = FsModuleLoader
             .load(Path::new(name))
             .map_err(|err| rquickjs::Error::new_loading_message(name, err.to_string()))?;
+        let outside = self.outside_project(name);
         let transpiled = if name.ends_with(".ts") {
             self.transpiler
                 .transpile(name, &content)
-                .map_err(|err| rquickjs::Error::new_loading_message(name, format!("{err}")))?
+                .map_err(|err| match err {
+                    VaernError::Syntax { line, col, .. }
+                    | VaernError::UnsupportedFeature { line, col, .. }
+                        if outside =>
+                    {
+                        redacted_parse_error(name, Some((line, col)))
+                    }
+                    _ if outside => redacted_parse_error(name, None),
+                    other => rquickjs::Error::new_loading_message(name, format!("{other}")),
+                })?
         } else {
             content
         };
-        Module::declare(ctx.clone(), name, transpiled)
+        match Module::declare(ctx.clone(), name, transpiled) {
+            Err(rquickjs::Error::Exception) if outside => {
+                let thrown = ctx.catch();
+                let stack = thrown
+                    .as_object()
+                    .and_then(|obj| obj.get::<_, String>("stack").ok())
+                    .unwrap_or_default();
+                Err(redacted_parse_error(name, stack_location(&stack)))
+            }
+            other => other,
+        }
     }
 }
 
@@ -2562,14 +2639,13 @@ impl Runtime for QuickJsRuntime {
 
         let base_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
 
+        let loader = VaernModuleLoader::new(self.transpiler.clone(), &base_dir);
         self.qjs_runtime.set_loader(
             VaernModuleResolver {
                 base_dir,
                 failure: Rc::clone(&self.resolve_failure),
             },
-            VaernModuleLoader {
-                transpiler: self.transpiler.clone(),
-            },
+            loader,
         );
 
         let eval_result = self.context.with(|ctx| -> rquickjs::Result<()> {
@@ -2613,14 +2689,13 @@ impl Runtime for QuickJsRuntime {
         };
 
         let base_dir = Path::new(".").to_path_buf();
+        let loader = VaernModuleLoader::new(self.transpiler.clone(), &base_dir);
         self.qjs_runtime.set_loader(
             VaernModuleResolver {
                 base_dir,
                 failure: Rc::clone(&self.resolve_failure),
             },
-            VaernModuleLoader {
-                transpiler: self.transpiler.clone(),
-            },
+            loader,
         );
 
         let eval_result = self.context.with(|ctx| -> rquickjs::Result<()> {
@@ -3446,6 +3521,41 @@ mod tests {
             Err(other) => panic!("expected SourceTooLarge, got {other}"),
             Ok(code) => panic!("expected SourceTooLarge, ran with status {code}"),
         }
+    }
+
+    #[test]
+    fn test_parse_errors_outside_the_project_do_not_quote_the_file() {
+        let root = tempfile::tempdir().unwrap();
+        let secret = root.path().join("secret");
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&secret).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(secret.join("ini.js"), "[default]\nkey=TOKEN\n").unwrap();
+        std::fs::write(secret.join("ini.ts"), "[default]\nkey=TOKEN\n").unwrap();
+        std::fs::write(project.join("own.js"), "[default]\n").unwrap();
+        let main = project.join("main.js");
+        std::fs::write(
+            &main,
+            r#"
+            const seen = [];
+            for (const f of ["../secret/ini.js", "../secret/ini.ts", "./own.js"]) {
+                try { await import(f); } catch (e) { seen.push(String(e.message)); }
+            }
+            const [js, ts, own] = seen;
+            const hidden = (m) => !m.includes("default") && !m.includes("TOKEN")
+                && m.includes("not shown for files outside the project");
+            process.exitCode =
+                (hidden(js) && js.includes("line 1, column") ? 0 : 1) |
+                (hidden(ts) && ts.includes("line 1, column") ? 0 : 2) |
+                (own.includes("default") ? 0 : 4);
+            if (process.exitCode) console.error(seen.join("\n"));
+            "#,
+        )
+        .unwrap();
+        // The working directory (the crate) does not contain the temp tree,
+        // so only the entry script's directory is the project.
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        assert_eq!(runtime.run_file(&main).unwrap(), 0);
     }
 
     #[test]

@@ -114,6 +114,7 @@ impl ModuleLoader for FsModuleLoader {
                     "Check the path; relative imports need the exact file name, extension included.",
                 ));
             }
+            check_package_containment(&failure, &normalized)?;
             return Ok(normalized);
         }
         if specifier.starts_with("node:") {
@@ -281,6 +282,8 @@ fn resolve_package(
         ));
     }
 
+    check_package_containment(failure, &file)?;
+
     // Canonical names give a package one module identity however it is
     // reached, and follow links such as those a pnpm store creates.
     let canonical = std::fs::canonicalize(&file)
@@ -293,6 +296,72 @@ fn resolve_package(
             )
         })?;
     Ok(canonical)
+}
+
+/// Refuses a module file under `node_modules/<package>` whose real path
+/// leaves that package's real directory.
+///
+/// Links are followed on purpose: a pnpm store or `npm link` puts the real
+/// package elsewhere, and its files then live inside that real directory. A
+/// single file linked out of its package, such as `index.js` pointing at a
+/// credentials file, would otherwise let an installed package read the first
+/// tokens of any file through a parse or reference error. The target is not
+/// named in the error for the same reason.
+fn check_package_containment(failure: &Failure<'_>, file: &Path) -> Result<()> {
+    let lexical = lexical_absolute(file);
+    let Some(root) = package_root_of(&lexical) else {
+        return Ok(());
+    };
+    let real = |path: &Path| std::fs::canonicalize(path).map(strip_verbatim);
+    match (real(&root), real(&lexical)) {
+        (Ok(root_real), Ok(file_real)) if file_real.starts_with(&root_real) => Ok(()),
+        (Ok(_), Ok(_)) => Err(failure.error(
+            &format!(
+                "the file links outside its package directory {}",
+                root.display()
+            ),
+            vec![lexical.display().to_string()],
+            "Remove the link or reinstall the package; a package's files must stay inside its own directory.",
+        )),
+        (Err(err), _) | (_, Err(err)) => Err(failure.error(
+            &format!("the file cannot be resolved to a real path: {err}"),
+            vec![lexical.display().to_string()],
+            "Check the permissions of the package directory.",
+        )),
+    }
+}
+
+/// Absolute form of `path` with `.` and `..` applied by name, so the package
+/// a file belongs to is judged by how it was reached.
+fn lexical_absolute(path: &Path) -> PathBuf {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut out = PathBuf::new();
+    for part in absolute.components() {
+        match part {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// `…/node_modules/<name>` or `…/node_modules/@scope/<name>` for the last
+/// `node_modules` in `path`, if there is one.
+fn package_root_of(path: &Path) -> Option<PathBuf> {
+    let parts: Vec<Component<'_>> = path.components().collect();
+    let at = parts
+        .iter()
+        .rposition(|part| part.as_os_str() == "node_modules")?;
+    let mut root: PathBuf = parts[..=at].iter().collect();
+    let first = parts.get(at + 1)?;
+    root.push(first);
+    if first.as_os_str().to_string_lossy().starts_with('@') {
+        root.push(parts.get(at + 2)?);
+    }
+    Some(root)
 }
 
 fn read_manifest(failure: &Failure<'_>, path: &Path) -> Result<Value> {
@@ -742,6 +811,98 @@ mod tests {
                 "{specifier}: {reason}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    fn link(target: &Path, link: &Path, _dir: bool) {
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn link(target: &Path, link: &Path, dir: bool) {
+        if dir {
+            std::os::windows::fs::symlink_dir(target, link).unwrap();
+        } else {
+            std::os::windows::fs::symlink_file(target, link).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_package_files_linked_out_of_their_package_are_refused() {
+        let root = tree(&[
+            ("secret/credentials.js", "[default]\nkey = TOKEN\n"),
+            (
+                "app/node_modules/evil/package.json",
+                r#"{"type": "module", "main": "index.js"}"#,
+            ),
+            (
+                "app/node_modules/sneaky/package.json",
+                r#"{"type": "module", "main": "index.js"}"#,
+            ),
+            ("app/node_modules/sneaky/index.js", "import './lib.js';"),
+            ("app/main.js", ""),
+        ]);
+        let secret = root.path().join("secret/credentials.js");
+        link(
+            &secret,
+            &root.path().join("app/node_modules/evil/index.js"),
+            false,
+        );
+        link(
+            &secret,
+            &root.path().join("app/node_modules/sneaky/lib.js"),
+            false,
+        );
+
+        // The entry point itself links out.
+        let (reason, tried) =
+            reason_and_tried(resolve_from(&root, "app/main.js", "evil").unwrap_err());
+        assert!(
+            reason.contains("links outside its package directory"),
+            "{reason}"
+        );
+        assert!(
+            !reason.contains("secret"),
+            "the target must not be named: {reason}"
+        );
+        assert!(tried[0].ends_with("index.js"), "{tried:?}");
+
+        // A relative import inside the package links out.
+        let entry = resolve_from(&root, "app/main.js", "sneaky").unwrap();
+        let err = FsModuleLoader.resolve("./lib.js", &entry).unwrap_err();
+        let (reason, _) = reason_and_tried(err);
+        assert!(
+            reason.contains("links outside its package directory"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn test_linked_package_directories_still_resolve() {
+        // pnpm and `npm link` put the real package elsewhere and link the
+        // whole directory; its files stay inside that real directory.
+        let root = tree(&[
+            (
+                "store/real-pkg/package.json",
+                r#"{"type": "module", "main": "index.js"}"#,
+            ),
+            ("store/real-pkg/index.js", "import './lib.js';"),
+            ("store/real-pkg/lib.js", ""),
+            ("app/main.js", ""),
+        ]);
+        std::fs::create_dir_all(root.path().join("app/node_modules")).unwrap();
+        link(
+            &root.path().join("store/real-pkg"),
+            &root.path().join("app/node_modules/linked"),
+            true,
+        );
+        let entry = resolve_from(&root, "app/main.js", "linked").unwrap();
+        assert_eq!(entry, real(&root, "store/real-pkg/index.js"));
+        let lib = FsModuleLoader.resolve("./lib.js", &entry).unwrap();
+        assert_eq!(
+            strip_verbatim(std::fs::canonicalize(lib).unwrap()),
+            real(&root, "store/real-pkg/lib.js")
+        );
     }
 
     #[test]

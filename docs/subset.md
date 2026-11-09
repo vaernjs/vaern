@@ -63,6 +63,15 @@ web or Node.js behaviour of the same name.
 - The resolved file is reached through its real path, so a linked package
   (as a pnpm store creates) is one module however it is imported. `.ts`
   files inside packages have their types removed as usual.
+- A file under `node_modules/<package>` whose real path leaves that
+  package's real directory, such as an `index.js` linked to a file elsewhere,
+  is refused before it is read. Linking the whole package directory, as pnpm
+  and `npm link` do, is unaffected.
+- A module outside the project (the working directory and the entry
+  script's directory) that fails to parse reports its location but not the
+  parser's message, which can quote the file's contents. Errors thrown while
+  such a module runs are reported as usual; no policy applies to which files
+  a script imports yet.
 - A failed import reports the specifier, the importer, the reason, every
   path or `package.json` field tried, and what to do next.
 
