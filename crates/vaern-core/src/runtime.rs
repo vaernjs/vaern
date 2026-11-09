@@ -899,7 +899,15 @@ impl QuickJsRuntime {
                     let tx = state_ai.borrow().events_tx.clone();
                     state_ai.borrow_mut().pending_models += 1;
                     tokio_handle_ai.spawn(async move {
-                        let result = crate::ai::send(&client, &call).await;
+                        let result = if call.stream {
+                            let deltas = tx.clone();
+                            crate::ai_stream::send(&client, &call, move |delta| {
+                                let _ = deltas.send(LoopEvent::ModelDelta(req_id, delta));
+                            })
+                            .await
+                        } else {
+                            crate::ai::send(&client, &call).await
+                        };
                         let _ = tx.send(LoopEvent::ModelDone(Box::new(ModelCompletion {
                             req_id,
                             call,
@@ -2779,6 +2787,20 @@ impl QuickJsRuntime {
                 }
                 self.dispatch_model_completion(completion);
             }
+            LoopEvent::ModelDelta(req_id, delta) => {
+                let delivered = self.context.with(|ctx| -> rquickjs::Result<()> {
+                    let deliver: Function = ctx.globals().get("__vaern_model_delta")?;
+                    deliver.call::<_, ()>((req_id, delta))
+                });
+                if let Err(err) = delivered {
+                    let mut s = self.state.borrow_mut();
+                    if s.unhandled_error.is_none() {
+                        s.unhandled_error = Some(format!(
+                            "vaern:ai stream {req_id} could not deliver a fragment to the script: {err}"
+                        ));
+                    }
+                }
+            }
             LoopEvent::ServerClosed(closed_server_id) => {
                 if self.state.borrow().active_servers > 0 {
                     self.state.borrow_mut().active_servers -= 1;
@@ -4074,7 +4096,9 @@ mod tests {
 
     /// An OpenAI-compatible stub on `port`. `/ok/` answers with usage,
     /// `/nousage/` without it, `/fail/` with a 500, `/junk/` with text, and
-    /// `/echo/` with the first message's content as the reply.
+    /// `/echo/` with the first message's content as the reply. `/sse/`
+    /// streams that content word by word, and `/sse-cut/` stops before the
+    /// stream is finished.
     fn model_stub(port: u16) -> String {
         format!(
             r#"
@@ -4085,6 +4109,18 @@ mod tests {
                 seen.push({{ url: req.url, auth: req.headers.get("authorization"), body }});
                 if (req.url.includes("/fail/")) return new Response("overloaded", {{ status: 500 }});
                 if (req.url.includes("/junk/")) return new Response("<html>");
+                if (req.url.includes("/sse")) {{
+                    const words = body.messages[0].content.split(" ");
+                    const event = (data) => "data: " + JSON.stringify(data) + "\n\n";
+                    let sse = words.map((w, i) =>
+                        event({{ choices: [{{ delta: {{ content: (i ? " " : "") + w }} }}] }})).join("");
+                    if (!req.url.includes("/sse-cut/")) {{
+                        sse += event({{ choices: [{{ delta: {{}}, finish_reason: "stop" }}] }});
+                        sse += event({{ choices: [], usage: {{ prompt_tokens: 4, completion_tokens: words.length }} }});
+                        sse += "data: [DONE]\n\n";
+                    }}
+                    return new Response(sse, {{ headers: {{ "content-type": "text/event-stream" }} }});
+                }}
                 const content = req.url.includes("/echo/")
                     ? body.messages[0].content : "hi " + body.messages[0].content;
                 const reply = {{
@@ -4193,6 +4229,67 @@ mod tests {
         let calls = records.iter().filter(|r| r["kind"] == "model.call");
         assert!(calls.clone().all(|r| r["res"]["status"] == 200));
         assert_eq!(calls.count(), 4);
+    }
+
+    #[test]
+    fn test_streamed_replies_arrive_in_order_and_are_journalled_as_received() {
+        let code = model_stub(8989)
+            + r#"
+            import { model, ModelError } from "vaern:ai";
+            // 1 USD per million tokens is 1000 nano-USD per token.
+            const m = model({ baseUrl: base + "/sse/v1", model: "m",
+                              price: { inputPerMTok: 1, outputPerMTok: 1 } });
+            const ask = (content) => ({ messages: [{ role: "user", content }] });
+
+            const lazy = m.stream(ask("never read"));
+            await new Promise((r) => setTimeout(r, 20));
+            if (seen.length !== 0) throw new Error("an unread stream was sent");
+
+            const events = [];
+            for await (const ev of m.stream(ask("one two three"))) events.push(ev);
+            const deltas = events.filter((e) => !e.done).map((e) => e.delta);
+            if (deltas.join("|") !== "one| two| three") throw new Error(deltas.join("|"));
+            const last = events[events.length - 1];
+            if (!last.done || last.text !== "one two three" || last.finishReason !== "stop"
+                || last.usage.inputTokens !== 4 || last.usage.outputTokens !== 3
+                || last.costUsd !== 7000 / 1e9) throw new Error(JSON.stringify(last));
+            const sent = seen[0].body;
+            if (sent.stream !== true || sent.stream_options?.include_usage !== true) {
+                throw new Error(JSON.stringify(sent));
+            }
+
+            for await (const ev of m.stream(ask("a b c"))) break;
+
+            const cut = model({ baseUrl: base + "/sse-cut/v1", model: "m" });
+            let failure = null;
+            try { for await (const ev of cut.stream(ask("x y"))) {} } catch (e) { failure = e; }
+            if (!(failure instanceof ModelError) || failure.stage !== "parse") throw failure;
+
+            const refused = await m.stream({ ...ask("x"), schema: { type: "string" } }).next()
+                .catch((e) => e);
+            if (refused.stage !== "config") throw refused;
+            await stub.close();
+            console.log("streams checked");
+            "#;
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join(".vaern");
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        runtime.set_journal_home(Some(home.clone()));
+        assert_eq!(runtime.eval("stream.js", &code).unwrap(), 0);
+        let records = journal_records(&home);
+        let last_console = records.iter().rfind(|r| r["kind"] == "console").unwrap();
+        assert_eq!(last_console["text"], "streams checked\n");
+        let calls: Vec<&serde_json::Value> = records
+            .iter()
+            .filter(|r| r["kind"] == "model.call")
+            .collect();
+        // The stream left early still completed and was recorded.
+        assert_eq!(calls.len(), 3, "{records:#?}");
+        let full = calls[0]["res"]["body"].as_str().unwrap();
+        assert!(full.starts_with("data: {"), "{full}");
+        assert!(full.ends_with("data: [DONE]\n\n"), "{full}");
+        assert_eq!(calls[0]["res"]["charged_nano_usd"], 7000);
+        assert_eq!(calls[2]["error"]["stage"], "parse");
     }
 
     #[test]

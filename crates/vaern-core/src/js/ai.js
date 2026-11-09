@@ -34,6 +34,11 @@
         else waiter.reject(new ModelError(info));
     };
 
+    globalThis.__vaern_model_delta = (reqId, delta) => {
+        const waiter = pending.get(reqId);
+        if (waiter && waiter.onDelta) waiter.onDelta(delta);
+    };
+
     const fromEnv = (name) => {
         const value = globalThis.process && process.env ? process.env[name] : undefined;
         return value === "" ? undefined : value;
@@ -46,7 +51,7 @@
         return value;
     };
 
-    function start(config, options) {
+    function start(config, options, onDelta) {
         const reqId = nextReqId++;
         const call = JSON.stringify({
             messages: options.messages,
@@ -56,9 +61,10 @@
             schema: options.schema,
             schemaName: options.schemaName,
             tools: options.tools,
+            stream: onDelta !== undefined,
         });
         return new Promise((resolve, reject) => {
-            pending.set(reqId, { resolve, reject });
+            pending.set(reqId, { resolve, reject, onDelta });
             let refused;
             try {
                 refused = __vaern_ai_start(reqId, config, call);
@@ -72,6 +78,74 @@
                 reject(new ModelError(JSON.parse(refused)));
             }
         });
+    }
+
+    const summary = (r) => ({
+        text: r.text ?? "",
+        usage: { inputTokens: r.inputTokens, outputTokens: r.outputTokens },
+        costUsd: r.chargedNano / 1e9,
+        finishReason: r.finishReason ?? null,
+        effect: r.eid,
+    });
+
+    // An async iterator over { delta } events, then one final event with
+    // done: true and the summary chat() returns. The request starts on the
+    // first next(), so a stream that is never read sends nothing. Leaving
+    // the loop early stops delivery, not the request: it still completes
+    // and is recorded and charged.
+    function streamOf(config, options) {
+        const events = [];
+        let wakers = [];
+        let started = false;
+        let ended = false;
+        let closed = false;
+        let failure = null;
+        const wake = () => {
+            const woken = wakers;
+            wakers = [];
+            for (const resolve of woken) resolve();
+        };
+        const begin = () => {
+            started = true;
+            start(config, options, (delta) => {
+                if (!closed) events.push({ delta });
+                wake();
+            }).then(
+                (r) => {
+                    if (!closed) events.push({ delta: "", done: true, ...summary(r) });
+                    ended = true;
+                    wake();
+                },
+                (err) => {
+                    failure = err;
+                    ended = true;
+                    wake();
+                },
+            );
+        };
+        return {
+            [Symbol.asyncIterator]() {
+                return this;
+            },
+            async next() {
+                if (!started) begin();
+                while (events.length === 0 && !ended && !closed) {
+                    await new Promise((resolve) => wakers.push(resolve));
+                }
+                if (events.length > 0) return { value: events.shift(), done: false };
+                if (failure && !closed) {
+                    closed = true;
+                    throw failure;
+                }
+                return { value: undefined, done: true };
+            },
+            async return() {
+                closed = true;
+                events.length = 0;
+                wake();
+                return { value: undefined, done: true };
+            },
+        };
     }
 
     function model(options) {
@@ -89,15 +163,12 @@
         return Object.freeze({
             async chat(callOptions) {
                 const r = await start(config, objectArg("chat", callOptions));
-                const result = {
-                    text: r.text ?? "",
-                    usage: { inputTokens: r.inputTokens, outputTokens: r.outputTokens },
-                    costUsd: r.chargedNano / 1e9,
-                    finishReason: r.finishReason ?? null,
-                    effect: r.eid,
-                };
+                const result = summary(r);
                 if (r.json !== null) result.json = r.json;
                 return result;
+            },
+            stream(callOptions) {
+                return streamOf(config, objectArg("stream", callOptions));
             },
         });
     }

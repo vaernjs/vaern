@@ -329,6 +329,11 @@ const m = model({
 });
 const reply = await m.chat({ messages: [{ role: "user", content: "Hi" }] });
 reply.text; reply.usage; reply.costUsd; reply.finishReason; reply.effect;
+
+for await (const ev of m.stream({ messages: [{ role: "user", content: "Hi" }] })) {
+  if (!ev.done) console.log(ev.delta);   // each text fragment as it arrives
+  else console.log(ev.costUsd);          // the last event: chat()'s result, done: true
+}
 ```
 
 - `model(options)`: `baseUrl` and `model` are required; `baseUrl` falls back
@@ -349,6 +354,17 @@ reply.text; reply.usage; reply.costUsd; reply.finishReason; reply.effect;
   `title` and `description`. A schema with any other keyword is refused with
   stage `config` and is not sent. `schema` and `responseFormat` cannot be
   combined.
+- `stream({ messages, maxTokens, temperature })` returns an async iterator.
+  The request is sent with `stream: true` and
+  `stream_options: { include_usage: true }` and read as server-sent events.
+  Each text fragment is yielded as `{ delta }` when it arrives; the last
+  event is `{ delta: "", done: true }` plus the fields `chat()` returns. The
+  request starts on the first `next()`, so a stream that is never read sends
+  nothing. Leaving the loop early stops delivery, not the request: it runs
+  to completion and is recorded and charged. A failure is thrown from the
+  loop. `schema` and `tools` cannot be streamed. A streamed call does not
+  follow redirects, and `timeoutMs` applies to the wait for the response and
+  to each gap between events.
 - The result: `text` (the first choice's content, `""` when absent), `json`
   (only with `schema`), `usage`
   `{ inputTokens, outputTokens }` as the server reported them (`null` when
@@ -367,7 +383,7 @@ reply.text; reply.usage; reply.costUsd; reply.finishReason; reply.effect;
   be recorded). It also carries `url` and `action`. A `schema` error also
   carries `costUsd` and `effect`: the call was made and is charged.
 
-Absent: streaming, embeddings, other endpoints, retries, schema keywords
+Absent: cancelling a call in flight, embeddings, other endpoints, retries, schema keywords
 outside the list above, and checking of replies requested with
 `responseFormat`.
 

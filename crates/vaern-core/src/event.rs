@@ -40,6 +40,9 @@ pub enum LoopEvent {
     FetchDone(FetchCompletion),
     FsDone(FsCompletion),
     ModelDone(Box<ModelCompletion>),
+    /// A text fragment of a streamed model call, by request id. Sent from
+    /// the same task as its `ModelDone`, so every delta arrives before it.
+    ModelDelta(u32, String),
     StreamChunkSent(StreamChunkSent),
     ServerRequest(ServerIncomingRequest),
     ServerClosed(u32),

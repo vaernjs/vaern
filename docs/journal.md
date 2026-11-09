@@ -44,7 +44,7 @@ numbers.
 | `console` | `fd` (1 stdout, 2 stderr), `text`: exactly what was written, newline included |
 | `fetch` | `eid`, `dur_us`, `req` {`method`, `url`, `headers`, `body`}, then `res` {`status`, `status_text`, `url` (after redirects), `headers`, `body`} or `error` {`stage`, `url`, `message`} |
 | `fs` | `eid`, `dur_us`, `req` {`op`, `path` as passed; writes add `len` and `sha256` of the data}, then `res` (`text` or `bytes` for reads, `{}` for writes) or `error` {`stage`, `code`, `path`, `message`} |
-| `model.call` | `eid`, `dur_us`, `req` {`base_url`, `model`, `body`: the request body as sent}, then `res` {`status`, `body`: the response text as received, `usage` {`input_tokens`, `output_tokens`}, `charged_nano_usd`} or `error` {`stage`, `url`, `status`, `message`}. A call refused before dispatch (`stage` `config`) is not recorded |
+| `model.call` | `eid`, `dur_us`, `req` {`base_url`, `model`, `body`: the request body as sent}, then `res` {`status`, `body`: the response text as received (for a streamed call, the event stream as received), `usage` {`input_tokens`, `output_tokens`}, `charged_nano_usd`} or `error` {`stage`, `url`, `status`, `message`}. A call refused before dispatch (`stage` `config`) is not recorded |
 | `run.end` | `exit_code`, `error` (when the run failed), `records` (count including this one), `transcript_sha256` |
 
 The transcript is the run's `console` records in order. `transcript_sha256`

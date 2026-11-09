@@ -59,6 +59,8 @@ pub struct PreparedCall {
     pub config: ModelConfig,
     /// The schema the reply must match, when the call asked for one.
     pub schema: Option<Value>,
+    /// Read the reply as server-sent events; see `ai_stream`.
+    pub stream: bool,
 }
 
 /// What the provider answered.
@@ -190,12 +192,30 @@ pub fn prepare(config_json: &str, call_json: &str) -> Result<PreparedCall> {
             }),
         );
     }
+    let stream = call.get("stream") == Some(&Value::Bool(true));
+    if stream {
+        // A streamed reply is handed on as text fragments; it is not
+        // assembled into JSON or tool calls.
+        if schema.is_some() || body.contains_key("tools") {
+            return Err(bad(
+                "stream() takes neither schema nor tools; use chat() for those".to_string(),
+            ));
+        }
+        body.insert("stream".to_string(), Value::Bool(true));
+        // Without this the final event has no usage and the call is charged
+        // its estimate.
+        body.insert(
+            "stream_options".to_string(),
+            json!({ "include_usage": true }),
+        );
+    }
     Ok(PreparedCall {
         endpoint: format!("{}/chat/completions", base_url.trim_end_matches('/')),
         body: Value::Object(body),
         max_tokens,
         config,
         schema,
+        stream,
     })
 }
 

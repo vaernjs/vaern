@@ -7,6 +7,7 @@
 
 pub mod ai;
 mod ai_schema;
+mod ai_stream;
 mod blank_strip;
 mod effect_record;
 pub mod error;
