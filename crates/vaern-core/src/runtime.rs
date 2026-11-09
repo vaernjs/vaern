@@ -3872,7 +3872,12 @@ mod tests {
         assert_eq!(fetch["req"]["body"], serde_json::json!({ "b64": "/wE=" }));
         assert_eq!(fetch["res"]["status"], 200);
         assert_eq!(fetch["res"]["body"]["b64"], serde_json::Value::Null);
-        assert!(fetch["res"]["body"]["utf8"].as_str().unwrap().starts_with("pong:"));
+        assert!(
+            fetch["res"]["body"]["utf8"]
+                .as_str()
+                .unwrap()
+                .starts_with("pong:")
+        );
         assert!(fetch["dur_us"].as_u64().is_some());
         let line = serde_json::to_string(&records).unwrap();
         assert!(!line.contains("sk-secret-token"), "authorization leaked");
