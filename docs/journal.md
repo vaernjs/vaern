@@ -47,6 +47,8 @@ numbers.
 | `model.call` | `eid`, `dur_us`, `req` {`base_url`, `model`, `body`: the request body as sent}, then `res` {`status`, `body`: the response text as received (for a streamed call, the event stream as received), `usage` {`input_tokens`, `output_tokens`}, `charged_nano_usd`} or `error` {`stage`, `url`, `status`, `message`}. A call refused before dispatch (`stage` `config`) is not recorded |
 | `tool.call` | `eid`, `req` {`name`, `args`}. Written when the tool starts, so the effects it makes follow it |
 | `tool.result` | `eid` (the same as its `tool.call`), `dur_us`, `req` {`name`}, then `res` {`value`} or `error` {`stage`, `message`} |
+| `budget.reserve` | `rid`, `run`, `for` (`model.call` or `tool.call`), `nano_usd`, `tokens`, `remaining_nano_usd`, `remaining_tokens` (before this reserve; `null` without a limit). Synced to disk before the call is sent |
+| `budget.settle` | `rid`, `run`, `nano_usd`, `tokens`: the amount charged for that reserve |
 | `run.end` | `exit_code`, `error` (when the run failed), `records` (count including this one), `transcript_sha256` |
 
 The transcript is the run's `console` records in order. `transcript_sha256`
@@ -74,10 +76,12 @@ Tool arguments that do not match the tool's `parameters` are refused before the 
 
 Incoming `serve()` requests are not recorded.
 
+A named budget's ledger, `<home>/budgets/<name>.jsonl`, uses the same line format and the same two record kinds, without `remaining_*`. `vaern journal verify` takes run ids only; the ledger is verified each time a run loads it.
+
 ## Durability
 
-Each line is written and flushed when it is appended. `run.end` is also
-synced to disk. `process.exit()` seals the journal with its exit code.
+Each line is written and flushed when it is appended. `budget.reserve` and
+`run.end` are also synced to disk. `process.exit()` seals the journal with its exit code.
 
 ## Verifying
 

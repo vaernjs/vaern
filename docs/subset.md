@@ -41,7 +41,7 @@ web or Node.js behaviour of the same name.
 - `vaern:http`, which exports `serve`.
 - `vaern:fs`, which exports `readFile`, `writeFile` and `appendFile`.
 - `vaern:ai`, which exports `model`, `ModelError`, `tool`, `ToolError`,
-  `agent` and `AgentError`.
+  `agent`, `AgentError`, `budget` and `BudgetError`.
 - Packages already installed in `node_modules`, imported by name (`pkg`,
   `@scope/pkg`, `pkg/sub`). Static and dynamic `import()` both work.
 
@@ -410,7 +410,8 @@ await add.call({ a: 2, b: 3 });       // { sum: 5 }
   called), `run` (`run` threw; the message is `Name: message` and `cause`
   is what was thrown), `result` (the result is not JSON-serialisable) or
   `journal`.
-- `cost: { usd }` is accepted and stored; it is not used yet.
+- `cost: { usd }` is what one run of the tool is reserved and charged
+  against the budget (see Budgets); the default is 0, which reserves nothing.
 
 ### Agents
 
@@ -441,6 +442,45 @@ out.text; out.steps; out.usage; out.costUsd;
   `agent()` are passed to every model call.
 - Model calls and tool runs are journalled as usual: `model.call`,
   `tool.call` and `tool.result`.
+
+### Budgets
+
+No model call or tool effect is dispatched unless the reserve fits the
+remaining budget. Reserves and charges are estimates in USD and tokens,
+computed from the prices the script gives; what a provider bills can drift
+from them.
+
+```ts
+import { budget } from "vaern:ai";
+
+budget({ usd: 0.25, tokens: 50_000 });   // once, before the first model call
+budget.remaining();                      // { usd: 0.24..., tokens: 49_100 }
+```
+
+- Before a model call is sent, it reserves its input estimate (request
+  bytes / 3, plus 16 per message) plus the full output cap that is sent as
+  `max_tokens`, in tokens and at the model's prices. A tool reserves its
+  `cost.usd`. The reserve is written to disk before the call is sent.
+- A reserve larger than what remains rejects with a `BudgetError` whose
+  `code` is `RESERVE_EXCEEDS_REMAINING`, with `unit` (`usd` or `tokens`),
+  `reserve` and `remaining`. Nothing is sent and no connection is opened.
+- When a call returns, its reserve is replaced by the charge computed from
+  the reported usage. A reply without usage, a failed call and a tool run
+  keep their whole reserve charged. A charge above the reserve stands, and
+  later reserves see it.
+- `budget({ usd, tokens })` returns what remains, as `budget.remaining()`
+  does; a unit without a limit is `null`. Limits only go down: a later call
+  can lower them but not raise them, and `vaern run --budget-usd` and
+  `--budget-tokens` cap what a script can ask for. Those caps apply even if
+  the script never calls `budget()`. Calling `budget()` for the first time
+  after a model call or priced tool run has started throws `BudgetError`
+  `INVALID`, so no spending goes uncounted.
+- `budget({ name: "nightly", usd: 1 })` keeps spending across runs in
+  `.vaern/budgets/nightly.jsonl` (under `$VAERN_HOME` when set), in the
+  journal's chained format. The name must be given in the first `budget()`
+  call. A reserve that was never settled, as a crash leaves it, counts as
+  fully spent. One run uses a named budget at a time; a second gets
+  `BudgetError` `LEDGER_BUSY`. An edited ledger fails to load.
 
 Absent: cancelling a call in flight, embeddings, other endpoints, retries, schema keywords
 outside the list above, and checking of replies requested with

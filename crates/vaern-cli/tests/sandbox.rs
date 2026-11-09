@@ -170,6 +170,51 @@ fn process_exit_seals_the_journal_with_its_code() -> TestResult {
 }
 
 #[test]
+fn budget_flags_cap_what_a_script_can_ask_for() -> TestResult {
+    let home = journal_home("budget")?;
+    let script = home.join("caps.js");
+    std::fs::write(
+        &script,
+        "import { budget } from 'vaern:ai';\n\
+         console.log(JSON.stringify(budget.remaining()));\n\
+         console.log(JSON.stringify(budget({ usd: 5, tokens: 100 })));\n",
+    )?;
+    let path = script.display().to_string();
+    let args = [
+        "run",
+        "--budget-usd",
+        "0.25",
+        "--budget-tokens",
+        "1000",
+        path.as_str(),
+    ];
+    let out = vaern_home(&args, &home)?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        "{\"usd\":0.25,\"tokens\":1000}\n{\"usd\":0.25,\"tokens\":100}\n"
+    );
+
+    let bad = vaern_home(&["run", "--budget-usd", "lots", path.as_str()], &home)?;
+    assert_eq!(bad.status.code(), Some(2));
+    assert!(text(&bad.stderr).contains("is not an amount in USD"));
+
+    // A named ledger is kept even when the journal is off.
+    let home = journal_home("budget-quiet")?;
+    let named = home.join("named.js");
+    std::fs::write(
+        &named,
+        "import { budget } from 'vaern:ai';\nbudget({ name: 'cli', usd: 1 });\n",
+    )?;
+    let named_path = named.display().to_string();
+    let out = vaern_home(&["run", "--no-journal", named_path.as_str()], &home)?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(home.join("budgets/cli.lock").exists());
+    assert!(!home.join("runs").exists());
+    Ok(())
+}
+
+#[test]
 fn no_journal_writes_nothing() -> TestResult {
     let home = journal_home("off")?;
     let out = vaern_home(&["run", "--no-journal", "hello.ts"], &home)?;

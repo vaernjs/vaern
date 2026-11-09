@@ -7,7 +7,7 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use vaern_core::{QuickJsRuntime, Runtime, RuntimeOptions, journal};
+use vaern_core::{QuickJsRuntime, Runtime, RuntimeOptions, budget, journal};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -28,6 +28,14 @@ enum Commands {
         /// Do not write a journal for this run
         #[arg(long)]
         no_journal: bool,
+        /// Most the run may reserve for model calls and priced tools, in
+        /// estimated USD; a script's budget() cannot raise it
+        #[arg(long, value_name = "USD", value_parser = parse_usd)]
+        budget_usd: Option<u64>,
+        /// Most the run may reserve in model tokens; a script's budget()
+        /// cannot raise it
+        #[arg(long, value_name = "TOKENS")]
+        budget_tokens: Option<u64>,
         /// Target script file to execute
         file: PathBuf,
         /// Arguments passed to the script
@@ -61,7 +69,19 @@ fn journal_home() -> PathBuf {
     }
 }
 
-fn run(no_journal: bool, file: PathBuf, args: Vec<String>) -> ExitCode {
+/// A USD amount as nano-USD, the unit budgets count in.
+fn parse_usd(text: &str) -> Result<u64, String> {
+    match text.parse::<f64>() {
+        Ok(usd) if usd.is_finite() && (0.0..=1.0e9).contains(&usd) => {
+            Ok((usd * 1.0e9).round() as u64)
+        }
+        _ => Err(format!(
+            "'{text}' is not an amount in USD; give a number such as 0.25"
+        )),
+    }
+}
+
+fn run(no_journal: bool, caps: budget::Limits, file: PathBuf, args: Vec<String>) -> ExitCode {
     let mut argv = vec!["vaern".to_string(), file.display().to_string()];
     argv.extend(args);
 
@@ -76,6 +96,8 @@ fn run(no_journal: bool, file: PathBuf, args: Vec<String>) -> ExitCode {
     if !no_journal {
         runtime.set_journal_home(Some(journal_home()));
     }
+    // Named budget ledgers live under the same home, journal or not.
+    runtime.set_budget(caps, Some(journal_home()));
 
     match runtime.run_file(&file) {
         Ok(0) => ExitCode::SUCCESS,
@@ -126,9 +148,17 @@ fn main() -> ExitCode {
     match cli.command {
         Commands::Run {
             no_journal,
+            budget_usd,
+            budget_tokens,
             file,
             args,
-        } => run(no_journal, file, args),
+        } => {
+            let caps = budget::Limits {
+                nano: budget_usd,
+                tokens: budget_tokens,
+            };
+            run(no_journal, caps, file, args)
+        }
         Commands::Journal {
             command: JournalCommand::Verify { id },
         } => verify(&id),
