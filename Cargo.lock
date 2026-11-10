@@ -1941,7 +1941,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "vaern-cli"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "clap",
  "tokio",
@@ -1950,7 +1950,7 @@ dependencies = [
 
 [[package]]
 name = "vaern-core"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "bytes",
  "http",

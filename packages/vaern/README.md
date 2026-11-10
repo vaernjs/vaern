@@ -1,12 +1,12 @@
 # vaern
 
-**An agent-native JavaScript & TypeScript runtime.** Vaern runs TypeScript directly, with `fetch` and an HTTP server built in, on an embedded QuickJS-ng engine driven by Rust and Tokio. Capability sandboxing, tool-calling, MCP and replayable runs are being built into the engine itself.
+**An agent-native JavaScript & TypeScript runtime.** Vaern runs TypeScript directly, with `fetch` and an HTTP server built in, on an embedded QuickJS-ng engine driven by Rust and Tokio. Model calls, tools, budgets and replayable runs are part of the runtime. Capability sandboxing and MCP are not built yet.
 
 [VaernJS](https://vaernjs.tech) is a [DevLogix](https://devlogix.com.pk) project · licensed MIT
 
 ---
 
-> ### Status: v0.0.6, early native runtime
+> ### Status: v0.0.7, early native runtime
 >
 > This release ships the native `vaern` binary for Linux, macOS and Windows.
 > The API surface is small and will change before v1.0.
@@ -21,13 +21,16 @@
 - `URL`, `URLSearchParams`, `TextEncoder` and `TextDecoder`
 - `serve()` from `vaern:http`, an HTTP server with Web-standard `Request` / `Response` and streamed bodies
 - `readFile`, `writeFile` and `appendFile` from `vaern:fs`
+- `model()`, `tool()` and `agent()` from `vaern:ai`, against any OpenAI-compatible endpoint, on a cloud service or on your own machine, with streaming and schema-checked structured output
+- Budgets in tokens and estimated USD: no model call or tool effect is dispatched unless the reserve fits the remaining budget. Provider billing may drift from the estimate
+- Replayable runs: every effect is recorded in a hash-chained journal; `vaern journal verify` checks it and `vaern replay` reproduces the transcript
 - Uncaught exceptions, unhandled rejections and throwing timers exit non-zero with a `file:line:col` location
 
 **Not implemented yet**
 
 - `node:*` modules, CommonJS packages and downloading packages
 - Capability sandboxing (`vaern.toml`)
-- `agent()`, `tool()`, MCP, budgets and `vaern replay`
+- MCP
 
 TypeScript `enum`, `namespace` and decorators are rejected with a located error, because they emit runtime code that type stripping cannot produce.
 

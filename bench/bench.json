@@ -1,64 +1,99 @@
 {
-  "version": "0.0.6",
-  "baseline": "0.0.5",
-  "date": "2026-11-04",
+  "version": "0.0.7",
+  "baseline": "0.0.6",
+  "date": "2026-11-09",
   "system": {
     "os": "Microsoft Windows 11 Pro (x86_64)",
     "cpu": "11th Gen Intel(R) Core(TM) i7-11850H @ 2.50GHz (8 cores, 16 threads)",
     "ram": "16 GB RAM"
   },
-  "method": "hyperfine -N, 3 warmups (2 for compute-heavy); 30 runs for startup and fetch, 20 for compute-loop and serve, 10 for compute-heavy; wall time is mean ± σ. Each row is one hyperfine call with 0.0.5 listed first; a second session with 0.0.6 first was used to check order effects. Peak RSS is the largest PeakWorkingSetSize of 5 runs. Both versions are release builds measured in the same session.",
+  "method": "hyperfine -N, 3 warmups (2 for compute-heavy); 30 runs for startup and fetch, 20 for compute-loop and serve, 10 for compute-heavy; wall time is mean ± σ. Each row is one hyperfine call with 0.0.6 listed first; startup and serve were repeated with 0.0.7 first to check order effects. Peak RSS is the largest PeakWorkingSetSize of 5 runs. Both versions are release builds measured in the same session; the machine was under other load, so σ is wide. 0.0.7 writes a run journal by default; --no-journal rows turn it off.",
   "binarySize": {
     "budget": 15728640,
-    "0.0.5": 15860224,
     "0.0.6": 16103936,
-    "status": "Over budget by 375296 bytes"
+    "0.0.7": 9889792,
+    "status": "Under budget by 5838848 bytes"
   },
   "benchmarks": [
     {
       "name": "Startup and greeting",
       "command": "vaern run examples/hello.ts",
-      "reproduce": "hyperfine -N --warmup 3 --runs 30 'target/release/vaern run examples/hello.ts' 'node -e 0'",
-      "wall": { "0.0.6": "15.7 ms ± 0.6", "0.0.5": "14.4 ms ± 1.0", "node -e 0": "42.2 ms ± 2.1" },
-      "peakRss": { "0.0.6": "7.9 MB", "0.0.5": "8.0 MB" },
-      "status": "Loss vs 0.0.5, +1.3 ms (+1.1 ms with 0.0.6 first); not yet profiled. Win vs Node process start"
+      "reproduce": "hyperfine -N --warmup 3 --runs 30 'target/release/vaern run examples/hello.ts' 'target/release/vaern run --no-journal examples/hello.ts' 'node -e 0'",
+      "wall": {
+        "0.0.7": "26.4 ms ± 3.2",
+        "0.0.7 --no-journal": "19.6 ms ± 3.0",
+        "0.0.6": "19.8 ms ± 1.4",
+        "node -e 0": "80.3 ms ± 12.9"
+      },
+      "peakRss": {
+        "0.0.7": "7.7 MB",
+        "0.0.6": "7.8 MB"
+      },
+      "status": "Loss vs 0.0.6 with the journal, +6.6 ms (+4.6 ms with 0.0.7 first); about 3 ms is creating the run directory and file and one sync, the rest is not profiled. Within noise with --no-journal. Win vs Node process start"
     },
     {
       "name": "Loopback fetch and JSON parse",
       "command": "vaern run examples/fetch-json.ts",
       "reproduce": "hyperfine -N --warmup 3 --runs 30 'target/release/vaern run examples/fetch-json.ts'",
-      "wall": { "0.0.6": "24.0 ms ± 8.6", "0.0.5": "23.1 ms ± 4.9" },
-      "peakRss": { "0.0.6": "10.3 MB", "0.0.5": "10.4 MB" },
-      "status": "Within noise of 0.0.5"
+      "wall": {
+        "0.0.7": "32.6 ms ± 4.1",
+        "0.0.7 --no-journal": "29.0 ms ± 5.8",
+        "0.0.6": "30.9 ms ± 8.6"
+      },
+      "peakRss": {
+        "0.0.7": "9.6 MB",
+        "0.0.6": "10.3 MB"
+      },
+      "status": "Within noise of 0.0.6"
     },
     {
       "name": "Arithmetic loop (1M)",
       "command": "vaern run bench/compute-loop.ts",
       "reproduce": "hyperfine -N --warmup 3 --runs 20 'target/release/vaern run bench/compute-loop.ts' 'node bench/compute-loop.ts'",
-      "wall": { "0.0.6": "42.6 ms ± 2.0", "0.0.5": "42.7 ms ± 3.1", "node": "83.2 ms ± 10.1" },
-      "peakRss": { "0.0.6": "8.2 MB", "0.0.5": "8.4 MB" },
-      "status": "Win vs Node; Node startup dominates at this size"
+      "wall": {
+        "0.0.7": "74.7 ms ± 8.8",
+        "0.0.6": "67.2 ms ± 11.3",
+        "node": "155.5 ms ± 21.3"
+      },
+      "peakRss": {
+        "0.0.7": "8.0 MB",
+        "0.0.6": "8.1 MB"
+      },
+      "status": "+7.5 ms vs 0.0.6, within σ; about the journal's startup cost. Win vs Node; Node startup dominates at this size"
     },
     {
       "name": "Arithmetic loop (50M)",
       "command": "vaern run bench/compute-heavy.ts",
       "reproduce": "hyperfine -N --warmup 2 --runs 10 'target/release/vaern run bench/compute-heavy.ts' 'node bench/compute-heavy.ts'",
-      "wall": { "0.0.6": "1.401 s ± 0.043", "0.0.5": "1.383 s ± 0.040", "node": "0.252 s ± 0.004" },
-      "status": "Loss vs Node, 5.6x slower; QuickJS interprets bytecode and V8 compiles the loop. Within noise of 0.0.5"
+      "wall": {
+        "0.0.7": "2.336 s ± 0.139",
+        "0.0.6": "2.254 s ± 0.124",
+        "node": "0.435 s ± 0.050"
+      },
+      "status": "Loss vs Node, 5.4x slower; QuickJS interprets bytecode and V8 compiles the loop. Within noise of 0.0.6"
     },
     {
       "name": "Parallel HTTP (100 requests)",
       "command": "vaern run tests/e2e/serve_concurrent.ts",
       "reproduce": "hyperfine -N --warmup 3 --runs 20 'target/release/vaern run tests/e2e/serve_concurrent.ts'",
-      "wall": { "0.0.6": "50.0 ms ± 1.3", "0.0.5": "50.1 ms ± 1.6" },
-      "peakRss": { "0.0.6": "17.4 MB", "0.0.5": "19.6 MB" },
-      "status": "Same time as 0.0.5 with 2.2 MB less peak memory"
+      "wall": {
+        "0.0.7": "77.9 ms ± 12.1",
+        "0.0.6": "70.2 ms ± 7.9"
+      },
+      "peakRss": {
+        "0.0.7": "17.1 MB",
+        "0.0.6": "17.7 MB"
+      },
+      "status": "+7.7 ms vs 0.0.6 (+3.7 ms with 0.0.7 first), within σ; about the journal's startup cost"
     },
     {
       "name": "Idle HTTP server CPU (3 s window)",
       "command": "vaern run bench/idle-server.ts",
-      "reproduce": "node bench/idle-cpu.mjs <0.0.5 binary> target/release/vaern",
-      "cpu": { "0.0.6": "0.0 ms (0.00% of one core)", "0.0.5": "0.0 ms (0.00% of one core)" },
+      "reproduce": "node bench/idle-cpu.mjs <0.0.6 binary> target/release/vaern",
+      "cpu": {
+        "0.0.7": "0.0 ms (0.00% of one core)",
+        "0.0.6": "0.0 ms (0.00% of one core)"
+      },
       "status": "Unchanged; Windows reports CPU time in 15.6 ms steps"
     }
   ]

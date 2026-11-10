@@ -1,6 +1,6 @@
 # Vaern runtime subset
 
-This is the exact surface `vaern run` provides in v0.0.6. Anything not listed
+This is the exact surface `vaern run` provides in v0.0.7. Anything not listed
 here is absent. A section's **Limits** list says where an API differs from the
 web or Node.js behaviour of the same name.
 

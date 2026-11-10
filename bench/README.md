@@ -1,7 +1,26 @@
 # Benchmarks
 
-Measurements for Vaern 0.0.6 against 0.0.5, including the runs Vaern loses.
+Measurements for Vaern 0.0.7 against 0.0.6, including the runs Vaern loses.
 Machine data and raw values are in [bench.json](bench.json).
+
+All runs: Microsoft Windows 11 Pro (x86_64), 11th Gen Intel(R) Core(TM) i7-11850H @ 2.50GHz (8 cores, 16 threads), 16 GB RAM, 2026-11-09. Wall time is the hyperfine mean ± σ with `-N` and 3 warmups, over 30 runs for startup and fetch, 20 for the others and 10 for the 50M loop. Peak RSS is the largest peak working set over 5 runs. The 0.0.7 build measured is the release's code, built the day before its version number changed; the 0.0.6 binary was built from the `v0.0.6` tag in the same session. Since 0.0.6, every `vaern run` writes a journal. Each row is one hyperfine call with 0.0.6 listed first, and startup and parallel HTTP were repeated with 0.0.7 first. The machine was busier than on 2026-11-07 (`node -e 0` took 80 ms, against 39 ms then), so σ is wider; compare within a row only. The journal goes to `$VAERN_HOME` on the local system disk.
+
+| Benchmark | 0.0.7 | 0.0.7, `--no-journal` | 0.0.6 | Comparison | Peak RSS (0.0.7 / 0.0.6) | Status |
+|---|---|---|---|---|---|---|
+| Startup and greeting | 26.4 ms ± 3.2 | 19.6 ms ± 3.0 | 19.8 ms ± 1.4 | `node -e 0`: 80.3 ms | 7.7 / 7.8 MB | **Loss with the journal, +6.6 ms** (+4.6 ms with 0.0.7 first); without it, within noise |
+| Loopback fetch and JSON parse | 32.6 ms ± 4.1 | 29.0 ms ± 5.8 | 30.9 ms ± 8.6 | | 9.6 / 10.3 MB | Within noise |
+| Arithmetic loop (1M) | 74.7 ms ± 8.8 | | 67.2 ms ± 11.3 | Node: 155.5 ms | 8.0 / 8.1 MB | +7.5 ms, within σ; about the journal's startup cost. Win vs Node |
+| Arithmetic loop (50M) | 2.336 s ± 0.139 | | 2.254 s ± 0.124 | Node: 0.435 s | | Within noise of 0.0.6; **loss, 5.4x slower than Node** |
+| Parallel HTTP (100 requests) | 77.9 ms ± 12.1 | | 70.2 ms ± 7.9 | | 17.1 / 17.7 MB | +7.7 ms (+3.7 ms with 0.0.7 first), within σ; about the journal's startup cost |
+| Idle HTTP server, CPU over 3 s | 0.0 ms | | 0.0 ms | | | Unchanged |
+
+The journal costs about 5 ms per run on this machine. Creating a run directory and file takes about 1.5 ms here and syncing one record about 1.8 ms more, measured on their own; the journal syncs once, at `run.end`, so that accounts for about 3 ms. The rest has not been profiled. `vaern run --no-journal` removes the cost.
+
+Binary size, stripped: 9,889,792 bytes (0.0.6: 16,103,936; the LTO build below: 9,427,456, +462,336 for the journal, `vaern:ai` and replay), 5,838,848 bytes under the 15 MiB budget.
+
+## Earlier measurements
+
+### 0.0.6 against 0.0.5 (2026-11-04)
 
 All runs: Microsoft Windows 11 Pro (x86_64), 11th Gen Intel(R) Core(TM) i7-11850H @ 2.50GHz (8 cores, 16 threads), 16 GB RAM, 2026-11-04.
 Wall time is the hyperfine mean ± σ with `-N` and 3 warmups, over 30 runs for startup and fetch, 20 for the others and 10 for the 50M loop. Each table row comes from one hyperfine call with 0.0.5 listed first; a second session with 0.0.6 first gave the same verdicts except where noted. Peak RSS is the largest peak working set over 5 runs.
@@ -19,7 +38,7 @@ The startup loss held in both orders (+1.1 ms with 0.0.6 first). It has not been
 
 Binary size, stripped: 16,103,936 bytes (0.0.5: 15,860,224, +243,712). This is 375,296 bytes over the 15 MiB budget.
 
-## Unreleased hardening against 0.0.6
+### Hardening after 0.0.6 (2026-11-07)
 
 Re-run on 2026-11-07 on the same machine, after the fetch body cap, the pool timer and the streaming backpressure change. The 0.0.6 binary was built from the `v0.0.6` tag in the same session; each row is one hyperfine call with 0.0.6 listed first, using the commands below, and startup and parallel HTTP were repeated with the new build first. Absolute times are lower than on 2026-11-04 for both builds; compare within a row only.
 
@@ -36,7 +55,7 @@ The startup loss has not been profiled. The likely cause is the larger JavaScrip
 
 Binary size, stripped: 16,166,912 bytes (0.0.6: 16,103,936, +62,976), 438,272 bytes over the 15 MiB budget.
 
-### With fat LTO
+### With fat LTO (2026-11-07)
 
 The release profile then gained `lto = "fat"` and `codegen-units = 1`. The same comparison, same session, 0.0.6 listed first:
 
@@ -50,23 +69,6 @@ The release profile then gained `lto = "fat"` and `codegen-units = 1`. The same 
 | Idle HTTP server, CPU over 3 s | 0.0 ms | 0.0 ms | | Unchanged |
 
 Binary size, stripped: 9,427,456 bytes (0.0.6: 16,103,936, −6,676,480), 6,301,184 bytes under the 15 MiB budget. The cost is build time: a cold `cargo build --release` takes about 10 minutes on this machine instead of about 2.
-
-## Unreleased run journal, `vaern:ai` and replay against 0.0.6
-
-Re-run on 2026-11-09 on the same machine, after every `vaern run` started writing a journal. The 0.0.6 binary was built from the `v0.0.6` tag in the same session. Each row is one hyperfine call with 0.0.6 listed first, and startup and parallel HTTP were repeated with the new build first. The machine was busier than on 2026-11-07 (`node -e 0` took 80 ms, against 39 ms then), so σ is wider; compare within a row only. The journal goes to `$VAERN_HOME` on the local system disk.
-
-| Benchmark | Unreleased | Unreleased, `--no-journal` | 0.0.6 | Comparison | Peak RSS (new / 0.0.6) | Status |
-|---|---|---|---|---|---|---|
-| Startup and greeting | 26.4 ms ± 3.2 | 19.6 ms ± 3.0 | 19.8 ms ± 1.4 | `node -e 0`: 80.3 ms | 7.7 / 7.8 MB | **Loss with the journal, +6.6 ms** (+4.6 ms with the new build first); without it, within noise |
-| Loopback fetch and JSON parse | 32.6 ms ± 4.1 | 29.0 ms ± 5.8 | 30.9 ms ± 8.6 | | 9.6 / 10.3 MB | Within noise |
-| Arithmetic loop (1M) | 74.7 ms ± 8.8 | | 67.2 ms ± 11.3 | Node: 155.5 ms | 8.0 / 8.1 MB | +7.5 ms, within σ; about the journal's startup cost. Win vs Node |
-| Arithmetic loop (50M) | 2.336 s ± 0.139 | | 2.254 s ± 0.124 | Node: 0.435 s | | Within noise of 0.0.6; **loss, 5.4x slower than Node** |
-| Parallel HTTP (100 requests) | 77.9 ms ± 12.1 | | 70.2 ms ± 7.9 | | 17.1 / 17.7 MB | +7.7 ms (+3.7 ms with the new build first), within σ; about the journal's startup cost |
-| Idle HTTP server, CPU over 3 s | 0.0 ms | | 0.0 ms | | | Unchanged |
-
-The journal costs about 5 ms per run on this machine. Creating a run directory and file takes about 1.5 ms here and syncing one record about 1.8 ms more, measured on their own; the journal syncs once, at `run.end`, so that accounts for about 3 ms. The rest has not been profiled. `vaern run --no-journal` removes the cost.
-
-Binary size, stripped: 9,889,792 bytes (0.0.6: 16,103,936; the LTO build above: 9,427,456, +462,336 for the journal, `vaern:ai` and replay), 5,838,848 bytes under the 15 MiB budget.
 
 ## Reproduction commands
 
