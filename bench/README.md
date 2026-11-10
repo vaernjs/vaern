@@ -3,7 +3,7 @@
 Measurements for Vaern 0.0.7 against 0.0.6, including the runs Vaern loses.
 Machine data and raw values are in [bench.json](bench.json).
 
-All runs: Microsoft Windows 11 Pro (x86_64), 11th Gen Intel(R) Core(TM) i7-11850H @ 2.50GHz (8 cores, 16 threads), 16 GB RAM, 2026-11-09. Wall time is the hyperfine mean ± σ with `-N` and 3 warmups, over 30 runs for startup and fetch, 20 for the others and 10 for the 50M loop. Peak RSS is the largest peak working set over 5 runs. The 0.0.7 build measured is the release's code, built the day before its version number changed; the 0.0.6 binary was built from the `v0.0.6` tag in the same session. Since 0.0.6, every `vaern run` writes a journal. Each row is one hyperfine call with 0.0.6 listed first, and startup and parallel HTTP were repeated with 0.0.7 first. The machine was busier than on 2026-11-07 (`node -e 0` took 80 ms, against 39 ms then), so σ is wider; compare within a row only. The journal goes to `$VAERN_HOME` on the local system disk.
+All runs: Microsoft Windows 11 Pro (x86_64), 11th Gen Intel(R) Core(TM) i7-11850H @ 2.50GHz (8 cores, 16 threads), 16 GB RAM, 2026-11-09. Wall time is the hyperfine mean ± σ with `-N` and 3 warmups, over 30 runs for startup and fetch, 20 for the others and 10 for the 50M loop. Peak RSS is the largest peak working set over 5 runs. The 0.0.7 build measured was made the day before the release, without its version number and without one later fix that renames a temporary file in the journal; the binary size below is the release build's. The 0.0.6 binary was built from the `v0.0.6` tag in the same session. Since 0.0.6, every `vaern run` writes a journal. Each row is one hyperfine call with 0.0.6 listed first, and startup and parallel HTTP were repeated with 0.0.7 first. The machine was busier than on 2026-11-07 (`node -e 0` took 80 ms, against 39 ms then), so σ is wider; compare within a row only. The journal goes to `$VAERN_HOME` on the local system disk.
 
 | Benchmark | 0.0.7 | 0.0.7, `--no-journal` | 0.0.6 | Comparison | Peak RSS (0.0.7 / 0.0.6) | Status |
 |---|---|---|---|---|---|---|
@@ -16,7 +16,7 @@ All runs: Microsoft Windows 11 Pro (x86_64), 11th Gen Intel(R) Core(TM) i7-11850
 
 The journal costs about 5 ms per run on this machine. Creating a run directory and file takes about 1.5 ms here and syncing one record about 1.8 ms more, measured on their own; the journal syncs once, at `run.end`, so that accounts for about 3 ms. The rest has not been profiled. `vaern run --no-journal` removes the cost.
 
-Binary size, stripped: 9,889,792 bytes (0.0.6: 16,103,936; the LTO build below: 9,427,456, +462,336 for the journal, `vaern:ai` and replay), 5,838,848 bytes under the 15 MiB budget.
+Binary size, stripped: 9,891,328 bytes (0.0.6: 16,103,936; the LTO build below: 9,427,456, +463,872 for the journal, `vaern:ai` and replay), 5,837,312 bytes under the 15 MiB budget.
 
 ## Earlier measurements
 

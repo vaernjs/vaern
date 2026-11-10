@@ -11,8 +11,8 @@
   "binarySize": {
     "budget": 15728640,
     "0.0.6": 16103936,
-    "0.0.7": 9889792,
-    "status": "Under budget by 5838848 bytes"
+    "0.0.7": 9891328,
+    "status": "Under budget by 5837312 bytes"
   },
   "benchmarks": [
     {
