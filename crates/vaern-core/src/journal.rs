@@ -82,10 +82,18 @@ impl Journal {
             .open(&path)
             .map_err(|err| create_error(&path, &err))?;
 
-        let latest_tmp = runs.join("latest.tmp");
-        std::fs::write(&latest_tmp, &run_id)
+        // The temporary file carries the run id: runs started together in
+        // one home would otherwise share it, and the second rename would
+        // find it already moved.
+        let latest_tmp = runs.join(format!("latest.{run_id}.tmp"));
+        if let Err(err) = std::fs::write(&latest_tmp, &run_id)
             .and_then(|()| std::fs::rename(&latest_tmp, runs.join("latest")))
-            .map_err(|err| create_error(&runs.join("latest"), &err))?;
+        {
+            // Best effort: the run is refused either way, and a leftover
+            // temporary file is harmless.
+            let _ = std::fs::remove_file(&latest_tmp);
+            return Err(create_error(&runs.join("latest"), &err));
+        }
 
         Ok(Journal {
             file,
@@ -503,6 +511,39 @@ mod tests {
             journal.run_id()
         );
         assert_eq!(locate(home.path(), "latest").unwrap(), journal.path());
+    }
+
+    #[test]
+    fn test_runs_started_together_in_one_home_all_get_a_journal() {
+        let home = tempfile::tempdir().unwrap();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let (home, start) = (home.path().to_path_buf(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    (0..25)
+                        .map(|_| Journal::create(&home).map(|journal| journal.run_id().to_string()))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut ids = Vec::new();
+        for worker in workers {
+            for created in worker.join().unwrap() {
+                ids.push(created.unwrap());
+            }
+        }
+        assert_eq!(ids.len(), 200);
+        // The pointer names one of the runs, and no temporary file is left.
+        let latest = std::fs::read_to_string(home.path().join("runs/latest")).unwrap();
+        assert!(ids.contains(&latest), "{latest}");
+        let left: Vec<_> = std::fs::read_dir(home.path().join("runs"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
     }
 
     #[test]
