@@ -4720,7 +4720,15 @@ mod tests {
         assert!(full.starts_with("data: {"), "{full}");
         assert!(full.ends_with("data: [DONE]\n\n"), "{full}");
         assert_eq!(calls[0]["res"]["charged_nano_usd"], 7000);
-        assert_eq!(calls[2]["error"]["stage"], "parse");
+        // Records are written when a call completes, and the stream left
+        // early is still in flight when the cut one starts, so either can be
+        // recorded first. Exactly one of the three failed, at the parse stage.
+        let failed: Vec<&str> = calls
+            .iter()
+            .filter(|call| call["error"].is_object())
+            .map(|call| call["error"]["stage"].as_str().unwrap_or("none"))
+            .collect();
+        assert_eq!(failed, ["parse"], "{calls:#?}");
     }
 
     #[test]
