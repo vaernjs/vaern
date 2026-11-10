@@ -4974,7 +4974,7 @@ mod tests {
     fn test_journal_keeps_caps_ledger_balances_and_error_actions_for_replay() {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join(".vaern");
-        let script = model_stub(8993)
+        let script = model_stub(8986)
             + r#"
             import { model, budget } from "vaern:ai";
             budget({ name: "kept", usd: 1 });
