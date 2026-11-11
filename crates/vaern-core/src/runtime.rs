@@ -5366,6 +5366,69 @@ mod tests {
     }
 
     #[test]
+    fn test_a_usd_limit_on_a_model_without_a_price_is_reported_once() {
+        let reply = r#"{"choices":[{"message":{"content":"hi"},"finish_reason":"stop"}],
+                        "usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+        let path = "/v1/chat/completions";
+        let one = || vec![(path, "application/json", reply.to_string())];
+        let run = |script: &str, calls: usize, usd: Option<u64>| {
+            let (port, stub) = canned_http((0..calls).map(|_| one()).collect());
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join(".vaern");
+            let main = root.path().join("main.js");
+            std::fs::write(&main, script.replace("PORT", &port.to_string())).unwrap();
+            let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+            runtime.set_journal_home(Some(home.clone()));
+            let caps = crate::budget::Limits {
+                nano: usd,
+                tokens: None,
+            };
+            runtime.set_budget(caps, Some(home.clone()));
+            assert_eq!(runtime.run_file(&main).unwrap(), 0);
+            stub.join().unwrap();
+            let warnings: Vec<String> = journal_records(&home)
+                .iter()
+                .filter(|r| r["kind"] == "console" && r["fd"] == 2)
+                .map(|r| r["text"].as_str().unwrap().to_string())
+                .collect();
+            // The warning is part of the transcript, so a replay repeats it.
+            let summary = replay_latest(&home).unwrap();
+            assert_eq!(summary.console as usize, warnings.len());
+            warnings
+        };
+        let ask = r#"{ messages: [{ role: "user", content: "x" }], maxTokens: 4 }"#;
+        let free = r#"import { model, budget } from "vaern:ai";
+            const m = model({ baseUrl: "http://127.0.0.1:PORT/v1", model: "local" });"#;
+
+        // Two calls under --budget-usd: one warning, naming the model.
+        let twice = format!("{free}\nawait m.chat({ask});\nawait m.chat({ask});\n");
+        let warnings = run(&twice, 2, Some(1_000_000_000));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].starts_with("vaern:ai: model 'local' has no price"));
+        assert!(warnings[0].contains("--budget-tokens"));
+
+        // The same from budget({ usd }) in the script.
+        let scripted = format!("{free}\nbudget({{ usd: 1 }});\nawait m.chat({ask});\n");
+        assert_eq!(run(&scripted, 1, None).len(), 1);
+
+        // No USD limit, or a token limit alone: nothing to warn about.
+        let once = format!("{free}\nawait m.chat({ask});\n");
+        assert!(run(&once, 1, None).is_empty());
+        let tokens = format!("{free}\nbudget({{ tokens: 500 }});\nawait m.chat({ask});\n");
+        assert!(run(&tokens, 1, None).is_empty());
+
+        // A priced model under a USD limit is limited; no warning.
+        let priced = format!(
+            r#"import {{ model }} from "vaern:ai";
+            const m = model({{ baseUrl: "http://127.0.0.1:PORT/v1", model: "paid",
+                              price: {{ inputPerMTok: 1, outputPerMTok: 1 }} }});
+            await m.chat({ask});
+            "#
+        );
+        assert!(run(&priced, 1, Some(1_000_000_000)).is_empty());
+    }
+
+    #[test]
     fn test_zero_usage_on_a_reply_with_text_keeps_the_reserve_charged() {
         let zero = r#""usage":{"prompt_tokens":0,"completion_tokens":0}"#;
         let reply = |text: &str| {

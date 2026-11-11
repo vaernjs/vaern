@@ -101,6 +101,21 @@
         return value;
     };
 
+    // Configurations whose prices come to 0 nano-USD per token, as the
+    // native side rounds them. Such a model reserves and is charged 0 USD,
+    // so a USD limit cannot hold against it; the first call that meets one
+    // says so, once per run.
+    const unpriced = new Set();
+    let warnedUnpriced = false;
+    const warnUnpriced = (config) => {
+        if (warnedUnpriced || !unpriced.has(config)) return;
+        if (JSON.parse(__vaern_budget_remaining()).nano === null) return;
+        warnedUnpriced = true;
+        console.error(
+            `vaern:ai: model '${JSON.parse(config).model}' has no price, so the USD budget does not limit it: ` +
+            "each call reserves 0 USD. Set price in model(), or limit the run with --budget-tokens.");
+    };
+
     function start(config, options, onDelta) {
         const reqId = nextReqId++;
         const call = JSON.stringify({
@@ -126,7 +141,9 @@
             if (refused) {
                 pending.delete(reqId);
                 reject(failure(JSON.parse(refused)));
+                return;
             }
+            warnUnpriced(config);
         });
     }
 
@@ -210,6 +227,10 @@
             maxOutputTokens: options.maxOutputTokens,
             timeoutMs: options.timeoutMs,
         });
+        const nanoPerToken = (perMTok) => Math.round(Number(perMTok ?? 0) * 1000);
+        if (nanoPerToken(price.inputPerMTok) === 0 && nanoPerToken(price.outputPerMTok) === 0) {
+            unpriced.add(config);
+        }
         return Object.freeze({
             async chat(callOptions) {
                 const r = await start(config, objectArg("chat", callOptions));

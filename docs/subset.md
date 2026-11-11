@@ -495,6 +495,11 @@ reserves its tokens whatever the script declares, so `--budget-tokens` is
 the limit the person starting the run can rely on. Set it whenever the
 script is not trusted to state its prices.
 
+When a USD limit is set and a model whose prices come to 0 makes a call, the
+runtime writes one line to stderr, once per run, naming the model and
+saying that the USD budget does not limit it. The call still goes ahead.
+The line is part of the run's transcript.
+
 ```ts
 import { budget } from "vaern:ai";
 
