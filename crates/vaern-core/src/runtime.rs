@@ -5060,6 +5060,71 @@ mod tests {
     }
 
     #[test]
+    fn test_a_stream_that_never_finishes_is_stopped_at_its_total_deadline() {
+        use std::io::{BufRead, Read};
+        // Sends one event every 40 ms for as long as the client stays: always
+        // inside the 100 ms wait between events, never done.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stub = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            reader.read_exact(&mut vec![0; length]).unwrap();
+            let stream = reader.get_mut();
+            let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
+            stream.write_all(head.as_bytes()).unwrap();
+            let event = "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n";
+            let chunk = format!("{:x}\r\n{event}\r\n", event.len());
+            let started = Instant::now();
+            let mut sent = 0;
+            while started.elapsed() < Duration::from_secs(10)
+                && stream.write_all(chunk.as_bytes()).is_ok()
+            {
+                sent += 1;
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            sent
+        });
+        let code = r#"
+            import { model, ModelError } from "vaern:ai";
+            const m = model({ baseUrl: "http://127.0.0.1:PORT/v1", model: "m", timeoutMs: 100 });
+            let seen = 0;
+            let failure = null;
+            try {
+                for await (const ev of m.stream({ messages: [{ role: "user", content: "x" }] })) seen++;
+            } catch (err) {
+                failure = err;
+            }
+            if (!(failure instanceof ModelError) || failure.stage !== "connect"
+                || !failure.message.includes("did not finish within 10 x timeoutMs")) throw failure;
+            if (seen < 5) throw new Error("only " + seen + " events arrived");
+            "#
+        .replace("PORT", &port.to_string());
+        let started = Instant::now();
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        assert_eq!(runtime.eval("drip.js", &code).unwrap(), 0);
+        // Ten waits of 100 ms, not the stub's ten seconds.
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(900) && took < Duration::from_secs(4),
+            "{took:?}"
+        );
+        drop(runtime);
+        assert!(stub.join().unwrap() < 200);
+    }
+
+    #[test]
     fn test_a_call_that_was_never_sent_gives_its_reserve_back_and_a_sent_one_keeps_it() {
         use std::io::{BufRead, Read};
         // Answers the first request with a 500 and leaves the second without

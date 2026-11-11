@@ -113,6 +113,12 @@ fn stream_error(call: &PreparedCall, stage: &str, status: u16, message: String) 
     }
 }
 
+/// How many times `timeoutMs` a whole stream may take. Each event must
+/// arrive within `timeoutMs` of the one before; without a bound on the
+/// total, a server sending one byte just inside that wait keeps a call, and
+/// the run, alive for as long as it likes.
+pub const STREAM_TOTAL_TIMEOUTS: u32 = 10;
+
 /// Sends a streaming call. `on_delta` receives each text fragment in order;
 /// the returned reply holds the whole text, the usage from the final event
 /// and the raw event text as received.
@@ -150,6 +156,7 @@ pub async fn send(
         })?;
 
     let timeout = call.config.timeout;
+    let deadline = tokio::time::Instant::now() + timeout.saturating_mul(STREAM_TOTAL_TIMEOUTS);
     let response = tokio::time::timeout(timeout, client.request(request))
         .await
         .map_err(|_| stream_error(call, "connect", 0, "no response within timeoutMs".into()))?
@@ -170,15 +177,16 @@ pub async fn send(
     let mut reader = SseReader::default();
     let mut state = StreamState::default();
     loop {
-        let frame = tokio::time::timeout(timeout, body.frame())
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let frame = tokio::time::timeout(timeout.min(left), body.frame())
             .await
             .map_err(|_| {
-                stream_error(
-                    call,
-                    "connect",
-                    status,
-                    "no stream event within timeoutMs".into(),
-                )
+                let message = if left <= timeout {
+                    format!("the stream did not finish within {STREAM_TOTAL_TIMEOUTS} x timeoutMs")
+                } else {
+                    "no stream event within timeoutMs".to_string()
+                };
+                stream_error(call, "connect", status, message)
             })?;
         let Some(frame) = frame else { break };
         let frame = frame.map_err(|err| {

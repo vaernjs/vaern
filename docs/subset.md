@@ -387,7 +387,10 @@ for await (const ev of m.stream({ messages: [{ role: "user", content: "Hi" }] })
   to completion and is recorded and charged. A failure is thrown from the
   loop. `schema` and `tools` cannot be streamed. A streamed call does not
   follow redirects, and `timeoutMs` applies to the wait for the response and
-  to each gap between events.
+  to each gap between events. The whole stream must also finish within 10
+  times `timeoutMs` (ten minutes by default), counted from the request,
+  however steadily events arrive; one that does not fails at stage
+  `connect` and keeps its reserve charged.
 - The result: `text` (the first choice's content, `""` when absent), `json`
   (only with `schema`), `usage`
   `{ inputTokens, outputTokens }` as the server reported them (`null` when
