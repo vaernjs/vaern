@@ -2877,9 +2877,9 @@ impl QuickJsRuntime {
             .get(&("model.call", req_id))
             .map(|pending| pending.eid);
         let charged = match &result {
-            Ok(reply) => match (reply.input_tokens, reply.output_tokens) {
-                (Some(input), Some(output)) => crate::ai::charge_nano(&call.config, input, output),
-                _ => crate::ai::reserve_nano(&call),
+            Ok(reply) => match crate::ai::billable_usage(reply) {
+                Some((input, output)) => crate::ai::charge_nano(&call.config, input, output),
+                None => crate::ai::reserve_nano(&call),
             },
             Err(_) => 0,
         };
@@ -2889,13 +2889,12 @@ impl QuickJsRuntime {
             None => result,
         };
         let charge = match &result {
-            Ok(reply) => match (reply.input_tokens, reply.output_tokens) {
-                (Some(input), Some(output)) => Some(crate::budget::Amount {
+            Ok(reply) => {
+                crate::ai::billable_usage(reply).map(|(input, output)| crate::budget::Amount {
                     nano: charged,
                     tokens: input.saturating_add(output),
-                }),
-                _ => None,
-            },
+                })
+            }
             Err(_) => None,
         };
         let settled = self.budget.borrow_mut().settle(
@@ -5091,6 +5090,70 @@ mod tests {
         // The second run opened the ledger with what the first left in it.
         assert_eq!(opened[0], 0);
         assert!(opened[1] > 0, "{opened:?}");
+    }
+
+    #[test]
+    fn test_zero_usage_on_a_reply_with_text_keeps_the_reserve_charged() {
+        let zero = r#""usage":{"prompt_tokens":0,"completion_tokens":0}"#;
+        let reply = |text: &str| {
+            format!(
+                r#"{{"choices":[{{"message":{{"content":"{text}"}},"finish_reason":"stop"}}],{zero}}}"#
+            )
+        };
+        let sse = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"hi\"}},\"finish_reason\":\"stop\"}}]}}\n\n\
+             data: {{\"choices\":[],{zero}}}\n\ndata: [DONE]\n\n"
+        );
+        let path = "/v1/chat/completions";
+        let (port, stub) = canned_http(vec![
+            vec![(path, "application/json", reply("hello"))],
+            vec![(path, "text/event-stream", sse)],
+            vec![(path, "application/json", reply(""))],
+        ]);
+        // 1 USD per million tokens is 1000 nano-USD per token.
+        let code = r#"
+            import { model, budget } from "vaern:ai";
+            budget({ usd: 1, tokens: 1000 });
+            const m = model({ baseUrl: "http://127.0.0.1:PORT/v1", model: "m",
+                              price: { inputPerMTok: 1, outputPerMTok: 1 } });
+            const ask = { messages: [{ role: "user", content: "x" }], maxTokens: 10 };
+            const left = () => budget.remaining().tokens;
+
+            const said = await m.chat(ask);
+            const reserve = 1000 - left();
+            if (!(reserve >= 10) || said.costUsd !== reserve * 1000 / 1e9
+                || said.usage.inputTokens !== 0) throw new Error(JSON.stringify([said, reserve]));
+
+            // A streamed request is longer, so its reserve is its own.
+            let last;
+            for await (const ev of m.stream(ask)) last = ev;
+            const streamed = 1000 - reserve - left();
+            if (last.text !== "hi" || !(streamed >= 10)
+                || last.costUsd !== streamed * 1000 / 1e9) {
+                throw new Error(JSON.stringify([last, streamed]));
+            }
+
+            // An empty reply reporting zero is taken at its word.
+            const empty = await m.chat(ask);
+            if (empty.costUsd !== 0 || left() !== 1000 - reserve - streamed) {
+                throw new Error(JSON.stringify([empty, left()]));
+            }
+            "#
+        .replace("PORT", &port.to_string());
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join(".vaern");
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        runtime.set_journal_home(Some(home.clone()));
+        assert_eq!(runtime.eval("zero_usage.js", &code).unwrap(), 0);
+        stub.join().unwrap();
+        let charged: Vec<u64> = journal_records(&home)
+            .iter()
+            .filter(|r| r["kind"] == "model.call")
+            .map(|r| r["res"]["charged_nano_usd"].as_u64().unwrap())
+            .collect();
+        assert_eq!(charged.len(), 3);
+        assert!(charged[0] >= 10_000 && charged[1] >= 10_000, "{charged:?}");
+        assert_eq!(charged[2], 0);
     }
 
     #[test]

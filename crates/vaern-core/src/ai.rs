@@ -339,6 +339,24 @@ pub fn reserve_nano(call: &PreparedCall) -> u64 {
     charge_nano(&call.config, estimate_input_tokens(call), call.max_tokens)
 }
 
+/// The `(input, output)` token counts a reply is charged from, or `None`
+/// when it keeps its whole reserve: the server reported no usage, or it
+/// reported zero tokens for a reply that carries text or tool calls. Such a
+/// reply was produced from something, so a zero count is wrong, and
+/// charging it would hand the reserve back for a call that was billed.
+pub fn billable_usage(reply: &ModelReply) -> Option<(u64, u64)> {
+    let (input, output) = (reply.input_tokens?, reply.output_tokens?);
+    let has_text = reply.text.as_deref().is_some_and(|text| !text.is_empty());
+    let has_calls = reply
+        .tool_calls
+        .as_array()
+        .is_some_and(|calls| !calls.is_empty());
+    if input == 0 && output == 0 && (has_text || has_calls) {
+        return None;
+    }
+    Some((input, output))
+}
+
 /// The reply's text parsed as JSON and checked against the call's schema.
 /// `Ok(None)` when the call asked for no schema.
 pub fn structured(
@@ -420,6 +438,30 @@ mod tests {
                 other => panic!("expected a config error for {cfg} {call}, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn test_zero_usage_on_a_reply_with_content_is_not_billable() {
+        let reply = |message: &str, usage: &str| {
+            let body = format!(r#"{{"choices":[{{"message":{message}}}]{usage}}}"#);
+            parse_reply("u", 200, body.into_bytes()).unwrap()
+        };
+        let zero = r#","usage":{"prompt_tokens":0,"completion_tokens":0}"#;
+        let call = r#"{"content":null,"tool_calls":[{"id":"c","type":"function","function":{"name":"f","arguments":"{}"}}]}"#;
+
+        assert_eq!(billable_usage(&reply(r#"{"content":"hi"}"#, "")), None);
+        assert_eq!(billable_usage(&reply(r#"{"content":"hi"}"#, zero)), None);
+        assert_eq!(billable_usage(&reply(call, zero)), None);
+        // Nothing came back, so nothing reported is believable.
+        assert_eq!(
+            billable_usage(&reply(r#"{"content":""}"#, zero)),
+            Some((0, 0))
+        );
+        let some = r#","usage":{"prompt_tokens":0,"completion_tokens":2}"#;
+        assert_eq!(
+            billable_usage(&reply(r#"{"content":"hi"}"#, some)),
+            Some((0, 2))
+        );
     }
 
     #[test]

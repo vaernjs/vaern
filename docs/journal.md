@@ -76,7 +76,8 @@ Effects (`fetch`, `fs`, `model.call`, and a tool call's two records):
   recorded as sent.
 - Money is integer nano-USD (10^-9 USD). `charged_nano_usd` is computed
   from the reported usage, or is the call's estimate when the server
-  reported none (see `vaern:ai` in the runtime subset).
+  reported none, or reported zero tokens for a reply with content (see
+  `vaern:ai` in the runtime subset).
 - The API key of a model call is not recorded.
 - If an effect completes but its record cannot be written, the script gets
   the journal error in place of the result.

@@ -395,8 +395,10 @@ for await (const ev of m.stream({ messages: [{ role: "user", content: "Hi" }] })
   the journal (`null` when journalling is off).
 - `costUsd` is computed by the runtime from the reported usage and `price`.
   When the server reports no usage, the call is charged its estimate: input
-  bytes / 3 + 16 per message, plus the full `max_tokens`. This is an
-  estimate; what a provider bills can differ.
+  bytes / 3 + 16 per message, plus the full `max_tokens`. So is a reply
+  that reports zero input and zero output tokens while carrying text or
+  tool calls: `usage` shows the zeros as reported, and `costUsd` is the
+  estimate. This is an estimate; what a provider bills can differ.
 - A failure rejects with a `ModelError` whose `stage` is `config` (bad
   options; nothing was sent), `connect` (no response), `http` (a non-2xx
   status, with `status` set and up to 500 bytes of the body in the
@@ -487,8 +489,9 @@ budget.remaining();                      // { usd: 0.24..., tokens: 49_100 }
   `code` is `RESERVE_EXCEEDS_REMAINING`, with `unit` (`usd` or `tokens`),
   `reserve` and `remaining`. Nothing is sent and no connection is opened.
 - When a call returns, its reserve is replaced by the charge computed from
-  the reported usage. A reply without usage, a failed call and a tool run
-  keep their whole reserve charged. A charge above the reserve stands, and
+  the reported usage. A reply without usage, a reply with text or tool
+  calls that reports zero tokens, a failed call and a tool run keep their
+  whole reserve charged. A charge above the reserve stands, and
   later reserves see it.
 - `budget({ usd, tokens })` returns what remains, as `budget.remaining()`
   does; a unit without a limit is `null`. Limits only go down: a later call
