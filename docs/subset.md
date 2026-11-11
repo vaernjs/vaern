@@ -483,6 +483,15 @@ remaining budget. Reserves and charges are estimates in USD and tokens,
 computed from the prices the script gives; what a provider bills can drift
 from them.
 
+The prices are the script's own: `price` in `model()`, 0 when it is left
+out. A USD limit, from `budget({ usd })` or `--budget-usd`, therefore binds
+only as far as those prices are true. A model declared with no price, or
+with a price of 0, reserves and is charged 0 USD on every call, and no USD
+limit ever stops it. The token limit does not depend on prices: every call
+reserves its tokens whatever the script declares, so `--budget-tokens` is
+the limit the person starting the run can rely on. Set it whenever the
+script is not trusted to state its prices.
+
 ```ts
 import { budget } from "vaern:ai";
 
