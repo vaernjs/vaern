@@ -15,6 +15,8 @@ on-disk format.
 `<run-id>` is the UTC start time and six hex digits, for example
 `20261110-093012-4f1a2b`. `vaern run --no-journal` writes nothing. Runs are
 never deleted by the runtime.
+When several runs start at the same moment in one home, `latest` names one
+of them; pass the run id to address another.
 
 A script cannot open anything under `<home>` with `vaern:fs`: reads, writes
 and appends there reject with `EPERM`, so a run cannot edit its own journal

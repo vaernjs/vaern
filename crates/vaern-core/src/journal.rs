@@ -87,7 +87,7 @@ impl Journal {
         // find it already moved.
         let latest_tmp = runs.join(format!("latest.{run_id}.tmp"));
         if let Err(err) = std::fs::write(&latest_tmp, &run_id)
-            .and_then(|()| std::fs::rename(&latest_tmp, runs.join("latest")))
+            .and_then(|()| replace_file(&latest_tmp, &runs.join("latest")))
         {
             // Best effort: the run is refused either way, and a leftover
             // temporary file is harmless.
@@ -342,6 +342,45 @@ pub fn verify(path: &Path) -> Result<Verified> {
         sealed: last_kind == "run.end",
         torn_tail,
     })
+}
+
+/// Points `to` (the `latest` file) at this run by renaming `from` over it.
+///
+/// On Windows a rename onto a file that another process is replacing at the
+/// same moment fails with access denied, though either rename alone would
+/// succeed. It is tried again for a short while. If it still loses and `to`
+/// was written within the last few seconds, another run started at the same
+/// time holds the pointer; it is as much the latest run as this one, so this
+/// run gives way instead of failing. A `to` that nobody has just written
+/// keeps the error: the directory is not writable. Elsewhere a rename over
+/// an existing file is atomic and a permission error is final.
+fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    const ATTEMPTS: u32 = 20;
+    const JUST_WRITTEN: std::time::Duration = std::time::Duration::from_secs(5);
+    let mut attempt = 0;
+    loop {
+        let err = match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(err) => err,
+        };
+        if !cfg!(windows) || err.kind() != std::io::ErrorKind::PermissionDenied {
+            return Err(err);
+        }
+        if attempt < ATTEMPTS {
+            attempt += 1;
+            std::thread::sleep(std::time::Duration::from_millis(u64::from(attempt)));
+            continue;
+        }
+        let just_written = std::fs::metadata(to)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|at| at.elapsed().ok())
+            .is_some_and(|age| age < JUST_WRITTEN);
+        if !just_written {
+            return Err(err);
+        }
+        return std::fs::remove_file(from);
+    }
 }
 
 /// The journal file for `id` (or `latest`) under `home`.
