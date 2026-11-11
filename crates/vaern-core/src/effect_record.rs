@@ -170,7 +170,13 @@ pub fn model_outcome(result: &Result<ModelReply>, charged: u64) -> Outcome {
             },
             "charged_nano_usd": charged,
         })),
-        Err(err) => Outcome::Error(error_value(err)),
+        Err(err) => {
+            let mut error = error_value(err);
+            if let Some(fields) = error.as_object_mut() {
+                fields.insert("charged_nano_usd".to_string(), charged.into());
+            }
+            Outcome::Error(error)
+        }
     }
 }
 
@@ -184,8 +190,10 @@ fn error_value(err: &VaernError) -> Value {
             status,
             message,
             action,
+            sent,
         } => json!({
             "stage": stage, "url": url, "status": status, "message": message, "action": action,
+            "sent": sent,
         }),
         VaernError::Fetch {
             stage,

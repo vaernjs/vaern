@@ -26,6 +26,7 @@ use std::convert::Infallible;
 use std::future;
 use std::str::FromStr;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::broadcast;
 use url::Url;
@@ -170,9 +171,40 @@ pub async fn execute_fetch_pooled(
     options: FetchOptions,
     abort_rx: Option<broadcast::Receiver<()>>,
 ) -> Result<FetchResponse> {
-    let url = parse_fetch_url(initial_url)?;
-    let client = client_for(&url, pooled)?;
-    execute_fetch_with(&client, url, options, abort_rx).await
+    execute_fetch_tracked(
+        pooled,
+        initial_url,
+        options,
+        abort_rx,
+        &AtomicBool::new(false),
+    )
+    .await
+}
+
+/// [`execute_fetch_pooled`], also reporting through `unsent` whether a
+/// failure is known to have come before any of the request was written: the
+/// URL was refused, or no connection to the first host could be made. It
+/// stays false for every other failure, a timeout included, because the
+/// request may have reached the server by then.
+pub async fn execute_fetch_tracked(
+    pooled: &HttpClient,
+    initial_url: &str,
+    options: FetchOptions,
+    abort_rx: Option<broadcast::Receiver<()>>,
+    unsent: &AtomicBool,
+) -> Result<FetchResponse> {
+    let prepared = parse_fetch_url(initial_url).and_then(|url| {
+        let client = client_for(&url, pooled)?;
+        Ok((client, url))
+    });
+    let (client, url) = match prepared {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            unsent.store(true, Ordering::Relaxed);
+            return Err(err);
+        }
+    };
+    execute_fetch_with(&client, url, options, abort_rx, unsent).await
 }
 
 // The pooled client only ever holds the public roots: the test origin gets a
@@ -233,6 +265,7 @@ async fn execute_fetch_with(
     mut current_url: Url,
     options: FetchOptions,
     mut abort_rx: Option<broadcast::Receiver<()>>,
+    unsent: &AtomicBool,
 ) -> Result<FetchResponse> {
     let timeout_duration = options.timeout.unwrap_or(DEFAULT_TIMEOUT);
 
@@ -315,6 +348,9 @@ async fn execute_fetch_with(
                     Ok(Ok(response)) => response,
                     Ok(Err(err)) => {
                         let stage = if err.is_connect() {
+                            // No connection, so nothing was written. A
+                            // later hop means an earlier request was.
+                            unsent.store(redirect_count == 0, Ordering::Relaxed);
                             "connect"
                         } else if err.to_string().contains("certificate") || err.to_string().contains("tls") {
                             "tls"
@@ -571,7 +607,8 @@ mod tests {
         let Ok(url) = parse_fetch_url("https://127.0.0.1:8443/test") else {
             panic!("failed to parse the test URL");
         };
-        let result = execute_fetch_with(&client, url, FetchOptions::default(), None).await;
+        let unsent = AtomicBool::new(false);
+        let result = execute_fetch_with(&client, url, FetchOptions::default(), None, &unsent).await;
         match result {
             Err(VaernError::Fetch { stage, .. }) => assert_eq!(stage, "connect"),
             Ok(res) => panic!(

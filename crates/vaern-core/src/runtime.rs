@@ -380,6 +380,7 @@ fn model_error_info(err: VaernError) -> serde_json::Value {
             status,
             message,
             action,
+            ..
         } => serde_json::json!({
             "stage": stage, "url": url, "status": status, "message": message, "action": action,
         }),
@@ -2881,7 +2882,11 @@ impl QuickJsRuntime {
                 Some((input, output)) => crate::ai::charge_nano(&call.config, input, output),
                 None => crate::ai::reserve_nano(&call),
             },
-            Err(_) => 0,
+            // Nothing reached the server, so nothing can have been billed.
+            Err(VaernError::Model { sent: false, .. }) => 0,
+            // The request went out. Whether it was billed is unknown, so
+            // the failure costs what the call could have cost.
+            Err(_) => crate::ai::reserve_nano(&call),
         };
         let outcome = crate::effect_record::model_outcome(&result, charged);
         let result = match self.record_effect("model.call", req_id, outcome) {
@@ -2895,6 +2900,7 @@ impl QuickJsRuntime {
                     tokens: input.saturating_add(output),
                 })
             }
+            Err(VaernError::Model { sent: false, .. }) => Some(crate::budget::Amount::default()),
             Err(_) => None,
         };
         let settled = self.budget.borrow_mut().settle(
@@ -2940,10 +2946,15 @@ impl QuickJsRuntime {
                 }),
             },
             Err(err) => {
+                let failed_call = matches!(err, VaernError::Model { .. });
                 let mut info = model_error_info(err);
                 if let Some(fields) = info.as_object_mut() {
                     fields.insert("reqId".into(), req_id.into());
                     fields.insert("ok".into(), false.into());
+                    if failed_call {
+                        fields.insert("chargedNano".into(), charged.into());
+                        fields.insert("eid".into(), eid.into());
+                    }
                 }
                 info
             }
@@ -5046,6 +5057,107 @@ mod tests {
         );
         let ledger = crate::journal::verify(&home.join("budgets/team.jsonl")).unwrap();
         assert_eq!(ledger.records, 8);
+    }
+
+    #[test]
+    fn test_a_call_that_was_never_sent_gives_its_reserve_back_and_a_sent_one_keeps_it() {
+        use std::io::{BufRead, Read};
+        // Answers the first request with a 500 and leaves the second without
+        // an answer until the caller's timeout has passed.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stub = std::thread::spawn(move || {
+            for answer in [true, false] {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                reader.read_exact(&mut vec![0; length]).unwrap();
+                if answer {
+                    let reply = "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 4\r\nconnection: close\r\n\r\nbusy";
+                    reader.get_mut().write_all(reply.as_bytes()).unwrap();
+                } else {
+                    std::thread::sleep(Duration::from_millis(900));
+                }
+            }
+        });
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join(".vaern");
+        let main = root.path().join("main.js");
+        let script = r#"
+            import { model, budget, ModelError } from "vaern:ai";
+            budget({ tokens: 1000 });
+            const price = { inputPerMTok: 1, outputPerMTok: 1 };
+            const ask = { messages: [{ role: "user", content: "x" }], maxTokens: 10 };
+            const left = () => budget.remaining().tokens;
+            const failure = (promise) => promise.then(
+                () => { throw new Error("the call resolved"); },
+                (err) => { if (!(err instanceof ModelError)) throw err; return err; });
+
+            // Nothing listens on port 1: no connection, so nothing was sent.
+            const nowhere = model({ baseUrl: "http://127.0.0.1:1/v1", model: "m", price });
+            const refused = await failure(nowhere.chat(ask));
+            if (refused.stage !== "connect" || refused.costUsd !== 0 || left() !== 1000) {
+                throw new Error(JSON.stringify([refused.stage, refused.costUsd, left()]));
+            }
+            const stream = await failure((async () => {
+                for await (const ev of nowhere.stream(ask)) {}
+            })());
+            if (stream.stage !== "connect" || left() !== 1000) throw new Error("stream " + left());
+
+            // The server answered 500: the request was sent, the reserve stays.
+            const m = model({ baseUrl: "http://127.0.0.1:PORT/v1", model: "m", price, timeoutMs: 300 });
+            const failed = await failure(m.chat(ask));
+            const reserve = 1000 - left();
+            if (failed.stage !== "http" || !(reserve >= 10) || failed.costUsd !== reserve * 1000 / 1e9) {
+                throw new Error(JSON.stringify([failed.stage, failed.costUsd, reserve]));
+            }
+            // No answer in time: the request was sent, so this one stays too.
+            const late = await failure(m.chat(ask));
+            if (late.stage !== "connect" || late.costUsd !== failed.costUsd) {
+                throw new Error(JSON.stringify([late.stage, late.costUsd]));
+            }
+            console.log(left() === 1000 - 2 * reserve);
+            "#
+        .replace("PORT", &port.to_string());
+        std::fs::write(&main, script).unwrap();
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        runtime.set_journal_home(Some(home.clone()));
+        assert_eq!(runtime.run_file(&main).unwrap(), 0);
+        stub.join().unwrap();
+
+        let records = journal_records(&home);
+        let last_console = records.iter().rfind(|r| r["kind"] == "console").unwrap();
+        assert_eq!(last_console["text"], "true\n");
+        // The journal's charge agrees with what the budget kept.
+        let calls: Vec<(bool, u64)> = records
+            .iter()
+            .filter(|r| r["kind"] == "model.call")
+            .map(|r| {
+                let error = &r["error"];
+                (
+                    error["sent"].as_bool().unwrap(),
+                    error["charged_nano_usd"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(calls.len(), 4, "{records:#?}");
+        assert_eq!(&calls[..2], [(false, 0), (false, 0)]);
+        assert!(calls[2].0 && calls[2].1 >= 10_000, "{calls:?}");
+        assert_eq!(calls[3], calls[2]);
+
+        // A replay rebuilds the same budget from the recorded outcomes.
+        let summary = replay_latest(&home).unwrap();
+        assert_eq!((summary.console, summary.exit_code), (1, 0));
     }
 
     #[test]

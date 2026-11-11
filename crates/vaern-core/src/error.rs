@@ -104,6 +104,8 @@ pub enum VaernError {
 
     /// A `vaern:ai` model call failed. `stage` is `config`, `connect`, `http`,
     /// `parse` or `schema`; `status` is the HTTP status, 0 when there was none.
+    /// `sent` is false only when the failure is known to have come before
+    /// any of the request was written, so the provider cannot have billed it.
     #[error("model call failed at stage '{stage}' for '{url}': {message}. {action}")]
     Model {
         stage: String,
@@ -111,6 +113,7 @@ pub enum VaernError {
         status: u16,
         message: String,
         action: String,
+        sent: bool,
     },
 
     /// A budget refused a reservation or could not be opened. `code` is

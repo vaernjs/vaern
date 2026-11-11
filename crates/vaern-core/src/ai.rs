@@ -83,6 +83,29 @@ fn model_error(stage: &str, url: &str, status: u16, message: String, action: &st
         status,
         message,
         action: action.to_string(),
+        sent: true,
+    }
+}
+
+/// Marks a model error as raised before any of the request was written.
+pub(crate) fn unsent(err: VaernError) -> VaernError {
+    match err {
+        VaernError::Model {
+            stage,
+            url,
+            status,
+            message,
+            action,
+            ..
+        } => VaernError::Model {
+            stage,
+            url,
+            status,
+            message,
+            action,
+            sent: false,
+        },
+        other => other,
     }
 }
 
@@ -235,21 +258,28 @@ pub async fn send(client: &HttpClient, call: &PreparedCall) -> Result<ModelReply
         timeout: Some(call.config.timeout),
         max_body_bytes: crate::fetch::MAX_RESPONSE_BODY_BYTES,
     };
-    let response = crate::fetch::execute_fetch_pooled(client, &call.endpoint, options, None)
-        .await
-        .map_err(|err| {
-            let message = match err {
-                VaernError::Fetch { stage, message, .. } => format!("{stage}: {message}"),
-                other => other.to_string(),
-            };
-            model_error(
-                "connect",
-                &call.endpoint,
-                0,
-                message,
-                "Check that the model server is running and baseUrl is right.",
-            )
-        })?;
+    let never_sent = std::sync::atomic::AtomicBool::new(false);
+    let response =
+        crate::fetch::execute_fetch_tracked(client, &call.endpoint, options, None, &never_sent)
+            .await
+            .map_err(|err| {
+                let message = match err {
+                    VaernError::Fetch { stage, message, .. } => format!("{stage}: {message}"),
+                    other => other.to_string(),
+                };
+                let failed = model_error(
+                    "connect",
+                    &call.endpoint,
+                    0,
+                    message,
+                    "Check that the model server is running and baseUrl is right.",
+                );
+                if never_sent.load(std::sync::atomic::Ordering::Relaxed) {
+                    unsent(failed)
+                } else {
+                    failed
+                }
+            })?;
     parse_reply(&call.endpoint, response.status, response.body)
 }
 

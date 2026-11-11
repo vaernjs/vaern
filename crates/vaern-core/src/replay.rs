@@ -100,6 +100,8 @@ fn recorded_error(kind: &str, error: &Value) -> VaernError {
                 .unwrap_or(0),
             message: field("message"),
             action: field("action"),
+            // Runs recorded before the field existed kept every reserve.
+            sent: error["sent"].as_bool().unwrap_or(true),
         },
         _ => VaernError::Replayed {
             message: field("message"),

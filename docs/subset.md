@@ -405,8 +405,17 @@ for await (const ev of m.stream({ messages: [{ role: "user", content: "Hi" }] })
   message), `parse` (the reply is not an OpenAI-style completion), `schema`
   (the reply is not JSON or does not match `schema`; `path` names the place,
   such as `$.items[2].name`) or `journal` (the reply arrived but could not
-  be recorded). It also carries `url` and `action`. A `schema` error also
-  carries `costUsd` and `effect`: the call was made and is charged.
+  be recorded). It also carries `url` and `action`. A failure after
+  dispatch also carries `costUsd` and `effect`: what the failed call was
+  charged, and its `eid` in the journal.
+- A failed call is charged by whether its request can have reached the
+  server. When no connection could be made, or the URL was refused, nothing
+  was written, so the call is charged nothing and its reserve is returned.
+  Every other failure keeps the whole reserve charged: an HTTP error
+  status, a reply that cannot be parsed, a broken connection, and a timeout,
+  because the request was sent and the runtime cannot know whether the
+  provider billed it. A `schema` failure is charged from the reported usage
+  like a reply that matched.
 
 ### Tools
 
@@ -490,8 +499,9 @@ budget.remaining();                      // { usd: 0.24..., tokens: 49_100 }
   `reserve` and `remaining`. Nothing is sent and no connection is opened.
 - When a call returns, its reserve is replaced by the charge computed from
   the reported usage. A reply without usage, a reply with text or tool
-  calls that reports zero tokens, a failed call and a tool run keep their
-  whole reserve charged. A charge above the reserve stands, and
+  calls that reports zero tokens, a tool run, and a failed call whose
+  request was sent keep their whole reserve charged. A call that failed
+  before anything was sent gets its reserve back. A charge above the reserve stands, and
   later reserves see it.
 - `budget({ usd, tokens })` returns what remains, as `budget.remaining()`
   does; a unit without a limit is `null`. Limits only go down: a later call

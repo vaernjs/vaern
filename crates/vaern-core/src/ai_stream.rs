@@ -109,6 +109,7 @@ fn stream_error(call: &PreparedCall, stage: &str, status: u16, message: String) 
         status,
         message,
         action: action.to_string(),
+        sent: true,
     }
 }
 
@@ -120,10 +121,14 @@ pub async fn send(
     call: &PreparedCall,
     on_delta: impl Fn(String),
 ) -> Result<ModelReply> {
-    let uri: hyper::Uri = call
-        .endpoint
-        .parse()
-        .map_err(|err| stream_error(call, "config", 0, format!("invalid endpoint URL: {err}")))?;
+    let uri: hyper::Uri = call.endpoint.parse().map_err(|err| {
+        crate::ai::unsent(stream_error(
+            call,
+            "config",
+            0,
+            format!("invalid endpoint URL: {err}"),
+        ))
+    })?;
     let mut request = Request::builder()
         .method(Method::POST)
         .uri(uri)
@@ -135,13 +140,29 @@ pub async fn send(
     // The builder's error names the bad header only, never its value.
     let request = request
         .body(Full::new(Bytes::from(call.body.to_string())).boxed())
-        .map_err(|err| stream_error(call, "config", 0, format!("invalid request: {err}")))?;
+        .map_err(|err| {
+            crate::ai::unsent(stream_error(
+                call,
+                "config",
+                0,
+                format!("invalid request: {err}"),
+            ))
+        })?;
 
     let timeout = call.config.timeout;
     let response = tokio::time::timeout(timeout, client.request(request))
         .await
         .map_err(|_| stream_error(call, "connect", 0, "no response within timeoutMs".into()))?
-        .map_err(|err| stream_error(call, "connect", 0, err.to_string()))?;
+        .map_err(|err| {
+            // Without a connection nothing was written.
+            let never_sent = err.is_connect();
+            let failed = stream_error(call, "connect", 0, err.to_string());
+            if never_sent {
+                crate::ai::unsent(failed)
+            } else {
+                failed
+            }
+        })?;
     let status = response.status().as_u16();
     let ok = (200..300).contains(&status);
     let mut body = response.into_body();
