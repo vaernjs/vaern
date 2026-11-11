@@ -2402,9 +2402,10 @@ impl QuickJsRuntime {
                 globalThis.__vaern_dispatch_fetch = (info) => {
                     const cb = __fetchCallbacks.get(info.reqId);
                     if (!cb) return;
-                    __fetchCallbacks.delete(info.reqId);
 
                     if (info.success) {
+                        // Built before the callback is removed, so a throw
+                        // here leaves it for __vaern_reject_fetch.
                         const headers = new Headers(info.headers);
                         const res = new Response(info.body, {
                             status: info.status,
@@ -2412,8 +2413,10 @@ impl QuickJsRuntime {
                             headers,
                             url: info.url
                         });
+                        __fetchCallbacks.delete(info.reqId);
                         cb.resolve(res);
                     } else {
+                        __fetchCallbacks.delete(info.reqId);
                         if (info.message && info.message.includes("aborted by AbortSignal")) {
                             const err = (cb.signal && cb.signal.reason) || new Error("The operation was aborted");
                             err.name = "AbortError";
@@ -2426,6 +2429,14 @@ impl QuickJsRuntime {
                             cb.reject(err);
                         }
                     }
+                };
+
+                globalThis.__vaern_reject_fetch = (reqId, err) => {
+                    const cb = __fetchCallbacks.get(reqId);
+                    if (!cb) return false;
+                    __fetchCallbacks.delete(reqId);
+                    cb.reject(err);
+                    return true;
                 };
 
                 // vaern:fs: whole-file reads and writes
@@ -2757,7 +2768,48 @@ impl QuickJsRuntime {
             },
             None => completion,
         };
-        let _ = self.context.with(|ctx| -> rquickjs::Result<()> {
+        let req_id = completion.req_id;
+        let unsettled = self.context.with(|ctx| {
+            if Self::settle_fetch(&ctx, completion).is_ok() {
+                return None;
+            }
+            Self::reject_undelivered(&ctx, "__vaern_reject_fetch", "fetch request", req_id)
+        });
+        self.note_unsettled(unsettled);
+    }
+
+    /// Rejects the promise of request `req_id` with the exception a failed
+    /// delivery left pending, most often out of memory while the result was
+    /// built in the heap. The script can then handle it; otherwise the
+    /// promise would never settle and the run could end with status 0.
+    /// Returns what to report when even that fails.
+    fn reject_undelivered(ctx: &Ctx<'_>, hook: &str, what: &str, req_id: u32) -> Option<String> {
+        let exception = ctx.catch();
+        let rejected = ctx
+            .globals()
+            .get::<_, Function>(hook)
+            .and_then(|reject| reject.call::<_, bool>((req_id, exception)));
+        match rejected {
+            Ok(true) => None,
+            Ok(false) => Some(format!(
+                "{what} {req_id} failed while its result was delivered"
+            )),
+            Err(err) => Some(format!("{what} {req_id} could not be rejected: {err}")),
+        }
+    }
+
+    /// Fails the run with `message` when a result reached no promise.
+    fn note_unsettled(&self, message: Option<String>) {
+        if let Some(message) = message {
+            let mut s = self.state.borrow_mut();
+            if s.unhandled_error.is_none() {
+                s.unhandled_error = Some(message);
+            }
+        }
+    }
+
+    fn settle_fetch(ctx: &Ctx<'_>, completion: FetchCompletion) -> rquickjs::Result<()> {
+        {
             let dispatch_fn: Function = ctx.globals().get("__vaern_dispatch_fetch")?;
             let info = Object::new(ctx.clone())?;
             info.set("reqId", completion.req_id)?;
@@ -2807,7 +2859,7 @@ impl QuickJsRuntime {
 
             dispatch_fn.call::<_, ()>((info,))?;
             Ok(())
-        });
+        }
     }
 
     /// Settles a model call's promise. The charge comes from reported usage;
@@ -2897,18 +2949,17 @@ impl QuickJsRuntime {
                 info
             }
         };
-        let delivered = self.context.with(|ctx| -> rquickjs::Result<()> {
-            let dispatch: Function = ctx.globals().get("__vaern_dispatch_model")?;
-            dispatch.call::<_, ()>((info.to_string(),))
-        });
-        if let Err(err) = delivered {
-            let mut s = self.state.borrow_mut();
-            if s.unhandled_error.is_none() {
-                s.unhandled_error = Some(format!(
-                    "vaern:ai call {req_id} could not be delivered to the script: {err}"
-                ));
+        let unsettled = self.context.with(|ctx| {
+            let delivered = ctx
+                .globals()
+                .get::<_, Function>("__vaern_dispatch_model")
+                .and_then(|dispatch| dispatch.call::<_, ()>((info.to_string(),)));
+            if delivered.is_ok() {
+                return None;
             }
-        }
+            Self::reject_undelivered(&ctx, "__vaern_reject_model", "vaern:ai call", req_id)
+        });
+        self.note_unsettled(unsettled);
     }
 
     /// The full resolution error behind a failed import, when `message` is
@@ -2939,31 +2990,9 @@ impl QuickJsRuntime {
             if Self::settle_fs(&ctx, completion).is_ok() {
                 return None;
             }
-            // Building the result threw, most often out of memory for a large
-            // text read. Rejecting with that exception lets the script handle
-            // it; otherwise the promise would never settle and the run could
-            // end with status 0.
-            let exception = ctx.catch();
-            let rejected = ctx
-                .globals()
-                .get::<_, Function>("__vaern_reject_fs")
-                .and_then(|reject| reject.call::<_, bool>((req_id, exception)));
-            match rejected {
-                Ok(true) => None,
-                Ok(false) => Some(format!(
-                    "vaern:fs request {req_id} failed while its result was delivered"
-                )),
-                Err(err) => Some(format!(
-                    "vaern:fs request {req_id} could not be rejected: {err}"
-                )),
-            }
+            Self::reject_undelivered(&ctx, "__vaern_reject_fs", "vaern:fs request", req_id)
         });
-        if let Some(message) = unsettled {
-            let mut s = self.state.borrow_mut();
-            if s.unhandled_error.is_none() {
-                s.unhandled_error = Some(message);
-            }
-        }
+        self.note_unsettled(unsettled);
     }
 
     fn settle_fs<'js>(ctx: &Ctx<'js>, completion: FsCompletion) -> rquickjs::Result<()> {
@@ -3013,40 +3042,74 @@ impl QuickJsRuntime {
 
     fn dispatch_server_request(&self, req: ServerIncomingRequest) {
         let req_id = req.req_id;
-        let resp_sender = req.resp_sender;
-        self.state
-            .borrow_mut()
-            .server_resp_senders
-            .insert(req_id, resp_sender);
-
-        let _ = self.context.with(|ctx| -> rquickjs::Result<()> {
-            let dispatch_fn: Function = ctx.globals().get("__vaern_dispatch_server_request")?;
-            let info = Object::new(ctx.clone())?;
-            info.set("serverId", req.server_id)?;
-            info.set("reqId", req.req_id as f64)?;
-            info.set("method", req.method.as_str())?;
-            info.set("uri", req.uri.as_str())?;
-            info.set("hostname", req.hostname.as_str())?;
-            info.set("port", req.port)?;
-
-            let headers_arr = Array::new(ctx.clone())?;
-            for (i, (k, v)) in req.headers.iter().enumerate() {
-                let pair = Array::new(ctx.clone())?;
-                pair.set(0, k.as_str())?;
-                pair.set(1, v.as_str())?;
-                headers_arr.set(i, pair)?;
+        let line = format!("{} {}", req.method, req.uri);
+        let failure = self.context.with(|ctx| {
+            let (dispatch_fn, info) = match Self::server_request_info(&ctx, &req) {
+                Ok(built) => built,
+                Err(_) => return Some((describe_rejection(&ctx.catch()), Some(req.resp_sender))),
+            };
+            // Registered before the call: a request for an unknown server is
+            // answered from inside it.
+            self.state
+                .borrow_mut()
+                .server_resp_senders
+                .insert(req_id, req.resp_sender);
+            match dispatch_fn.call::<_, ()>((info,)) {
+                Ok(()) => None,
+                Err(_) => {
+                    let reason = describe_rejection(&ctx.catch());
+                    let sender = self.state.borrow_mut().server_resp_senders.remove(&req_id);
+                    Some((reason, sender))
+                }
             }
-            info.set("headers", headers_arr)?;
-
-            let body_arr = Array::new(ctx.clone())?;
-            for (i, &byte) in req.body.iter().enumerate() {
-                body_arr.set(i, byte)?;
-            }
-            info.set("body", body_arr)?;
-
-            dispatch_fn.call::<_, ()>((info,))?;
-            Ok(())
         });
+        // The request never reached the handler, so nothing else will answer
+        // it: the client would wait until it gave up.
+        if let Some((reason, sender)) = failure {
+            eprintln!(
+                "[ERROR] {line}: the request could not be delivered to the handler: {reason}"
+            );
+            if let Some(sender) = sender {
+                let _ = sender.send(ServerResponse {
+                    status: 500,
+                    status_text: "Internal Server Error".to_string(),
+                    headers: vec![("content-type".to_string(), "text/plain".to_string())],
+                    body: ServerResponseBody::Full(b"Internal Server Error\n".to_vec()),
+                });
+            }
+        }
+    }
+
+    /// Builds the object the JavaScript side receives for `req`, and finds
+    /// the function to hand it to.
+    fn server_request_info<'js>(
+        ctx: &Ctx<'js>,
+        req: &ServerIncomingRequest,
+    ) -> rquickjs::Result<(Function<'js>, Object<'js>)> {
+        let dispatch_fn: Function = ctx.globals().get("__vaern_dispatch_server_request")?;
+        let info = Object::new(ctx.clone())?;
+        info.set("serverId", req.server_id)?;
+        info.set("reqId", req.req_id as f64)?;
+        info.set("method", req.method.as_str())?;
+        info.set("uri", req.uri.as_str())?;
+        info.set("hostname", req.hostname.as_str())?;
+        info.set("port", req.port)?;
+
+        let headers_arr = Array::new(ctx.clone())?;
+        for (i, (k, v)) in req.headers.iter().enumerate() {
+            let pair = Array::new(ctx.clone())?;
+            pair.set(0, k.as_str())?;
+            pair.set(1, v.as_str())?;
+            headers_arr.set(i, pair)?;
+        }
+        info.set("headers", headers_arr)?;
+
+        let body_arr = Array::new(ctx.clone())?;
+        for (i, &byte) in req.body.iter().enumerate() {
+            body_arr.set(i, byte)?;
+        }
+        info.set("body", body_arr)?;
+        Ok((dispatch_fn, info))
     }
 
     fn dispatch_stream_chunk_sent(&self, sent: StreamChunkSent) {
@@ -5585,6 +5648,155 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("bad.js:2:"), "{text}");
+    }
+
+    /// Serves one HTTP response whose headers alone take about 320 KiB.
+    fn wide_reply() -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, Read};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            reader.read_exact(&mut vec![0; length]).unwrap();
+            let mut head =
+                String::from("HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n");
+            for i in 0..80 {
+                head.push_str(&format!("x-pad-{i}: {}\r\n", "h".repeat(4000)));
+            }
+            head.push_str("\r\nok");
+            reader.get_mut().write_all(head.as_bytes()).unwrap();
+        });
+        (port, server)
+    }
+
+    /// A script that fills the heap, ending with blocks of `block` bytes,
+    /// frees `spare` of those, awaits `call`, and exits 0 only if that
+    /// promise rejected.
+    fn with_full_heap(imports: &str, block: usize, spare: usize, call: &str) -> String {
+        format!(
+            r#"
+            {imports}
+            process.exitCode = 3;
+            const hold = [];
+            const fill = (size) => {{
+                try {{ for (;;) hold.push(new ArrayBuffer(size)); }} catch {{}}
+            }};
+            fill(8 * 1024 * 1024);
+            fill({block});
+            hold.length = Math.max(0, hold.length - {spare});
+            let outcome;
+            try {{
+                await {call};
+                outcome = "resolved";
+            }} catch (err) {{
+                outcome = "rejected";
+            }}
+            hold.length = 0;
+            process.exitCode = outcome === "rejected" ? 0 : 4;
+        "#
+        )
+    }
+
+    #[test]
+    fn test_fetch_result_that_does_not_fit_the_heap_rejects() {
+        // The body is two bytes. The headers are built in the heap, where
+        // 128 KiB is left for 320 KiB of them.
+        let (port, server) = wide_reply();
+        let code = with_full_heap(
+            "",
+            64 * 1024,
+            2,
+            &format!(r#"fetch("http://127.0.0.1:{port}/")"#),
+        );
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        let result = runtime.eval("fetch_oom.js", &code);
+        server.join().unwrap();
+        assert_eq!(result.unwrap(), 0);
+    }
+
+    #[test]
+    fn test_model_result_that_does_not_fit_the_heap_rejects() {
+        // The reply is valid JSON whose text is larger than the heap has left.
+        let text = "a".repeat(24 * 1024 * 1024);
+        let body = format!(
+            r#"{{"choices":[{{"message":{{"content":"{text}"}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":1,"completion_tokens":1}}}}"#
+        );
+        let (port, server) = canned_http(vec![vec![(
+            "/v1/chat/completions",
+            "application/json",
+            body,
+        )]]);
+        let code = with_full_heap(
+            r#"import { model } from "vaern:ai";"#,
+            8 * 1024 * 1024,
+            2,
+            &format!(
+                r#"model({{ baseUrl: "http://127.0.0.1:{port}/v1", model: "m" }})
+                    .chat({{ messages: [{{ role: "user", content: "x" }}], maxTokens: 8 }})"#
+            ),
+        );
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        let result = runtime.eval("model_oom.js", &code);
+        server.join().unwrap();
+        assert_eq!(result.unwrap(), 0);
+    }
+
+    #[test]
+    fn test_request_that_cannot_reach_its_handler_is_answered_with_500() {
+        use std::io::Read;
+        // The script fills the heap in the turn that starts the server, so
+        // the request arrives while there is no room to hand it over.
+        let client = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let mut stream = loop {
+                match std::net::TcpStream::connect("127.0.0.1:8984") {
+                    Ok(stream) => break stream,
+                    Err(err) if started.elapsed() > Duration::from_secs(10) => panic!("{err}"),
+                    Err(_) => std::thread::sleep(Duration::from_millis(20)),
+                }
+            };
+            let body = vec![b'b'; 512 * 1024];
+            let head = format!(
+                "POST /in HTTP/1.1\r\nhost: x\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(&body).unwrap();
+            let mut reply = String::new();
+            stream.read_to_string(&mut reply).unwrap();
+            reply
+        });
+        let code = r#"
+            import { serve } from "vaern:http";
+            let handled = 0;
+            const server = serve(() => (handled++, new Response("ok")), { port: 8984, hostname: "127.0.0.1" });
+            const hold = [];
+            const fill = (size) => { try { for (;;) hold.push(new ArrayBuffer(size)); } catch {} };
+            fill(8 * 1024 * 1024);
+            fill(64 * 1024);
+            hold.length -= 4;
+            await new Promise((resolve) => setTimeout(resolve, 1500));
+            hold.length = 0;
+            await server.close();
+            process.exitCode = handled === 0 ? 0 : 4;
+        "#;
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        let result = runtime.eval("serve_oom.js", code);
+        assert_eq!(result.unwrap(), 0);
+        let reply = client.join().unwrap();
+        assert!(reply.starts_with("HTTP/1.1 500 "), "{reply}");
     }
 
     #[test]

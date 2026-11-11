@@ -36,10 +36,12 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum number of redirects followed before returning a typed error.
 pub const MAX_REDIRECTS: usize = 20;
 
-/// Largest response body a fetch reads. The body reaches JavaScript as an
-/// ArrayBuffer that owns the Rust buffer, outside the QuickJS heap cap, so
-/// without this bound a single response could take all host memory.
-pub const MAX_RESPONSE_BODY_BYTES: usize = crate::runtime::HEAP_LIMIT_BYTES;
+/// Largest response body a fetch reads: a quarter of the JavaScript heap
+/// cap, the same bound as a `vaern:fs` read. The body is handed to the
+/// script as an ArrayBuffer and usually decoded into a heap string of up to
+/// two bytes per character, so a limit equal to the heap cap would pass
+/// here and then fail inside the heap.
+pub const MAX_RESPONSE_BODY_BYTES: usize = crate::runtime::HEAP_LIMIT_BYTES / 4;
 
 /// Headers that frame or route an HTTP/1.1 message. The runtime derives them
 /// from the URL and the body; a script-supplied value can disagree with the
@@ -953,7 +955,7 @@ mod tests {
             None,
         )
         .await;
-        assert_body_too_large(result, "256 MiB");
+        assert_body_too_large(result, "64 MiB");
         assert!(
             started.elapsed() < Duration::from_secs(4),
             "the read waited for the server"

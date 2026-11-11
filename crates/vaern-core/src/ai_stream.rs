@@ -171,7 +171,7 @@ pub async fn send(
                 call,
                 "parse",
                 status,
-                "the stream is larger than the 256 MiB response limit".into(),
+                "the stream is larger than the 64 MiB response limit".into(),
             ));
         }
         raw.extend_from_slice(&chunk);

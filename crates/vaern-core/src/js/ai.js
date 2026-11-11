@@ -66,9 +66,22 @@
         const info = JSON.parse(json);
         const waiter = pending.get(info.reqId);
         if (!waiter) return;
+        // Built before the waiter is removed, so a throw here leaves it for
+        // __vaern_reject_model.
+        const error = info.ok ? null : failure(info);
         pending.delete(info.reqId);
         if (info.ok) waiter.resolve(info);
-        else waiter.reject(failure(info));
+        else waiter.reject(error);
+    };
+
+    // The native side calls this when handing a result over threw, for
+    // example out of memory while the reply was parsed.
+    globalThis.__vaern_reject_model = (reqId, err) => {
+        const waiter = pending.get(reqId);
+        if (!waiter) return false;
+        pending.delete(reqId);
+        waiter.reject(err);
+        return true;
     };
 
     globalThis.__vaern_model_delta = (reqId, delta) => {

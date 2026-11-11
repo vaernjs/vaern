@@ -215,8 +215,14 @@ trusting the public Mozilla root certificates.
 - An abort stops the request whether it is sent before the request starts,
   while it is in flight, or between redirect hops.
 - The whole response body is read before `fetch` resolves, and bodies over
-  256 MiB are refused with a `read` error. A `Content-Length` over the limit
-  is refused before any of the body is read.
+  64 MiB, a quarter of the heap cap, are refused with a `read` error. A
+  `Content-Length` over the limit is refused before any of the body is
+  read. A model reply is held to the same limit.
+- A response that arrives but cannot be handed to the script, for example
+  because its headers do not fit in what is left of the heap, rejects the
+  `fetch` promise with the engine's error (`InternalError: out of memory`).
+  The same holds for a `vaern:ai` reply. A request that cannot be handed
+  to a `serve()` handler is answered with 500 and logged.
 - Idle connections are kept for reuse for 90 seconds, at most 8 per host.
 - A failed request rejects with an error whose `stage` names the step that
   failed: `dns`, `connect`, `tls`, `send` or `read`. Timeouts and aborts

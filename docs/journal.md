@@ -68,7 +68,7 @@ Effects (`fetch`, `fs`, `model.call`, and a tool call's two records):
   is written when the effect completes, so records appear in completion
   order.
 - A body is stored as `{"utf8": text}` when it is valid UTF-8, else as
-  `{"b64": base64}`. Response bodies are stored whole, up to the 256 MiB
+  `{"b64": base64}`. Response bodies are stored whole, up to the 64 MiB
   fetch limit, so a journal can be large.
 - The values of the `Authorization`, `Proxy-Authorization`, `Cookie`,
   `Set-Cookie`, `X-Api-Key` and `Api-Key` headers are stored as
