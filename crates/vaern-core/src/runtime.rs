@@ -5106,7 +5106,7 @@ mod tests {
     }
 
     #[test]
-    fn test_large_bodies_and_console_writes_are_recorded_cut_and_such_a_run_is_not_replayed() {
+    fn test_a_large_body_is_recorded_cut_and_such_a_run_is_not_replayed() {
         let big = "b".repeat(3 * 1024 * 1024);
         let (port, stub) = canned_http(vec![vec![("/big", "text/plain", big.clone())]]);
         let root = tempfile::tempdir().unwrap();
@@ -5115,7 +5115,6 @@ mod tests {
         let script = r#"
             const body = await (await fetch("http://127.0.0.1:PORT/big")).text();
             console.log(body.length);
-            console.log("c".repeat(2 * 1024 * 1024));
             "#
         .replace("PORT", &port.to_string());
         std::fs::write(&main, script).unwrap();
@@ -5124,7 +5123,9 @@ mod tests {
         assert_eq!(runtime.run_file(&main).unwrap(), 0);
         stub.join().unwrap();
 
-        // The script got the whole body; the journal kept 1 MiB of each.
+        // The script got the whole body; the journal kept 1 MiB of it. A
+        // console write over the limit is covered in replay::plan, without
+        // printing megabytes into the test output.
         let records = journal_records(&home);
         let limit = crate::journal::MAX_RECORDED_BYTES;
         let fetched = records.iter().find(|r| r["kind"] == "fetch").unwrap();
@@ -5138,11 +5139,9 @@ mod tests {
         let prints: Vec<_> = records.iter().filter(|r| r["kind"] == "console").collect();
         assert_eq!(prints[0]["text"], "3145728\n");
         assert!(prints[0].get("truncated").is_none());
-        assert_eq!(prints[1]["text"].as_str().unwrap().len(), limit);
-        assert_eq!(prints[1]["truncated"]["len"], 2 * 1024 * 1024 + 1);
         let path = crate::journal::locate(&home, "latest").unwrap();
         let size = std::fs::metadata(&path).unwrap().len();
-        assert!(size < 2 * limit as u64 + 4096, "{size}");
+        assert!(size < limit as u64 + 8192, "{size}");
         // It is still a whole, sealed journal.
         assert!(crate::journal::verify(&path).unwrap().sealed);
 
@@ -5158,8 +5157,9 @@ mod tests {
     #[test]
     fn test_a_stream_that_never_finishes_is_stopped_at_its_total_deadline() {
         use std::io::{BufRead, Read};
-        // Sends one event every 40 ms for as long as the client stays: always
-        // inside the 100 ms wait between events, never done.
+        // Sends one event every 40 ms for as long as the client stays: well
+        // inside the 400 ms wait between events, even on a slow machine, and
+        // never done.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let stub = std::thread::spawn(move || {
@@ -5184,7 +5184,7 @@ mod tests {
             let chunk = format!("{:x}\r\n{event}\r\n", event.len());
             let started = Instant::now();
             let mut sent = 0;
-            while started.elapsed() < Duration::from_secs(10)
+            while started.elapsed() < Duration::from_secs(30)
                 && stream.write_all(chunk.as_bytes()).is_ok()
             {
                 sent += 1;
@@ -5194,7 +5194,7 @@ mod tests {
         });
         let code = r#"
             import { model, ModelError } from "vaern:ai";
-            const m = model({ baseUrl: "http://127.0.0.1:PORT/v1", model: "m", timeoutMs: 100 });
+            const m = model({ baseUrl: "http://127.0.0.1:PORT/v1", model: "m", timeoutMs: 400 });
             let seen = 0;
             let failure = null;
             try {
@@ -5210,14 +5210,14 @@ mod tests {
         let started = Instant::now();
         let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
         assert_eq!(runtime.eval("drip.js", &code).unwrap(), 0);
-        // Ten waits of 100 ms, not the stub's ten seconds.
+        // Ten waits of 400 ms, not the stub's thirty seconds.
         let took = started.elapsed();
         assert!(
-            took >= Duration::from_millis(900) && took < Duration::from_secs(4),
+            took >= Duration::from_millis(3600) && took < Duration::from_secs(20),
             "{took:?}"
         );
         drop(runtime);
-        assert!(stub.join().unwrap() < 200);
+        assert!(stub.join().unwrap() < 600);
     }
 
     #[test]

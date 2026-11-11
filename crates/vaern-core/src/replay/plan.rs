@@ -257,6 +257,47 @@ mod tests {
     }
 
     #[test]
+    fn test_a_console_write_over_the_limit_is_recorded_cut_and_refuses_a_replay() {
+        let root = tempfile::tempdir().unwrap();
+        let limit = crate::journal::MAX_RECORDED_BYTES;
+        let mut journal = Journal::create(&root.path().join(".vaern")).unwrap();
+        journal
+            .append("run.start", fields(json!({ "script": "main.js" })))
+            .unwrap();
+        // At the limit a write is recorded whole; one byte over, it is cut.
+        let whole = "c".repeat(limit);
+        let over = "c".repeat(limit + 1);
+        journal.console(1, &whole).unwrap();
+        let seq = journal.console(2, &over).unwrap();
+        journal.seal(0, None).unwrap();
+        let path = journal.path().to_path_buf();
+
+        let lines: Vec<Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap()["r"].clone())
+            .collect();
+        assert!(lines[1].get("truncated").is_none());
+        assert_eq!(lines[1]["text"].as_str().unwrap().len(), limit);
+        assert_eq!(lines[2]["text"].as_str().unwrap().len(), limit);
+        assert_eq!(lines[2]["truncated"]["len"], limit + 1);
+        assert_eq!(
+            lines[2]["truncated"]["sha256"],
+            crate::journal::sha256_hex(over.as_bytes())
+        );
+        assert!(crate::journal::verify(&path).unwrap().sealed);
+
+        match Plan::load(&path) {
+            Err(VaernError::Replay { code, message, .. }) => {
+                assert_eq!(code, "TRUNCATED");
+                assert!(message.contains(&format!("record {seq} ")), "{message}");
+                assert!(message.contains("a console write"), "{message}");
+            }
+            other => panic!("{:?}", other.map(|plan| plan.run_id)),
+        }
+    }
+
+    #[test]
     fn test_a_sealed_run_is_read_and_changed_sources_are_refused() {
         let root = tempfile::tempdir().unwrap();
         let script = root.path().join("main.js");
