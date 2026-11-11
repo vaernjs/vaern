@@ -74,8 +74,17 @@ Effects (`fetch`, `fs`, `model.call`, and a tool call's two records):
   fetch limit, so a journal can be large.
 - The values of the `Authorization`, `Proxy-Authorization`, `Cookie`,
   `Set-Cookie`, `X-Api-Key` and `Api-Key` headers are stored as
-  `"[redacted]"`. Secrets carried elsewhere, such as in a URL or a body, are
-  recorded as sent.
+  `"[redacted]"`.
+- In every recorded URL (a fetch's `url`, a response's final `url`, a
+  `Location` header, a model call's `base_url`, and the `url` and `message`
+  of an error) the password of `user:password@host` is stored as
+  `[redacted]`, and so is the value of any query parameter whose name
+  contains `key`, `token`, `secret`, `password`, `passwd`, `signature` or
+  `credential`, ignoring case. A user name is kept. A URL with nothing to
+  redact is recorded exactly as the script gave it.
+- Secrets carried anywhere else are recorded as sent: a request or response
+  body, a header not listed above, a query parameter with another name, the
+  script's arguments in `run.start`, and anything the script prints.
 - Money is integer nano-USD (10^-9 USD). `charged_nano_usd` is computed
   from the reported usage, or is the call's estimate when the server
   reported none, or reported zero tokens for a reply with content (see
@@ -149,6 +158,7 @@ Read live during a replay, so a script whose output depends on them can
 diverge: `Date.now()`, `performance.now()`, `process.env`, and the order of
 timers against effects. Fragments of a streamed model reply are handed back
 together with its completion. Redacted header values come back as
-`"[redacted]"`. A stream that failed part-way records only its error, so the
+`"[redacted]"`, and a response's `url` and an error's `url` come back with
+their credentials redacted, so a script that prints one diverges there. A stream that failed part-way records only its error, so the
 fragments it delivered first are not handed back. `serve()` stops a replay,
 because incoming requests are not recorded.

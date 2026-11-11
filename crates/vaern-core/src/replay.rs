@@ -224,7 +224,7 @@ impl Replay {
         let recorded = rec
             .record
             .get("req")
-            .map(Value::to_string)
+            .map(|req| crate::effect_record::redacted_request(req).to_string())
             .unwrap_or_default();
         let actual = req.to_string();
         if rec.kind != kind || recorded != actual {

@@ -5060,6 +5060,52 @@ mod tests {
     }
 
     #[test]
+    fn test_credentials_in_urls_do_not_reach_the_journal_and_the_run_still_replays() {
+        let chat = r#"{"choices":[{"message":{"content":"hi"},"finish_reason":"stop"}],
+                       "usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+        let (port, stub) = canned_http(vec![
+            vec![(
+                "/data?api_key=QUERYSECRET&page=2",
+                "text/plain",
+                "payload".to_string(),
+            )],
+            vec![("/v1/chat/completions", "application/json", chat.to_string())],
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join(".vaern");
+        let main = root.path().join("main.js");
+        let script = r#"
+            import { model } from "vaern:ai";
+            const res = await fetch("http://127.0.0.1:PORT/data?api_key=QUERYSECRET&page=2");
+            console.log(await res.text());
+            const m = model({ baseUrl: "http://bot:URLPASSWORD@127.0.0.1:PORT/v1", model: "m" });
+            const reply = await m.chat({ messages: [{ role: "user", content: "x" }], maxTokens: 4 });
+            console.log(reply.text);
+            // Nothing answers here; the failure is recorded with its URL.
+            await fetch("http://ann:FAILSECRET@127.0.0.1:1/x?token=FAILTOKEN").catch(() => {});
+            "#
+        .replace("PORT", &port.to_string());
+        std::fs::write(&main, script).unwrap();
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        runtime.set_journal_home(Some(home.clone()));
+        assert_eq!(runtime.run_file(&main).unwrap(), 0);
+        stub.join().unwrap();
+
+        let id = std::fs::read_to_string(home.join("runs/latest")).unwrap();
+        let journal =
+            std::fs::read_to_string(home.join("runs").join(id).join("journal.jsonl")).unwrap();
+        for secret in ["QUERYSECRET", "URLPASSWORD", "FAILSECRET", "FAILTOKEN"] {
+            assert!(!journal.contains(secret), "{secret} is in the journal");
+        }
+        assert!(journal.contains("/data?api_key=[redacted]&page=2"));
+        assert!(journal.contains("http://bot:[redacted]@127.0.0.1"));
+        assert!(journal.contains("http://ann:[redacted]@127.0.0.1:1/x?token=[redacted]"));
+
+        let summary = replay_latest(&home).unwrap();
+        assert_eq!((summary.console, summary.exit_code), (2, 0));
+    }
+
+    #[test]
     fn test_a_stream_that_never_finishes_is_stopped_at_its_total_deadline() {
         use std::io::{BufRead, Read};
         // Sends one event every 40 ms for as long as the client stays: always

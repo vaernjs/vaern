@@ -7,8 +7,11 @@
 //! and `eid` recovers dispatch order, which a replay needs to hand concurrent
 //! results back in the order they arrived.
 //!
-//! Secrets never reach the journal: the request and response headers listed
-//! in [`REDACTED_HEADERS`] are stored as `"[redacted]"`.
+//! Credentials in the usual places are replaced with `"[redacted]"` before a
+//! record is written: the headers listed in [`REDACTED_HEADERS`], and in
+//! every recorded URL the password and the query values [`redact_url`]
+//! names. A secret carried anywhere else, such as a body, is recorded as
+//! sent.
 
 use crate::ai::ModelReply;
 use crate::error::{Result, VaernError};
@@ -26,6 +29,80 @@ pub const REDACTED_HEADERS: [&str; 6] = [
     "x-api-key",
     "api-key",
 ];
+
+/// A query parameter whose name contains one of these, ignoring case, has
+/// its value replaced in recorded URLs.
+pub const REDACTED_QUERY_NAMES: [&str; 7] = [
+    "key",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "signature",
+    "credential",
+];
+
+/// `url` as it is recorded: the password in `user:password@host` and the
+/// values of query parameters named in [`REDACTED_QUERY_NAMES`] become
+/// `[redacted]`. A URL with neither, or one that does not parse, is returned
+/// unchanged, byte for byte.
+pub fn redact_url(url: &str) -> String {
+    use url::Position;
+    let Ok(parsed) = url::Url::parse(url) else {
+        return url.to_string();
+    };
+    let secret_name = |pair: &str| {
+        let name = pair.split('=').next().unwrap_or(pair).to_ascii_lowercase();
+        pair.contains('=') && REDACTED_QUERY_NAMES.iter().any(|word| name.contains(word))
+    };
+    let query = parsed.query().unwrap_or("");
+    if parsed.password().is_none() && !query.split('&').any(secret_name) {
+        return url.to_string();
+    }
+
+    let mut out = parsed[..Position::BeforeUsername].to_string();
+    if parsed.password().is_some() {
+        out.push_str(parsed.username());
+        out.push_str(":[redacted]@");
+    } else {
+        out.push_str(&parsed[Position::BeforeUsername..Position::BeforeHost]);
+    }
+    out.push_str(&parsed[Position::BeforeHost..Position::AfterPath]);
+    if parsed.query().is_some() {
+        let pairs: Vec<String> = query
+            .split('&')
+            .map(|pair| match pair.split_once('=') {
+                Some((name, _)) if secret_name(pair) => format!("{name}=[redacted]"),
+                _ => pair.to_string(),
+            })
+            .collect();
+        out.push('?');
+        out.push_str(&pairs.join("&"));
+    }
+    if let Some(fragment) = parsed.fragment() {
+        out.push('#');
+        out.push_str(fragment);
+    }
+    out
+}
+
+/// A recorded request with its URL redacted as a request recorded today
+/// would be. A replay compares the request it builds with this, so a run
+/// recorded before URLs were redacted still matches.
+pub fn redacted_request(req: &Value) -> std::borrow::Cow<'_, Value> {
+    for key in ["url", "base_url"] {
+        let Some(url) = req.get(key).and_then(Value::as_str) else {
+            continue;
+        };
+        let redacted = redact_url(url);
+        if redacted != url {
+            let mut changed = req.clone();
+            changed[key] = Value::from(redacted);
+            return std::borrow::Cow::Owned(changed);
+        }
+    }
+    std::borrow::Cow::Borrowed(req)
+}
 
 /// An effect that has been dispatched and not yet recorded.
 pub struct PendingEffect {
@@ -92,9 +169,11 @@ pub fn headers_value(headers: &[(String, String)]) -> Value {
             .map(|(name, value)| {
                 let lower = name.to_ascii_lowercase();
                 let shown = if REDACTED_HEADERS.contains(&lower.as_str()) {
-                    "[redacted]"
+                    "[redacted]".to_string()
+                } else if lower == "location" || lower == "content-location" {
+                    redact_url(value)
                 } else {
-                    value.as_str()
+                    value.clone()
                 };
                 json!([name, shown])
             })
@@ -110,7 +189,7 @@ pub fn fetch_request(
 ) -> Value {
     json!({
         "method": method,
-        "url": url,
+        "url": redact_url(url),
         "headers": headers_value(headers),
         "body": body.map(bytes_value),
     })
@@ -121,7 +200,7 @@ pub fn fetch_outcome(result: &Result<FetchResponse>) -> Outcome {
         Ok(resp) => Outcome::Response(json!({
             "status": resp.status,
             "status_text": resp.status_text,
-            "url": resp.url,
+            "url": redact_url(&resp.url),
             "headers": headers_value(&resp.headers),
             "body": bytes_value(&resp.body),
         })),
@@ -192,15 +271,18 @@ fn error_value(err: &VaernError) -> Value {
             action,
             sent,
         } => json!({
-            "stage": stage, "url": url, "status": status, "message": message, "action": action,
-            "sent": sent,
+            "stage": stage, "url": redact_url(url), "status": status,
+            "message": without_url(message, url), "action": action, "sent": sent,
         }),
         VaernError::Fetch {
             stage,
             url,
             message,
             action,
-        } => json!({ "stage": stage, "url": url, "message": message, "action": action }),
+        } => json!({
+            "stage": stage, "url": redact_url(url), "message": without_url(message, url),
+            "action": action,
+        }),
         VaernError::Fs {
             stage,
             code,
@@ -212,6 +294,15 @@ fn error_value(err: &VaernError) -> Value {
         }),
         other => json!({ "message": other.to_string() }),
     }
+}
+
+/// `message` with any copy of `url` in it redacted like the URL itself.
+fn without_url(message: &str, url: &str) -> String {
+    let redacted = redact_url(url);
+    if url.is_empty() || redacted == url {
+        return message.to_string();
+    }
+    message.replace(url, &redacted)
 }
 
 /// Standard base64 with padding (RFC 4648).
@@ -268,6 +359,57 @@ fn unbase64(text: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_recorded_urls_lose_passwords_and_secret_query_values_only() {
+        for (url, recorded) in [
+            (
+                "https://ann:hunter2@example.com/a?x=1#top",
+                "https://ann:[redacted]@example.com/a?x=1#top",
+            ),
+            (
+                "https://example.com/v1?api_key=K1&q=two+words&Access-Token=T2&empty=",
+                "https://example.com/v1?api_key=[redacted]&q=two+words&Access-Token=[redacted]&empty=",
+            ),
+            (
+                "http://u:p@127.0.0.1:8080/x?X-Amz-Signature=abc&sig",
+                "http://u:[redacted]@127.0.0.1:8080/x?X-Amz-Signature=[redacted]&sig",
+            ),
+        ] {
+            assert_eq!(redact_url(url), recorded);
+            // Redacting what is already redacted changes nothing.
+            assert_eq!(redact_url(recorded), recorded);
+        }
+        // Nothing to hide: the text is kept exactly, whatever its spelling.
+        for url in [
+            "HTTP://Example.COM",
+            "https://ann@example.com/a?page=2",
+            "not a url?token=x",
+            "",
+        ] {
+            assert_eq!(redact_url(url), url);
+        }
+
+        // A request recorded before redaction compares equal to today's.
+        let raw = json!({ "method": "GET", "url": "https://a:b@h/?token=t", "headers": [], "body": null });
+        let today = fetch_request("GET", "https://a:b@h/?token=t", &[], None);
+        assert_ne!(raw, today);
+        assert_eq!(*redacted_request(&raw), today);
+        assert_eq!(*redacted_request(&today), today);
+        let model = json!({ "base_url": "https://k:s@h/v1", "model": "m" });
+        assert_eq!(
+            redacted_request(&model)["base_url"],
+            "https://k:[redacted]@h/v1"
+        );
+
+        let failed = error_value(&VaernError::Fetch {
+            stage: "connect".into(),
+            url: "https://a:b@h/".into(),
+            message: "could not reach https://a:b@h/".into(),
+            action: "retry".into(),
+        });
+        assert!(!failed.to_string().contains("a:b@"), "{failed}");
+    }
 
     #[test]
     fn test_base64_matches_rfc_4648_vectors() {

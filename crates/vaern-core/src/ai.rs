@@ -413,7 +413,7 @@ pub fn structured(
 /// The journal's `req` for a call: everything sent except the key.
 pub fn request_record(call: &PreparedCall) -> Value {
     json!({
-        "base_url": call.config.base_url,
+        "base_url": crate::effect_record::redact_url(&call.config.base_url),
         "model": call.config.model,
         "body": call.body,
     })
