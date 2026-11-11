@@ -5106,6 +5106,56 @@ mod tests {
     }
 
     #[test]
+    fn test_large_bodies_and_console_writes_are_recorded_cut_and_such_a_run_is_not_replayed() {
+        let big = "b".repeat(3 * 1024 * 1024);
+        let (port, stub) = canned_http(vec![vec![("/big", "text/plain", big.clone())]]);
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join(".vaern");
+        let main = root.path().join("main.js");
+        let script = r#"
+            const body = await (await fetch("http://127.0.0.1:PORT/big")).text();
+            console.log(body.length);
+            console.log("c".repeat(2 * 1024 * 1024));
+            "#
+        .replace("PORT", &port.to_string());
+        std::fs::write(&main, script).unwrap();
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        runtime.set_journal_home(Some(home.clone()));
+        assert_eq!(runtime.run_file(&main).unwrap(), 0);
+        stub.join().unwrap();
+
+        // The script got the whole body; the journal kept 1 MiB of each.
+        let records = journal_records(&home);
+        let limit = crate::journal::MAX_RECORDED_BYTES;
+        let fetched = records.iter().find(|r| r["kind"] == "fetch").unwrap();
+        let body = &fetched["res"]["body"];
+        assert_eq!(body["utf8"].as_str().unwrap().len(), limit);
+        assert_eq!(body["truncated"]["len"], big.len());
+        assert_eq!(
+            body["truncated"]["sha256"],
+            crate::journal::sha256_hex(big.as_bytes())
+        );
+        let prints: Vec<_> = records.iter().filter(|r| r["kind"] == "console").collect();
+        assert_eq!(prints[0]["text"], "3145728\n");
+        assert!(prints[0].get("truncated").is_none());
+        assert_eq!(prints[1]["text"].as_str().unwrap().len(), limit);
+        assert_eq!(prints[1]["truncated"]["len"], 2 * 1024 * 1024 + 1);
+        let path = crate::journal::locate(&home, "latest").unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size < 2 * limit as u64 + 4096, "{size}");
+        // It is still a whole, sealed journal.
+        assert!(crate::journal::verify(&path).unwrap().sealed);
+
+        match replay_latest(&home) {
+            Err(VaernError::Replay { code, message, .. }) => {
+                assert_eq!(code, "TRUNCATED");
+                assert!(message.contains("first 1048576 bytes"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn test_a_stream_that_never_finishes_is_stopped_at_its_total_deadline() {
         use std::io::{BufRead, Read};
         // Sends one event every 40 ms for as long as the client stays: always

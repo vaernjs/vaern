@@ -17,6 +17,7 @@ use crate::ai::ModelReply;
 use crate::error::{Result, VaernError};
 use crate::fetch::FetchResponse;
 use crate::fs::{FsOp, FsOutput, WriteMode};
+use crate::journal::{MAX_RECORDED_BYTES, recorded_prefix, truncation};
 use serde_json::{Map, Value, json};
 use std::time::Instant;
 
@@ -134,15 +135,57 @@ pub enum Outcome {
 }
 
 /// Bytes as `{"utf8": text}` when they are valid UTF-8, else `{"b64": …}`.
+///
+/// Bytes over [`MAX_RECORDED_BYTES`] keep only their start, with
+/// `"truncated": {"len", "sha256"}` describing the whole.
 pub fn bytes_value(bytes: &[u8]) -> Value {
-    match std::str::from_utf8(bytes) {
-        Ok(text) => json!({ "utf8": text }),
-        Err(_) => json!({ "b64": base64(bytes) }),
+    let cut = truncation(bytes);
+    let mut value = match std::str::from_utf8(bytes) {
+        Ok(text) => json!({ "utf8": recorded_prefix(text) }),
+        Err(_) => json!({ "b64": base64(&bytes[..bytes.len().min(MAX_RECORDED_BYTES)]) }),
+    };
+    if let Some(cut) = cut {
+        value["truncated"] = cut;
+    }
+    value
+}
+
+/// `{key: text}`, with the text cut and `"truncated"` beside it when it is
+/// over [`MAX_RECORDED_BYTES`].
+fn text_value(key: &str, text: &str) -> Value {
+    let mut value = json!({ key: recorded_prefix(text) });
+    if let Some(cut) = truncation(text.as_bytes()) {
+        value["truncated"] = cut;
+    }
+    value
+}
+
+/// A JSON request body as recorded: itself, or the start of its text when
+/// that is over [`MAX_RECORDED_BYTES`].
+pub fn json_body_value(body: &Value) -> Value {
+    let text = body.to_string();
+    match truncation(text.as_bytes()) {
+        Some(cut) => json!({ "utf8": recorded_prefix(&text), "truncated": cut }),
+        None => body.clone(),
     }
 }
 
-/// The bytes behind a [`bytes_value`], or `None` when it is not one.
+/// Whether `record`, an effect's journal record, holds only the start of
+/// what the script received, so the effect cannot be handed back.
+pub fn outcome_is_truncated(record: &Value) -> bool {
+    let res = &record["res"];
+    res.get("truncated").is_some()
+        || ["body", "bytes"]
+            .iter()
+            .any(|key| res[*key].get("truncated").is_some())
+}
+
+/// The bytes behind a [`bytes_value`], or `None` when it is not one or holds
+/// only the start of them.
 pub fn bytes_of(value: &Value) -> Option<Vec<u8>> {
+    if value.get("truncated").is_some() {
+        return None;
+    }
     if let Some(text) = value.get("utf8").and_then(Value::as_str) {
         return Some(text.as_bytes().to_vec());
     }
@@ -230,7 +273,7 @@ pub fn fs_request(op: &FsOp) -> Value {
 pub fn fs_outcome(result: &Result<FsOutput>) -> Outcome {
     match result {
         Ok(FsOutput::Bytes(bytes)) => Outcome::Response(json!({ "bytes": bytes_value(bytes) })),
-        Ok(FsOutput::Text(text)) => Outcome::Response(json!({ "text": text })),
+        Ok(FsOutput::Text(text)) => Outcome::Response(text_value("text", text)),
         Ok(FsOutput::Written) => Outcome::Response(json!({})),
         Err(err) => Outcome::Error(error_value(err)),
     }
@@ -240,15 +283,22 @@ pub fn fs_outcome(result: &Result<FsOutput>) -> Outcome {
 /// from reported usage, or the reservation when the server reported none.
 pub fn model_outcome(result: &Result<ModelReply>, charged: u64) -> Outcome {
     match result {
-        Ok(reply) => Outcome::Response(json!({
-            "status": reply.status,
-            "body": reply.raw,
-            "usage": {
-                "input_tokens": reply.input_tokens,
-                "output_tokens": reply.output_tokens,
-            },
-            "charged_nano_usd": charged,
-        })),
+        Ok(reply) => {
+            // Fields keep the order earlier journals have.
+            let mut res = json!({
+                "status": reply.status,
+                "body": recorded_prefix(&reply.raw),
+                "usage": {
+                    "input_tokens": reply.input_tokens,
+                    "output_tokens": reply.output_tokens,
+                },
+                "charged_nano_usd": charged,
+            });
+            if let Some(cut) = truncation(reply.raw.as_bytes()) {
+                res["truncated"] = cut;
+            }
+            Outcome::Response(res)
+        }
         Err(err) => {
             let mut error = error_value(err);
             if let Some(fields) = error.as_object_mut() {
@@ -409,6 +459,58 @@ mod tests {
             action: "retry".into(),
         });
         assert!(!failed.to_string().contains("a:b@"), "{failed}");
+    }
+
+    #[test]
+    fn test_content_over_the_limit_is_recorded_as_its_start_length_and_hash() {
+        let limit = MAX_RECORDED_BYTES;
+        // At the limit nothing changes.
+        let whole = vec![b'a'; limit];
+        assert!(bytes_value(&whole).get("truncated").is_none());
+        assert_eq!(bytes_of(&bytes_value(&whole)), Some(whole));
+
+        // One byte over, as text and as bytes that are not text.
+        let text = vec![b'a'; limit + 1];
+        let recorded = bytes_value(&text);
+        assert_eq!(recorded["utf8"].as_str().unwrap().len(), limit);
+        assert_eq!(recorded["truncated"]["len"], limit + 1);
+        assert_eq!(
+            recorded["truncated"]["sha256"],
+            crate::journal::sha256_hex(&text)
+        );
+        assert_eq!(bytes_of(&recorded), None);
+        let binary = vec![0xff; limit + 1];
+        let recorded = bytes_value(&binary);
+        assert_eq!(
+            recorded["b64"].as_str().unwrap().len(),
+            limit.div_ceil(3) * 4
+        );
+        assert_eq!(recorded["truncated"]["len"], limit + 1);
+
+        // A cut never splits a character: these are three bytes each.
+        let wide = "\u{20ac}".repeat(limit / 3 + 1);
+        let kept = recorded_prefix(&wide);
+        assert!(kept.len() <= limit && kept.len() > limit - 3);
+        assert!(wide.starts_with(kept));
+
+        let body = json!({ "messages": [{ "role": "user", "content": "x".repeat(limit) }] });
+        let recorded = json_body_value(&body);
+        assert_eq!(recorded["truncated"]["len"], body.to_string().len());
+        assert_eq!(json_body_value(&json!({ "a": 1 })), json!({ "a": 1 }));
+
+        let cut = bytes_value(&text);
+        assert!(outcome_is_truncated(&json!({ "res": { "body": cut } })));
+        assert!(outcome_is_truncated(
+            &json!({ "res": { "text": "a", "truncated": {} } })
+        ));
+        assert!(!outcome_is_truncated(
+            &json!({ "res": { "body": { "utf8": "a" } } })
+        ));
+        // A request may be cut; the run can still be replayed.
+        let cut = bytes_value(&text);
+        assert!(!outcome_is_truncated(
+            &json!({ "req": { "body": cut }, "res": {} })
+        ));
     }
 
     #[test]

@@ -173,7 +173,10 @@ impl Journal {
     pub fn console(&mut self, fd: u8, text: &str) -> Result<u64> {
         let mut fields = Map::new();
         fields.insert("fd".to_string(), Value::from(fd));
-        fields.insert("text".to_string(), Value::from(text));
+        fields.insert("text".to_string(), Value::from(recorded_prefix(text)));
+        if let Some(cut) = truncation(text.as_bytes()) {
+            fields.insert("truncated".to_string(), cut);
+        }
         let seq = self.append("console", fields)?;
         self.transcript
             .update(format!("{fd}:{}:", text.len()).as_bytes());
@@ -342,6 +345,32 @@ pub fn verify(path: &Path) -> Result<Verified> {
         sealed: last_kind == "run.end",
         torn_tail,
     })
+}
+
+/// Most bytes of one body or one console write that a record holds. A run
+/// that fetches or prints without bound would otherwise fill the disk
+/// through its journal.
+pub const MAX_RECORDED_BYTES: usize = 1024 * 1024;
+
+/// The part of `text` a record holds: all of it, or its first
+/// [`MAX_RECORDED_BYTES`] cut back to a character boundary.
+pub fn recorded_prefix(text: &str) -> &str {
+    if text.len() <= MAX_RECORDED_BYTES {
+        return text;
+    }
+    let mut end = MAX_RECORDED_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// What a record says about content it holds only the start of: the full
+/// length and SHA-256, so the content can still be identified. `None` when
+/// `bytes` fits and is recorded whole.
+pub fn truncation(bytes: &[u8]) -> Option<Value> {
+    (bytes.len() > MAX_RECORDED_BYTES)
+        .then(|| serde_json::json!({ "len": bytes.len(), "sha256": sha256_hex(bytes) }))
 }
 
 /// Points `to` (the `latest` file) at this run by renaming `from` over it.

@@ -73,6 +73,20 @@ fn seed_of(hex: &str) -> Option<[u32; 4]> {
     (hex.len() == 32).then_some(seed)
 }
 
+/// A run that cannot be replayed because record `seq` holds only the start
+/// of content the script received.
+fn truncated(seq: u64, what: &str) -> VaernError {
+    VaernError::Replay {
+        code: "TRUNCATED".into(),
+        message: format!(
+            "record {seq} holds only the first {} bytes of {what}, so the run cannot be reproduced from its journal",
+            crate::journal::MAX_RECORDED_BYTES
+        ),
+        action: "The journal still verifies and names the full length and SHA-256; only runs whose bodies and console writes fit the limit can be replayed."
+            .into(),
+    }
+}
+
 impl Plan {
     /// Reads the journal at `path`. The run must verify and be sealed: an
     /// interrupted run has no outcome to compare with.
@@ -150,6 +164,9 @@ impl Plan {
                 }
                 ("module.load", _) => plan.modules.push((text(&r, "path"), text(&r, "sha256"))),
                 ("console", _) => {
+                    if r.get("truncated").is_some() {
+                        return Err(truncated(seq, "a console write"));
+                    }
                     let fd = if r["fd"].as_u64() == Some(2) { 2 } else { 1 };
                     plan.console.push((seq, fd, text(&r, "text")));
                 }
@@ -162,6 +179,9 @@ impl Plan {
                     plan.ledgers.insert(text(&r, "name"), spent);
                 }
                 (kind @ ("fetch" | "fs" | "model.call" | "tool.call"), Some(eid)) => {
+                    if crate::effect_record::outcome_is_truncated(&r) {
+                        return Err(truncated(seq, "an effect's result"));
+                    }
                     if kind != "tool.call" {
                         plan.completions.push(eid);
                     }

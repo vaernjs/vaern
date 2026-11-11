@@ -51,7 +51,7 @@ numbers.
 |---|---|
 | `run.start` | `vaern` (version), `script`, `script_sha256`, `argv`, `budget_caps` {`nano_usd`, `tokens`} (from `--budget-usd` and `--budget-tokens`; `null` when not given), `random_seed` (32 hex digits: the four 32-bit words, in order, that seed `Math.random`) |
 | `module.load` | `path`, `sha256` of the source as read. One per module evaluated, the entry script first |
-| `console` | `fd` (1 stdout, 2 stderr), `text`: exactly what was written, newline included |
+| `console` | `fd` (1 stdout, 2 stderr), `text`: exactly what was written, newline included. A write over 1 MiB keeps its first 1 MiB and adds `truncated` |
 | `fetch` | `eid`, `dur_us`, `turn`, `req` {`method`, `url`, `headers`, `body`}, then `res` {`status`, `status_text`, `url` (after redirects), `headers`, `body`} or `error` {`stage`, `url`, `message`, `action`} |
 | `fs` | `eid`, `dur_us`, `turn`, `req` {`op`, `path` as passed; writes add `len` and `sha256` of the data}, then `res` (`text` or `bytes` for reads, `{}` for writes) or `error` {`stage`, `code`, `path`, `message`, `action`} |
 | `model.call` | `eid`, `dur_us`, `turn`, `req` {`base_url`, `model`, `body`: the request body as sent}, then `res` {`status`, `body`: the response text as received (for a streamed call, the event stream as received), `usage` {`input_tokens`, `output_tokens`}, `charged_nano_usd`} or `error` {`stage`, `url`, `status`, `message`, `action`, `sent` (false when the call failed before any of the request was written), `charged_nano_usd` (the reserve the failure kept, 0 when nothing was sent)}. A call refused before dispatch (`stage` `config`) is not recorded |
@@ -70,8 +70,17 @@ Effects (`fetch`, `fs`, `model.call`, and a tool call's two records):
   is written when the effect completes, so records appear in completion
   order.
 - A body is stored as `{"utf8": text}` when it is valid UTF-8, else as
-  `{"b64": base64}`. Response bodies are stored whole, up to the 64 MiB
-  fetch limit, so a journal can be large.
+  `{"b64": base64}`.
+- No record holds more than 1 MiB (1,048,576 bytes) of one body or one
+  console write. Content over that keeps its first 1 MiB, cut back to a
+  character boundary for text, and gains `"truncated": {"len", "sha256"}`:
+  the length and SHA-256 of all of it. This applies to a fetch's request
+  and response bodies, a `vaern:fs` read, a model call's request and reply,
+  and a console write. The script still receives everything; only the
+  record is cut. `transcript_sha256` still covers every console write in
+  full. A journal therefore grows by at most about 2 MiB per effect, but
+  there is no limit on the number of records or on the size of the file.
+  Tool arguments and results are recorded whole.
 - The values of the `Authorization`, `Proxy-Authorization`, `Cookie`,
   `Set-Cookie`, `X-Api-Key` and `Api-Key` headers are stored as
   `"[redacted]"`.
@@ -153,6 +162,12 @@ the script and module paths as they were given. The replay:
 |---|---|
 | 0 | The transcript, exit code and error match. A summary line goes to stderr |
 | 1 | The first difference, with its record `seq` and both sides cut to 200 bytes, or a reason the run cannot be replayed |
+
+A run cannot be replayed when a record holds only the start of something
+the script received: a response body, a file read, a model reply or a
+console write over 1 MiB. `vaern replay` refuses it before running anything,
+with `replay TRUNCATED` and the record's `seq`. A request body over the
+limit does not prevent a replay; its length and hash are compared.
 
 Read live during a replay, so a script whose output depends on them can
 diverge: `Date.now()`, `performance.now()`, `process.env`, and the order of

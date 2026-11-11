@@ -415,7 +415,7 @@ pub fn request_record(call: &PreparedCall) -> Value {
     json!({
         "base_url": crate::effect_record::redact_url(&call.config.base_url),
         "model": call.config.model,
-        "body": call.body,
+        "body": crate::effect_record::json_body_value(&call.body),
     })
 }
 
