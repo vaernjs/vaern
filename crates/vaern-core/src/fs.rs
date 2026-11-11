@@ -6,8 +6,11 @@
 //! failed, a POSIX-style code and the absolute path, because a script that
 //! only sees "os error 2" cannot tell a missing file from a missing parent.
 //!
-//! No policy is applied here: a path is opened with the permissions of the
-//! process. [`resolve`] is the single point every operation passes through,
+//! No policy is applied here, with one exception: the directories the runtime
+//! keeps its own records in (run journals and budget ledgers) are refused, so
+//! a script cannot erase its spending or rewrite its transcript. Any other
+//! path is opened with the permissions of the process.
+//! [`resolve`] is the single point every operation passes through,
 //! and it returns the physical path the open will reach: symlinks followed,
 //! `..` applied after them, and Windows verbatim prefixes removed. A policy
 //! check on its result therefore sees the file the operating system opens,
@@ -58,9 +61,16 @@ pub enum FsOutput {
 
 /// Runs `op` to completion on the calling thread.
 pub fn run(op: FsOp) -> Result<FsOutput> {
+    run_outside(op, &[])
+}
+
+/// Runs `op` unless its physical path is inside one of the `reserved`
+/// directories, which hold the runtime's own records.
+pub fn run_outside(op: FsOp, reserved: &[PathBuf]) -> Result<FsOutput> {
     match op {
         FsOp::Read { path, utf8 } => {
             let path = resolve(&path)?;
+            refuse_reserved(&path, reserved)?;
             let bytes = read(&path)?;
             if utf8 {
                 Ok(FsOutput::Text(String::from_utf8_lossy(&bytes).into_owned()))
@@ -70,10 +80,54 @@ pub fn run(op: FsOp) -> Result<FsOutput> {
         }
         FsOp::Write { path, data, mode } => {
             let path = resolve(&path)?;
+            refuse_reserved(&path, reserved)?;
             write(&path, &data, mode)?;
             Ok(FsOutput::Written)
         }
     }
+}
+
+/// Refuses `path`, already physical, when it is a reserved directory or
+/// anything under one. Each directory is resolved for every operation: it
+/// may have been created, or replaced by a link, since the last one, and a
+/// directory that cannot be resolved refuses the operation.
+fn refuse_reserved(path: &Path, reserved: &[PathBuf]) -> Result<()> {
+    for home in reserved {
+        let absolute = std::path::absolute(home).map_err(|err| fs_error("resolve", home, &err))?;
+        let home = physical(&absolute, 0)?;
+        if is_under(path, &home) {
+            return Err(VaernError::Fs {
+                stage: "open".to_string(),
+                code: "EPERM".to_string(),
+                path: path.display().to_string(),
+                message: format!(
+                    "the path is inside '{}', where the runtime keeps run journals and budget ledgers",
+                    home.display()
+                ),
+                action: "The runtime's own records are not script-writable or readable through vaern:fs; use a path outside that directory, or set VAERN_HOME elsewhere."
+                    .to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Whether `path` is `dir` or below it. Names compare without case on
+/// Windows and macOS, whose default filesystems fold it: a part of the path
+/// that does not exist yet keeps the spelling the script gave it.
+fn is_under(path: &Path, dir: &Path) -> bool {
+    let fold = cfg!(any(windows, target_os = "macos"));
+    let mut parts = path.components();
+    dir.components().all(|want| {
+        parts.next().is_some_and(|have| {
+            if fold {
+                have.as_os_str().to_string_lossy().to_lowercase()
+                    == want.as_os_str().to_string_lossy().to_lowercase()
+            } else {
+                have == want
+            }
+        })
+    })
 }
 
 /// Links followed while resolving one path before it fails with `ELOOP`,
@@ -406,6 +460,46 @@ mod tests {
 
     fn real(path: &Path) -> PathBuf {
         strip_verbatim(std::fs::canonicalize(path).unwrap())
+    }
+
+    #[test]
+    fn test_reserved_directories_are_refused_whole_and_their_neighbours_are_not() {
+        let dir = scratch("reserved");
+        let home = dir.join("home");
+        let write = |path: PathBuf| {
+            run_outside(
+                FsOp::Write {
+                    path: path.display().to_string(),
+                    data: b"x".to_vec(),
+                    mode: WriteMode::Truncate,
+                },
+                std::slice::from_ref(&home),
+            )
+        };
+        let refused = |path: PathBuf| match write(path) {
+            Err(VaernError::Fs { code, .. }) => code,
+            other => panic!("{other:?}"),
+        };
+
+        // A home that does not exist yet is refused before it can be seeded.
+        assert_eq!(refused(home.join("budgets").join("a.jsonl")), "EPERM");
+        assert!(!home.exists());
+        std::fs::create_dir_all(home.join("runs")).unwrap();
+        assert_eq!(refused(home.clone()), "EPERM");
+        assert_eq!(refused(home.join("runs").join("latest")), "EPERM");
+        // Filesystems that fold case reach the same directory by another
+        // spelling; elsewhere this is a different, unreserved directory.
+        let shouted = dir.join("HOME").join("new").join("x");
+        if cfg!(any(windows, target_os = "macos")) {
+            assert_eq!(refused(shouted), "EPERM");
+        }
+
+        // A name that only starts like the home is a different directory.
+        assert_eq!(
+            write(dir.join("home-notes.txt")).unwrap(),
+            FsOutput::Written
+        );
+        assert_eq!(write(dir.join("homework")).unwrap(), FsOutput::Written);
     }
 
     #[test]

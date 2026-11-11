@@ -16,6 +16,14 @@ on-disk format.
 `20261110-093012-4f1a2b`. `vaern run --no-journal` writes nothing. Runs are
 never deleted by the runtime.
 
+A script cannot open anything under `<home>` with `vaern:fs`: reads, writes
+and appends there reject with `EPERM`, so a run cannot edit its own journal
+or a budget ledger that way. The chain itself proves only that a file is
+internally consistent. Anyone who can write the file by other means can
+rewrite it with a recomputed chain, so keep the final hash that `vaern
+journal verify` prints somewhere else when the record has to be trusted
+later.
+
 ## Lines
 
 One record per line:

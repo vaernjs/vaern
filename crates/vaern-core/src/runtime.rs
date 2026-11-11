@@ -483,6 +483,8 @@ pub struct QuickJsRuntime {
     active_servers_list: Arc<tokio::sync::Mutex<Vec<Arc<HttpServer>>>>,
     /// Where run journals are written; `None` disables the journal.
     journal_home: Option<PathBuf>,
+    /// The journal home and the budget home, which `vaern:fs` refuses.
+    reserved_homes: Rc<RefCell<[Option<PathBuf>; 2]>>,
     /// The open journal, shared with the bridges that record effects.
     journal: JournalSlot,
     /// The run's budget, shared with the bridges that reserve and settle.
@@ -573,6 +575,7 @@ impl QuickJsRuntime {
             resolve_failure: Rc::new(RefCell::new(None)),
             active_servers_list,
             journal_home: None,
+            reserved_homes: Rc::new(RefCell::new([None, None])),
             journal: Rc::new(RefCell::new(None)),
             budget: Rc::new(RefCell::new(crate::budget::RunBudget::default())),
             replay: Rc::new(RefCell::new(None)),
@@ -888,6 +891,7 @@ impl QuickJsRuntime {
             let state_fs = Rc::clone(&state);
             let journal_fs = Rc::clone(&self.journal);
             let replay_fs = Rc::clone(&self.replay);
+            let reserved_fs = Rc::clone(&self.reserved_homes);
             let tokio_handle_fs = tokio_handle.clone();
             let fs_start_fn = Function::new(
                 ctx.clone(),
@@ -933,8 +937,10 @@ impl QuickJsRuntime {
 
                     let tx = state_fs.borrow().events_tx.clone();
                     state_fs.borrow_mut().pending_fs += 1;
+                    let reserved: Vec<PathBuf> =
+                        reserved_fs.borrow().iter().flatten().cloned().collect();
                     tokio_handle_fs.spawn_blocking(move || {
-                        let result = crate::fs::run(op);
+                        let result = crate::fs::run_outside(op, &reserved);
                         let _ = tx.send(LoopEvent::FsDone(FsCompletion { req_id, result }));
                     });
                     Ok(())
@@ -3325,12 +3331,14 @@ impl QuickJsRuntime {
     /// `.vaern` in the working directory). `None`, the default, records
     /// nothing.
     pub fn set_journal_home(&mut self, home: Option<PathBuf>) {
+        self.reserved_homes.borrow_mut()[0].clone_from(&home);
         self.journal_home = home;
     }
 
     /// Caps the run's budget (from `--budget-usd` and `--budget-tokens`)
     /// and sets where named budget ledgers live.
     pub fn set_budget(&mut self, caps: crate::budget::Limits, home: Option<PathBuf>) {
+        self.reserved_homes.borrow_mut()[1].clone_from(&home);
         self.budget.borrow_mut().configure(caps, home);
     }
 
@@ -5338,6 +5346,98 @@ mod tests {
             Err(VaernError::Replay { code, .. }) => assert_eq!(code, "UNSUPPORTED"),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    fn link_dir(target: &Path, link: &Path) {
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn link_dir(target: &Path, link: &Path) {
+        std::os::windows::fs::symlink_dir(target, link).unwrap();
+    }
+
+    #[test]
+    fn test_a_script_cannot_reach_its_journals_or_ledgers_through_vaern_fs() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join(".vaern");
+        let caps = crate::budget::Limits {
+            nano: Some(2_000_000_000),
+            tokens: None,
+        };
+        let run = |name: &str, script: &str| {
+            let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+            runtime.set_journal_home(Some(home.clone()));
+            runtime.set_budget(caps, Some(home.clone()));
+            let outcome = runtime.eval(name, script);
+            assert_eq!(outcome.unwrap(), 0, "{name}");
+            journal_records(&home)
+        };
+        let spent = |records: &[serde_json::Value]| {
+            let open = records.iter().find(|r| r["kind"] == "ledger.open").unwrap();
+            open["spent_nano_usd"].as_u64().unwrap()
+        };
+
+        // One run spends from a named budget.
+        let spend = model_stub(8985)
+            + r#"
+            import { model, budget } from "vaern:ai";
+            budget({ name: "nightly", usd: 1 });
+            await model({ baseUrl: base + "/ok/v1", model: "m",
+                          price: { inputPerMTok: 1, outputPerMTok: 1 } })
+                .chat({ messages: [{ role: "user", content: "x" }], maxTokens: 8 });
+            await stub.close();
+            "#;
+        assert_eq!(spent(&run("spend.js", &spend)), 0);
+
+        // The next one tries to erase that spending and its own journal:
+        // directly, through a link into the home, and through `..`.
+        let link = root.path().join("link");
+        link_dir(&home, &link);
+        let slashed = |path: &Path| path.display().to_string().replace('\\', "/");
+        let attack = r#"
+            import { readFile, writeFile, appendFile } from "vaern:fs";
+            const ledger = "HOME/budgets/nightly.jsonl";
+            const tries = [
+                () => writeFile(ledger, ""),
+                () => writeFile(ledger, "", { flag: "wx" }),
+                () => appendFile(ledger, "x"),
+                () => readFile(ledger, "utf8"),
+                () => writeFile("HOME/budgets/nightly.lock", ""),
+                () => writeFile("HOME/runs/latest", "forged"),
+                () => writeFile("HOME/new.txt", ""),
+                () => writeFile("LINK/budgets/nightly.jsonl", ""),
+                () => writeFile("ROOT/sub/../.vaern/budgets/nightly.jsonl", ""),
+            ];
+            const seen = [];
+            for (const attempt of tries) {
+                seen.push(await attempt().then(() => "done", (e) => e.name + " " + e.code));
+            }
+            if (seen.some((s) => s !== "FsError EPERM")) throw new Error(seen.join(", "));
+            const refused = await writeFile(ledger, "").catch((e) => e);
+            if (!refused.message.includes("not script-writable")
+                || !refused.message.includes("nightly.jsonl")
+                || !refused.message.includes(".vaern'")) throw refused;
+            // A path beside the home is still the script's to use.
+            await writeFile("ROOT/.vaern-notes.txt", "kept");
+            console.log(await readFile("ROOT/.vaern-notes.txt", "utf8"));
+            "#
+        .replace("HOME", &slashed(&home))
+        .replace("LINK", &slashed(&link))
+        .replace("ROOT", &slashed(root.path()));
+        std::fs::create_dir(root.path().join("sub")).unwrap();
+        let records = run("attack.js", &attack);
+        let last_console = records.iter().rfind(|r| r["kind"] == "console").unwrap();
+        assert_eq!(last_console["text"], "kept\n");
+        assert!(!home.join("new.txt").exists());
+
+        // The ledger still holds what the first run spent.
+        let reopen = r#"
+            import { budget } from "vaern:ai";
+            budget({ name: "nightly", usd: 1 });
+            "#;
+        assert!(spent(&run("reopen.js", reopen)) > 0);
     }
 
     #[test]

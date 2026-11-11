@@ -306,12 +306,23 @@ returns a promise; the work runs off the JavaScript thread.
   memory`.
 - A failure rejects with an `FsError` whose `stage` is `resolve`, `open`,
   `read` or `write`, whose `code` is `ENOENT`, `EACCES`, `EEXIST`, `EISDIR`,
-  `ENOTDIR`, `EFBIG`, `ELOOP` or `EIO`, whose `path` is the physical path, and whose
+  `ENOTDIR`, `EFBIG`, `ELOOP`, `EPERM` or `EIO`, whose `path` is the physical path, and whose
   `action` says what to do next. A bad argument (a non-string path, an
   unsupported encoding or flag, data of another type) rejects with
   `TypeError`.
-- No policy applies yet: a script can read and write anything the process
-  can.
+- The runtime's home directory (`$VAERN_HOME`, else `.vaern` in the working
+  directory) is refused whole: a read, write or append whose physical path
+  is that directory or anything under it rejects with `EPERM`, whether the
+  path names it directly, through a symbolic link or through `..`. Run
+  journals, budget ledgers and their lock files live there, so a script
+  cannot erase its spending or rewrite its transcript with `vaern:fs`. A
+  script that needs files of its own keeps them elsewhere; a home set to a
+  directory the script works in makes that whole directory unusable to it.
+  This covers `vaern:fs` only: `import` can still load a file under the
+  home as a module, and another program the script reaches is not
+  restrained.
+- No other policy applies yet: outside that directory a script can read and
+  write anything the process can.
 
 Absent: synchronous and callback variants, `stat`, `readdir`, `mkdir`, `rm`,
 `rename`, file handles, streams, `file:` URLs as paths, and the `node:fs`
