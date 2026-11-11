@@ -18,6 +18,21 @@ The journal costs about 5 ms per run on this machine. Creating a run directory a
 
 Binary size, stripped: 9,891,328 bytes (0.0.6: 16,103,936; the LTO build below: 9,427,456, +463,872 for the journal, `vaern:ai` and replay), 5,837,312 bytes under the 15 MiB budget.
 
+## Unreleased hardening against 0.0.7
+
+Re-run on 2026-11-11 on the same machine, after the response cap moved to 64 MiB and journal records were limited to 1 MiB of a body. Only the two runs those changes touch were repeated. The 0.0.7 column is the build measured above. Each row is one hyperfine call with the journal on.
+
+| Benchmark | Unreleased | 0.0.7 | Order | Status |
+|---|---|---|---|---|
+| Startup and greeting | 19.4 ms ± 1.1 | 19.7 ms ± 1.6 | 0.0.7 first | Within noise |
+| Startup and greeting | 19.8 ms ± 1.9 | 18.9 ms ± 1.3 | new build first | Within noise |
+| Loopback fetch and JSON parse | 25.6 ms ± 7.6 | 27.5 ms ± 8.0 | 0.0.7 first | Within noise |
+| Loopback fetch and JSON parse | 28.7 ms ± 8.1 | 24.5 ms ± 5.7 | new build first | Within noise |
+
+Whichever build ran second was faster in all four calls, so the differences are an effect of order, not of the build. The journal's startup cost reported above is unchanged.
+
+Binary size, stripped: 9,933,824 bytes (0.0.7: 9,891,328, +42,496), 5,794,816 bytes under the 15 MiB budget.
+
 ## Earlier measurements
 
 ### 0.0.6 against 0.0.5 (2026-11-04)
