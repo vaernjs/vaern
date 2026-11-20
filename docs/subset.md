@@ -4,6 +4,11 @@ This is the exact surface `vaern run` provides in v0.0.7. Anything not listed
 here is absent. A section's **Limits** list says where an API differs from the
 web or Node.js behaviour of the same name.
 
+What a run writes to its journal is in [journal.md](journal.md). Two of its
+rules change what a script's effects leave on disk: credentials in recorded
+URLs are redacted, and a record holds at most 1 MiB of one body or console
+write, so a run that read or printed more cannot be replayed.
+
 ## Running files
 
 - `vaern run <file>` runs `.js`, `.mjs` and `.ts` files as ES modules. Top-level

@@ -85,8 +85,8 @@ Effects (`fetch`, `fs`, `model.call`, and a tool call's two records):
   `Set-Cookie`, `X-Api-Key` and `Api-Key` headers are stored as
   `"[redacted]"`.
 - In every recorded URL (a fetch's `url`, a response's final `url`, a
-  `Location` header, a model call's `base_url`, and the `url` and `message`
-  of an error) the password of `user:password@host` is stored as
+  `Location` or `Content-Location` header, a model call's `base_url`, and
+  the `url` and `message` of an error) the password of `user:password@host` is stored as
   `[redacted]`, and so is the value of any query parameter whose name
   contains `key`, `token`, `secret`, `password`, `passwd`, `signature` or
   `credential`, ignoring case. A user name is kept. A URL with nothing to
