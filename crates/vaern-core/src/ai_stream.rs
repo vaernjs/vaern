@@ -162,7 +162,7 @@ pub async fn send(
     }
     // The builder's error names the bad header only, never its value.
     let request = request
-        .body(Full::new(Bytes::from(call.body.to_string())).boxed())
+        .body(Full::new(Bytes::from(call.encoded.clone())).boxed())
         .map_err(|err| {
             crate::ai::unsent(stream_error(
                 call,

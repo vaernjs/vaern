@@ -55,6 +55,10 @@ impl std::fmt::Debug for ModelConfig {
 pub struct PreparedCall {
     pub endpoint: String,
     pub body: Value,
+    /// `body` serialised once, as it is sent. The input estimate counts
+    /// these bytes and both send paths write them, so a call is encoded a
+    /// single time however often it is estimated.
+    pub encoded: String,
     pub max_tokens: u64,
     pub config: ModelConfig,
     /// The schema the reply must match, when the call asked for one.
@@ -239,9 +243,12 @@ pub fn prepare(config_json: &str, call_json: &str) -> Result<PreparedCall> {
             json!({ "include_usage": true }),
         );
     }
+    let body = Value::Object(body);
+    let encoded = body.to_string();
     Ok(PreparedCall {
         endpoint: format!("{}/chat/completions", base_url.trim_end_matches('/')),
-        body: Value::Object(body),
+        body,
+        encoded,
         max_tokens,
         config,
         schema,
@@ -267,7 +274,7 @@ pub async fn send(
     let options = FetchOptions {
         method: "POST".to_string(),
         headers,
-        body: Some(call.body.to_string().into_bytes()),
+        body: Some(call.encoded.clone().into_bytes()),
         timeout: Some(call.config.timeout),
         max_body_bytes: crate::fetch::MAX_RESPONSE_BODY_BYTES,
     };
@@ -364,7 +371,7 @@ pub fn charge_nano(config: &ModelConfig, input_tokens: u64, output_tokens: u64) 
 /// rounded up, plus 16 per message for the provider's framing. Tokenizers
 /// average three to four bytes per token on prose, so this errs high.
 pub fn estimate_input_tokens(call: &PreparedCall) -> u64 {
-    let bytes = call.body.to_string().len() as u64;
+    let bytes = call.encoded.len() as u64;
     let messages = call
         .body
         .get("messages")
@@ -427,7 +434,7 @@ pub fn request_record(call: &PreparedCall) -> Value {
     json!({
         "base_url": crate::effect_record::redact_url(&call.config.base_url),
         "model": call.config.model,
-        "body": crate::effect_record::json_body_value(&call.body),
+        "body": crate::effect_record::encoded_body_value(&call.body, &call.encoded),
     })
 }
 

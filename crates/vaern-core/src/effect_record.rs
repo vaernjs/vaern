@@ -160,12 +160,19 @@ fn text_value(key: &str, text: &str) -> Value {
     value
 }
 
-/// A JSON request body as recorded: itself, or the start of its text when
-/// that is over [`MAX_RECORDED_BYTES`].
+/// [`encoded_body_value`] for a body not yet serialised. The runtime always
+/// holds the text already, so only tests build a record from the value.
+#[cfg(test)]
 pub fn json_body_value(body: &Value) -> Value {
-    let text = body.to_string();
+    encoded_body_value(body, &body.to_string())
+}
+
+/// A JSON request body as recorded: itself, or the start of `text`, its
+/// serialised form, when that is over [`MAX_RECORDED_BYTES`]. The caller
+/// passes the text it sends, so the body is not encoded again to be measured.
+pub fn encoded_body_value(body: &Value, text: &str) -> Value {
     match truncation(text.as_bytes()) {
-        Some(cut) => json!({ "utf8": recorded_prefix(&text), "truncated": cut }),
+        Some(cut) => json!({ "utf8": recorded_prefix(text), "truncated": cut }),
         None => body.clone(),
     }
 }
