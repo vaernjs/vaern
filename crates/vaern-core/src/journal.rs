@@ -13,6 +13,10 @@
 //! The chain detects any edit, reordering, insertion or deletion of records.
 //! A cut-off tail looks like a crash: the run is reported unsealed, not
 //! tampered, because the two cannot be told apart from the file alone.
+//!
+//! A write that fails is cut back off the file before the error is returned,
+//! so a later append, such as a second attempt at `run.end` once the disk has
+//! room, continues a chain with no partial or unchained line in it.
 
 use crate::error::{Result, VaernError};
 use serde_json::{Map, Value};
@@ -35,6 +39,11 @@ pub struct Journal {
     /// Running SHA-256 of the transcript; see [`Journal::console`].
     transcript: ring::digest::Context,
     sealed: bool,
+    /// Length of the file up to the end of the last record written whole.
+    len: u64,
+    /// Set when a failed write could not be cut back off the file; every
+    /// later write is refused, because it would follow bytes no hash covers.
+    damaged: bool,
 }
 
 /// The outcome of [`verify`].
@@ -103,6 +112,8 @@ impl Journal {
             prev: GENESIS.to_string(),
             transcript: ring::digest::Context::new(&ring::digest::SHA256),
             sealed: false,
+            len: 0,
+            damaged: false,
         })
     }
 
@@ -120,11 +131,16 @@ impl Journal {
             .open(path)
             .map_err(|err| create_error(path, &err))?;
         let verified = verify(path)?;
+        let mut len = writer
+            .metadata()
+            .map_err(|err| create_error(path, &err))?
+            .len();
         if verified.torn_tail {
             let bytes = std::fs::read(path).map_err(|err| create_error(path, &err))?;
             let keep = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+            len = keep as u64;
             writer
-                .set_len(keep as u64)
+                .set_len(len)
                 .and_then(|()| writer.sync_data())
                 .map_err(|err| write_error(path, &err.to_string()))?;
         }
@@ -141,6 +157,8 @@ impl Journal {
             prev: verified.final_hash,
             transcript: ring::digest::Context::new(&ring::digest::SHA256),
             sealed: false,
+            len,
+            damaged: false,
         })
     }
 
@@ -184,13 +202,14 @@ impl Journal {
         Ok(seq)
     }
 
-    /// Appends `run.end` and syncs the file. Later calls do nothing, so the
-    /// first outcome, such as `process.exit`, is the one recorded.
+    /// Appends `run.end` and syncs the file. Once that has succeeded, later
+    /// calls do nothing, so the first outcome recorded, such as
+    /// `process.exit`, is the one that stands. A call whose write failed
+    /// leaves the journal unsealed, and the next call tries again.
     pub fn seal(&mut self, exit_code: i32, error: Option<&str>) -> Result<()> {
         if self.sealed {
             return Ok(());
         }
-        self.sealed = true;
         let mut fields = Map::new();
         fields.insert("exit_code".to_string(), Value::from(exit_code));
         if let Some(error) = error {
@@ -202,6 +221,7 @@ impl Journal {
             Value::from(hex(self.transcript.clone().finish().as_ref())),
         );
         self.append_durable("run.end", fields)?;
+        self.sealed = true;
         Ok(())
     }
 
@@ -211,6 +231,12 @@ impl Journal {
         fields: Map<String, Value>,
         durable: bool,
     ) -> Result<u64> {
+        if self.damaged {
+            return Err(write_error(
+                &self.path,
+                "an earlier write failed and could not be removed from the file, so no record can follow it",
+            ));
+        }
         let seq = self.next_seq;
         let mut record = Map::new();
         record.insert("seq".to_string(), Value::from(seq));
@@ -222,7 +248,8 @@ impl Journal {
         })?;
         let hash = chain_hash(&self.prev, body.as_bytes());
         let line = format!("{{\"h\":\"{hash}\",\"r\":{body}}}\n");
-        self.file
+        let written = self
+            .file
             .write_all(line.as_bytes())
             .and_then(|()| self.file.flush())
             .and_then(|()| {
@@ -231,11 +258,31 @@ impl Journal {
                 } else {
                     Ok(())
                 }
-            })
-            .map_err(|err| write_error(&self.path, &err.to_string()))?;
+            });
+        if let Err(err) = written {
+            // Part of the line, or all of it when only the sync failed, may
+            // be in the file. It is not part of the chain, so it is removed.
+            if let Err(cut) = self.cut_back() {
+                self.damaged = true;
+                return Err(write_error(
+                    &self.path,
+                    &format!("{err}; removing the partial record also failed: {cut}"),
+                ));
+            }
+            return Err(write_error(&self.path, &err.to_string()));
+        }
         self.prev = hash;
         self.next_seq += 1;
+        self.len += line.len() as u64;
         Ok(seq)
+    }
+
+    /// Truncates the file to the end of the last whole record. The append
+    /// handle cannot truncate on Windows, so a write handle is opened for it.
+    fn cut_back(&self) -> std::io::Result<()> {
+        let writer = std::fs::OpenOptions::new().write(true).open(&self.path)?;
+        writer.set_len(self.len)?;
+        writer.sync_data()
     }
 }
 
@@ -696,5 +743,50 @@ mod tests {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(20_402), (2025, 11, 10));
         assert_eq!(civil_from_days(11_016), (2000, 2, 29));
+    }
+
+    #[test]
+    fn test_a_seal_whose_write_failed_is_retried_and_lands() {
+        let home = tempfile::tempdir().unwrap();
+        let mut journal = Journal::create(home.path()).unwrap();
+        journal
+            .append("run.start", fields(&[("script", Value::from("main.ts"))]))
+            .unwrap();
+        let path = journal.path().to_path_buf();
+        let good = std::mem::replace(&mut journal.file, std::fs::File::open(&path).unwrap());
+        // Bytes a failed write left behind, which no hash covers.
+        let mut partial = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        partial.write_all(b"{\"h\":\"00").unwrap();
+        drop(partial);
+
+        assert!(matches!(
+            journal.seal(3, None),
+            Err(VaernError::Journal { ref stage, .. }) if stage == "write"
+        ));
+        let after_failure = verify(&path).unwrap();
+        assert_eq!(
+            (
+                after_failure.records,
+                after_failure.sealed,
+                after_failure.torn_tail
+            ),
+            (1, false, false)
+        );
+
+        journal.file = good;
+        journal.seal(3, None).unwrap();
+        let verified = verify(&path).unwrap();
+        assert_eq!(
+            (verified.records, verified.sealed, verified.torn_tail),
+            (2, true, false)
+        );
+        let end = lines(&path).pop().unwrap();
+        assert!(end.contains("\"exit_code\":3"), "{end}");
+
+        journal.seal(0, None).unwrap();
+        assert_eq!(verify(&path).unwrap().records, 2);
     }
 }
