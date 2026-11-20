@@ -369,7 +369,7 @@ for await (const ev of m.stream({ messages: [{ role: "user", content: "Hi" }] })
   as `Authorization: Bearer <key>` and never written to the journal.
   `price` is USD per million tokens for input and output (default 0).
   `maxOutputTokens` defaults to 1024; `timeoutMs` to 60000.
-- `chat({ messages, maxTokens, temperature, schema, schemaName, responseFormat, tools })`:
+- `chat({ messages, maxTokens, temperature, schema, schemaName, responseFormat, tools, signal })`:
   `messages` is passed through as given. `max_tokens` is always sent:
   `maxTokens` when set, else the model's `maxOutputTokens`. `responseFormat`
   is sent as `response_format` and `tools` as `tools`, unchanged.
@@ -382,14 +382,15 @@ for await (const ev of m.stream({ messages: [{ role: "user", content: "Hi" }] })
   `title` and `description`. A schema with any other keyword is refused with
   stage `config` and is not sent. `schema` and `responseFormat` cannot be
   combined.
-- `stream({ messages, maxTokens, temperature })` returns an async iterator.
+- `stream({ messages, maxTokens, temperature, signal })` returns an async iterator.
   The request is sent with `stream: true` and
   `stream_options: { include_usage: true }` and read as server-sent events.
   Each text fragment is yielded as `{ delta }` when it arrives; the last
   event is `{ delta: "", done: true }` plus the fields `chat()` returns. The
   request starts on the first `next()`, so a stream that is never read sends
   nothing. Leaving the loop early stops delivery, not the request: it runs
-  to completion and is recorded and charged. A failure is thrown from the
+  to completion and is recorded and charged. To stop the request, abort its
+  `signal`. A failure is thrown from the
   loop. `schema` and `tools` cannot be streamed. A streamed call does not
   follow redirects, and `timeoutMs` applies to the wait for the response and
   to each gap between events. The whole stream must also finish within 10
@@ -539,7 +540,18 @@ budget.remaining();                      // { usd: 0.24..., tokens: 49_100 }
   fully spent. One run uses a named budget at a time; a second gets
   `BudgetError` `LEDGER_BUSY`. An edited ledger fails to load.
 
-Absent: cancelling a call in flight, embeddings, other endpoints, retries, schema keywords
+- `signal` is an `AbortSignal`, as for `fetch`; anything else is a
+  `TypeError`. A signal already aborted rejects the call with an
+  `AbortError` (the signal's reason, as `fetch` builds it) before anything
+  is reserved, sent or recorded. Aborting while the call is in flight
+  rejects it at once the same way: a pending `chat()` rejects, and a
+  stream drops the fragments not yet read and throws from its loop. The
+  request is stopped and its connection closed, and the call is still
+  recorded as a failed `model.call`. It is charged by the rule above: it
+  keeps its reserve unless the abort came before any of the request was
+  written.
+
+Absent: embeddings, other endpoints, retries, schema keywords
 outside the list above, and checking of replies requested with
 `responseFormat`.
 

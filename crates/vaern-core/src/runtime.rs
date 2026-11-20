@@ -361,6 +361,24 @@ fn random_seed() -> std::result::Result<[u32; 4], String> {
 
 /// The shared HTTP client, built on first use. Fetch and model calls share
 /// it so they share kept-alive connections and TLS sessions.
+/// A receiver for the abort signal `abort_id` (0 for none). It is
+/// subscribed before the effect starts, so an abort sent at any point after
+/// is seen.
+fn abort_receiver(
+    state: &Rc<RefCell<SharedState>>,
+    abort_id: u32,
+) -> Option<tokio::sync::broadcast::Receiver<()>> {
+    if abort_id == 0 {
+        return None;
+    }
+    let mut s = state.borrow_mut();
+    let sender = s.abort_senders.entry(abort_id).or_insert_with(|| {
+        let (tx, _) = tokio::sync::broadcast::channel(1);
+        tx
+    });
+    Some(sender.subscribe())
+}
+
 fn shared_client(state: &Rc<RefCell<SharedState>>) -> Result<crate::fetch::HttpClient> {
     let mut s = state.borrow_mut();
     match &s.fetch_client {
@@ -832,16 +850,7 @@ impl QuickJsRuntime {
                         max_body_bytes: crate::fetch::MAX_RESPONSE_BODY_BYTES,
                     };
 
-                    let abort_rx = if abort_id > 0 {
-                        let mut s = state_fetch.borrow_mut();
-                        let sender = s.abort_senders.entry(abort_id).or_insert_with(|| {
-                            let (tx, _) = tokio::sync::broadcast::channel(1);
-                            tx
-                        });
-                        Some(sender.subscribe())
-                    } else {
-                        None
-                    };
+                    let abort_rx = abort_receiver(&state_fetch, abort_id);
 
                     let tx = state_fetch.borrow().events_tx.clone();
                     let client = shared_client(&state_fetch);
@@ -966,7 +975,7 @@ impl QuickJsRuntime {
             let tokio_handle_ai = tokio_handle.clone();
             let ai_start_fn = Function::new(
                 ctx.clone(),
-                move |req_id: u32, config: String, call: String| -> Option<String> {
+                move |req_id: u32, config: String, call: String, abort_id: u32| -> Option<String> {
                     let call = match crate::ai::prepare(&config, &call) {
                         Ok(call) => call,
                         Err(err) => return Some(model_error_info(err).to_string()),
@@ -1013,17 +1022,18 @@ impl QuickJsRuntime {
                         let req = crate::ai::request_record(&call);
                         track_effect(&state_ai, "model.call", req_id, req);
                     }
+                    let abort_rx = abort_receiver(&state_ai, abort_id);
                     let tx = state_ai.borrow().events_tx.clone();
                     state_ai.borrow_mut().pending_models += 1;
                     tokio_handle_ai.spawn(async move {
                         let result = if call.stream {
                             let deltas = tx.clone();
-                            crate::ai_stream::send(&client, &call, move |delta| {
+                            crate::ai_stream::send(&client, &call, abort_rx, move |delta| {
                                 let _ = deltas.send(LoopEvent::ModelDelta(req_id, delta));
                             })
                             .await
                         } else {
-                            crate::ai::send(&client, &call).await
+                            crate::ai::send(&client, &call, abort_rx).await
                         };
                         let _ = tx.send(LoopEvent::ModelDone(Box::new(ModelCompletion {
                             req_id,
@@ -5218,6 +5228,164 @@ mod tests {
         );
         drop(runtime);
         assert!(stub.join().unwrap() < 600);
+    }
+
+    /// Reads one HTTP/1.1 request with a `content-length` body off `stream`.
+    fn read_request(stream: std::net::TcpStream) -> std::io::BufReader<std::net::TcpStream> {
+        use std::io::{BufRead, Read};
+        let mut reader = std::io::BufReader::new(stream);
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                length = value.trim().parse().unwrap();
+            }
+            if line == "\r\n" {
+                break;
+            }
+        }
+        reader.read_exact(&mut vec![0; length]).unwrap();
+        reader
+    }
+
+    #[test]
+    fn test_an_aborted_model_call_rejects_at_once_closes_its_request_and_keeps_its_reserve() {
+        use std::io::Read;
+        // Takes the request and never answers; reports how long the client
+        // kept the connection open.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stub = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = read_request(stream);
+            let held = Instant::now();
+            reader
+                .get_mut()
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .unwrap();
+            let closed = matches!(reader.read(&mut [0; 64]), Ok(0) | Err(_));
+            (closed, held.elapsed())
+        });
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join(".vaern");
+        let main = root.path().join("main.js");
+        let script = r#"
+            import { model, budget } from "vaern:ai";
+            budget({ tokens: 1000 });
+            const m = model({ baseUrl: "http://127.0.0.1:PORT/v1", model: "m",
+                              price: { inputPerMTok: 1, outputPerMTok: 1 }, timeoutMs: 20000 });
+            const ask = { messages: [{ role: "user", content: "x" }], maxTokens: 10 };
+            const left = () => budget.remaining().tokens;
+            const rejection = (promise) => promise.then(
+                () => { throw new Error("the call resolved"); }, (err) => err);
+
+            // Aborted before the call: nothing is reserved, sent or recorded.
+            const early = await rejection(m.chat({ ...ask, signal: AbortSignal.abort() }));
+            if (early.name !== "AbortError" || left() !== 1000) throw new Error("early " + left());
+            const wrong = await rejection(m.chat({ ...ask, signal: {} }));
+            if (!(wrong instanceof TypeError)) throw wrong;
+
+            const controller = new AbortController();
+            const reason = new Error("stop now");
+            const started = Date.now();
+            const call = m.chat({ ...ask, signal: controller.signal });
+            setTimeout(() => controller.abort(reason), 200);
+            const late = await rejection(call);
+            if (late !== reason || late.name !== "AbortError") throw late;
+            if (Date.now() - started > 5000) throw new Error("the abort took " + (Date.now() - started));
+            console.log(1000 - left());
+            "#
+        .replace("PORT", &port.to_string());
+        std::fs::write(&main, script).unwrap();
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        runtime.set_journal_home(Some(home.clone()));
+        assert_eq!(runtime.run_file(&main).unwrap(), 0);
+        let (closed, held) = stub.join().unwrap();
+        assert!(closed && held < Duration::from_secs(10), "{held:?}");
+
+        let records = journal_records(&home);
+        let calls: Vec<_> = records
+            .iter()
+            .filter(|r| r["kind"] == "model.call")
+            .collect();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        let error = &calls[0]["error"];
+        assert!(
+            error["message"]
+                .as_str()
+                .unwrap()
+                .contains("aborted by AbortSignal"),
+            "{error}"
+        );
+        assert_eq!(error["sent"], true, "{error}");
+        let reserves = records
+            .iter()
+            .filter(|r| r["kind"] == "budget.reserve")
+            .count();
+        assert_eq!(reserves, 1);
+        let settle = records
+            .iter()
+            .find(|r| r["kind"] == "budget.settle")
+            .unwrap();
+        let reserve = records
+            .iter()
+            .find(|r| r["kind"] == "budget.reserve")
+            .unwrap();
+        assert_eq!(settle["tokens"], reserve["tokens"]);
+        assert_eq!(error["charged_nano_usd"], reserve["nano_usd"]);
+    }
+
+    #[test]
+    fn test_an_aborted_stream_throws_from_its_loop_and_stops_the_body() {
+        use std::io::Write as _;
+        // Sends one event every 40 ms until the client goes away.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stub = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = read_request(stream);
+            let stream = reader.get_mut();
+            let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
+            stream.write_all(head.as_bytes()).unwrap();
+            let event = "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n";
+            let chunk = format!("{:x}\r\n{event}\r\n", event.len());
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(30)
+                && stream.write_all(chunk.as_bytes()).is_ok()
+            {
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            started.elapsed()
+        });
+        let code = r#"
+            import { model } from "vaern:ai";
+            const m = model({ baseUrl: "http://127.0.0.1:PORT/v1", model: "m", timeoutMs: 20000 });
+            const controller = new AbortController();
+            const events = m.stream({ messages: [{ role: "user", content: "x" }], signal: controller.signal });
+            let seen = 0;
+            let failure = null;
+            try {
+                for await (const ev of events) {
+                    seen++;
+                    if (seen === 3) controller.abort();
+                }
+            } catch (err) {
+                failure = err;
+            }
+            if (!failure || failure.name !== "AbortError") throw failure || new Error("the loop ended");
+            if (seen !== 3) throw new Error(seen + " events were read after the abort");
+            let wrong = null;
+            try { m.stream({ messages: [], signal: "no" }); } catch (err) { wrong = err; }
+            if (!(wrong instanceof TypeError)) throw new Error("a bad signal was taken");
+            "#
+        .replace("PORT", &port.to_string());
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        assert_eq!(runtime.eval("stop.js", &code).unwrap(), 0);
+        drop(runtime);
+        // The stub keeps writing until the connection is gone.
+        let sent_for = stub.join().unwrap();
+        assert!(sent_for < Duration::from_secs(10), "{sent_for:?}");
     }
 
     #[test]

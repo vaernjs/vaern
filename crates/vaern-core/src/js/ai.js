@@ -50,6 +50,19 @@
 
     const failure = (info) => (info.budget ? new BudgetError(info) : new ModelError(info));
 
+    // What an aborted call rejects with, built as fetch builds it.
+    const abortReason = (signal) => {
+        const err = signal.reason || new Error("The operation was aborted");
+        err.name = "AbortError";
+        return err;
+    };
+    const signalArg = (where, signal) => {
+        if (signal !== undefined && signal !== null && !(signal instanceof AbortSignal)) {
+            throw new TypeError(`${where}: signal must be an AbortSignal`);
+        }
+        return signal ?? undefined;
+    };
+
     class AgentError extends Error {
         constructor(code, message, steps) {
             super(message);
@@ -67,8 +80,10 @@
         const waiter = pending.get(info.reqId);
         if (!waiter) return;
         // Built before the waiter is removed, so a throw here leaves it for
-        // __vaern_reject_model.
-        const error = info.ok ? null : failure(info);
+        // __vaern_reject_model. A call stopped by its signal, as a replay
+        // delivers it, rejects as the abort did.
+        const aborted = !info.ok && waiter.signal && String(info.message).includes("aborted by AbortSignal");
+        const error = info.ok ? null : aborted ? abortReason(waiter.signal) : failure(info);
         pending.delete(info.reqId);
         if (info.ok) waiter.resolve(info);
         else waiter.reject(error);
@@ -116,7 +131,13 @@
             "each call reserves 0 USD. Set price in model(), or limit the run with --budget-tokens.");
     };
 
+    // An aborted signal rejects the call at once, as fetch does. The request
+    // itself is stopped on the native side, and the call is still recorded
+    // and charged by whether any of it was sent. A signal aborted before the
+    // call starts means nothing is reserved, sent or recorded.
     function start(config, options, onDelta) {
+        const signal = options.signal;
+        if (signal && signal.aborted) return Promise.reject(abortReason(signal));
         const reqId = nextReqId++;
         const call = JSON.stringify({
             messages: options.messages,
@@ -129,10 +150,10 @@
             stream: onDelta !== undefined,
         });
         return new Promise((resolve, reject) => {
-            pending.set(reqId, { resolve, reject, onDelta });
+            pending.set(reqId, { resolve, reject, onDelta, signal });
             let refused;
             try {
-                refused = __vaern_ai_start(reqId, config, call);
+                refused = __vaern_ai_start(reqId, config, call, signal ? signal._id : 0);
             } catch (err) {
                 pending.delete(reqId);
                 reject(err);
@@ -142,6 +163,14 @@
                 pending.delete(reqId);
                 reject(failure(JSON.parse(refused)));
                 return;
+            }
+            if (signal) {
+                signal.addEventListener("abort", () => {
+                    const waiter = pending.get(reqId);
+                    if (!waiter) return;
+                    pending.delete(reqId);
+                    waiter.reject(abortReason(signal));
+                });
             }
             warnUnpriced(config);
         });
@@ -159,7 +188,8 @@
     // done: true and the summary chat() returns. The request starts on the
     // first next(), so a stream that is never read sends nothing. Leaving
     // the loop early stops delivery, not the request: it still completes
-    // and is recorded and charged.
+    // and is recorded and charged. Aborting the call's signal stops the
+    // request, drops events not yet read, and makes next() throw.
     function streamOf(config, options) {
         const events = [];
         let wakers = [];
@@ -184,6 +214,7 @@
                     wake();
                 },
                 (err) => {
+                    if (options.signal && options.signal.aborted) events.length = 0;
                     failure = err;
                     ended = true;
                     wake();
@@ -233,7 +264,9 @@
         }
         return Object.freeze({
             async chat(callOptions) {
-                const r = await start(config, objectArg("chat", callOptions));
+                objectArg("chat", callOptions);
+                signalArg("chat", callOptions.signal);
+                const r = await start(config, callOptions);
                 const result = summary(r);
                 if (r.json !== null) result.json = r.json;
                 if (Array.isArray(r.toolCalls) && r.toolCalls.length > 0) {
@@ -242,7 +275,9 @@
                 return result;
             },
             stream(callOptions) {
-                return streamOf(config, objectArg("stream", callOptions));
+                objectArg("stream", callOptions);
+                signalArg("stream", callOptions.signal);
+                return streamOf(config, callOptions);
             },
         });
     }

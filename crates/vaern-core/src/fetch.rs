@@ -183,7 +183,8 @@ pub async fn execute_fetch_pooled(
 
 /// [`execute_fetch_pooled`], also reporting through `unsent` whether a
 /// failure is known to have come before any of the request was written: the
-/// URL was refused, or no connection to the first host could be made. It
+/// URL was refused, no connection to the first host could be made, or an
+/// abort was already waiting when the first hop was about to start. It
 /// stays false for every other failure, a timeout included, because the
 /// request may have reached the server by then.
 pub async fn execute_fetch_tracked(
@@ -247,7 +248,7 @@ fn parse_fetch_url(initial_url: &str) -> Result<Url> {
 /// before this call: the receiver keeps its own read position, so an abort
 /// between redirect hops waits for the next hop instead of being missed.
 /// A closed channel means nobody can abort any more, not an abort.
-async fn aborted(abort_rx: &mut Option<broadcast::Receiver<()>>) {
+pub(crate) async fn aborted(abort_rx: &mut Option<broadcast::Receiver<()>>) {
     let Some(rx) = abort_rx else {
         return future::pending().await;
     };
@@ -256,6 +257,20 @@ async fn aborted(abort_rx: &mut Option<broadcast::Receiver<()>>) {
             Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => return,
             Err(broadcast::error::RecvError::Closed) => future::pending::<()>().await,
         }
+    }
+}
+
+/// Whether an abort is already waiting on `abort_rx`. Checked before a
+/// request is handed to the client: until then none of it can have been
+/// written, so a caller that charges for sent requests can tell the two
+/// apart.
+pub(crate) fn abort_pending(abort_rx: &mut Option<broadcast::Receiver<()>>) -> bool {
+    match abort_rx {
+        Some(rx) => matches!(
+            rx.try_recv(),
+            Ok(()) | Err(broadcast::error::TryRecvError::Lagged(_))
+        ),
+        None => false,
     }
 }
 
@@ -331,6 +346,15 @@ async fn execute_fetch_with(
         // Race request execution against timeout and cancellation. The abort
         // arm is polled first, so an abort already sent stops this hop before
         // any of its bytes, credentials included, leave the process.
+        if abort_pending(&mut abort_rx) {
+            unsent.store(redirect_count == 0, Ordering::Relaxed);
+            return Err(VaernError::Fetch {
+                stage: "send".to_string(),
+                url: current_url.to_string(),
+                message: "request aborted by AbortSignal".to_string(),
+                action: "handle AbortError or increase abort timeout".to_string(),
+            });
+        }
         let send_future = client.request(req);
 
         let resp = tokio::select! {
@@ -1012,6 +1036,26 @@ mod tests {
             .await
             .expect("a body of exactly the limit is delivered");
         assert_eq!(res.body.len(), 1024);
+    }
+
+    #[tokio::test]
+    async fn test_an_abort_waiting_before_the_first_hop_reports_nothing_sent() {
+        let (addr, seen) = start_recording_server(|| {}).await;
+        let (tx, rx) = broadcast::channel(1);
+        tx.send(()).unwrap();
+        let unsent = AtomicBool::new(false);
+        let client = build_http_client().unwrap();
+        let result = execute_fetch_tracked(
+            &client,
+            &format!("http://{addr}/hop1"),
+            FetchOptions::default(),
+            Some(rx),
+            &unsent,
+        )
+        .await;
+        assert_aborted(result);
+        assert!(unsent.load(Ordering::Relaxed));
+        assert!(seen.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

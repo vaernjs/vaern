@@ -175,5 +175,9 @@ timers against effects. Fragments of a streamed model reply are handed back
 together with its completion. Redacted header values come back as
 `"[redacted]"`, and a response's `url` and an error's `url` come back with
 their credentials redacted, so a script that prints one diverges there. A stream that failed part-way records only its error, so the
-fragments it delivered first are not handed back. `serve()` stops a replay,
+fragments it delivered first are not handed back. A `fetch` or model call
+that an `AbortSignal` stopped is handed back its recorded error when the
+replay reaches it, which can be before the script's own abort runs: the
+rejection then carries the default reason, not the script's, and a script
+that prints it diverges. `serve()` stops a replay,
 because incoming requests are not recorded.

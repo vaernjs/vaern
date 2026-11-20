@@ -7,6 +7,10 @@
 //!
 //! The raw event text is kept as the reply's body. The journal records it
 //! as received, so the deltas a script saw can be derived again from it.
+//!
+//! An abort is raced against the request and every wait for an event, so a
+//! script that stops a stream also closes its connection; the body is
+//! dropped with the error.
 
 use crate::ai::{ModelReply, PreparedCall};
 use crate::error::{Result, VaernError};
@@ -16,6 +20,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use hyper::{Method, Request};
 use serde_json::Value;
+use tokio::sync::broadcast;
 
 /// Splits a `text/event-stream` body into the payloads of its `data:`
 /// lines. OpenAI-compatible servers send one `data:` line per event, so
@@ -113,6 +118,17 @@ fn stream_error(call: &PreparedCall, stage: &str, status: u16, message: String) 
     }
 }
 
+fn aborted_error(call: &PreparedCall, status: u16, message: String) -> VaernError {
+    VaernError::Model {
+        stage: "connect".to_string(),
+        url: call.endpoint.clone(),
+        status,
+        message,
+        action: crate::ai::ABORTED_ACTION.to_string(),
+        sent: true,
+    }
+}
+
 /// How many times `timeoutMs` a whole stream may take. Each event must
 /// arrive within `timeoutMs` of the one before; without a bound on the
 /// total, a server sending one byte just inside that wait keeps a call, and
@@ -125,6 +141,7 @@ pub const STREAM_TOTAL_TIMEOUTS: u32 = 10;
 pub async fn send(
     client: &HttpClient,
     call: &PreparedCall,
+    mut abort_rx: Option<broadcast::Receiver<()>>,
     on_delta: impl Fn(String),
 ) -> Result<ModelReply> {
     let uri: hyper::Uri = call.endpoint.parse().map_err(|err| {
@@ -157,19 +174,29 @@ pub async fn send(
 
     let timeout = call.config.timeout;
     let deadline = tokio::time::Instant::now() + timeout.saturating_mul(STREAM_TOTAL_TIMEOUTS);
-    let response = tokio::time::timeout(timeout, client.request(request))
-        .await
-        .map_err(|_| stream_error(call, "connect", 0, "no response within timeoutMs".into()))?
-        .map_err(|err| {
-            // Without a connection nothing was written.
-            let never_sent = err.is_connect();
-            let failed = stream_error(call, "connect", 0, err.to_string());
-            if never_sent {
-                crate::ai::unsent(failed)
-            } else {
-                failed
-            }
-        })?;
+    // Until the request is handed to the client none of it is written.
+    if crate::fetch::abort_pending(&mut abort_rx) {
+        let message = format!("request {}", crate::ai::ABORTED);
+        return Err(crate::ai::unsent(aborted_error(call, 0, message)));
+    }
+    let response = tokio::select! {
+        biased;
+        () = crate::fetch::aborted(&mut abort_rx) => {
+            return Err(aborted_error(call, 0, format!("request {}", crate::ai::ABORTED)));
+        }
+        response = tokio::time::timeout(timeout, client.request(request)) => response,
+    }
+    .map_err(|_| stream_error(call, "connect", 0, "no response within timeoutMs".into()))?
+    .map_err(|err| {
+        // Without a connection nothing was written.
+        let never_sent = err.is_connect();
+        let failed = stream_error(call, "connect", 0, err.to_string());
+        if never_sent {
+            crate::ai::unsent(failed)
+        } else {
+            failed
+        }
+    })?;
     let status = response.status().as_u16();
     let ok = (200..300).contains(&status);
     let mut body = response.into_body();
@@ -178,16 +205,22 @@ pub async fn send(
     let mut state = StreamState::default();
     loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let frame = tokio::time::timeout(timeout.min(left), body.frame())
-            .await
-            .map_err(|_| {
-                let message = if left <= timeout {
-                    format!("the stream did not finish within {STREAM_TOTAL_TIMEOUTS} x timeoutMs")
-                } else {
-                    "no stream event within timeoutMs".to_string()
-                };
-                stream_error(call, "connect", status, message)
-            })?;
+        let frame = tokio::select! {
+            biased;
+            () = crate::fetch::aborted(&mut abort_rx) => {
+                let message = format!("stream {}", crate::ai::ABORTED);
+                return Err(aborted_error(call, status, message));
+            }
+            frame = tokio::time::timeout(timeout.min(left), body.frame()) => frame,
+        }
+        .map_err(|_| {
+            let message = if left <= timeout {
+                format!("the stream did not finish within {STREAM_TOTAL_TIMEOUTS} x timeoutMs")
+            } else {
+                "no stream event within timeoutMs".to_string()
+            };
+            stream_error(call, "connect", status, message)
+        })?;
         let Some(frame) = frame else { break };
         let frame = frame.map_err(|err| {
             stream_error(call, "connect", status, format!("the stream broke: {err}"))

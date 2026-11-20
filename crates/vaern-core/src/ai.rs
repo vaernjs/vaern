@@ -87,6 +87,13 @@ fn model_error(stage: &str, url: &str, status: u16, message: String, action: &st
     }
 }
 
+/// Text every aborted call's error carries. The prelude turns an error with
+/// it into the signal's reason, as `fetch` does.
+pub(crate) const ABORTED: &str = "aborted by AbortSignal";
+
+/// The action of an aborted call: the script stopped it, not the server.
+pub(crate) const ABORTED_ACTION: &str = "The script aborted this call through its signal; catch the AbortError where the call is awaited.";
+
 /// Marks a model error as raised before any of the request was written.
 pub(crate) fn unsent(err: VaernError) -> VaernError {
     match err {
@@ -242,8 +249,14 @@ pub fn prepare(config_json: &str, call_json: &str) -> Result<PreparedCall> {
     })
 }
 
-/// Sends `call` and parses the reply.
-pub async fn send(client: &HttpClient, call: &PreparedCall) -> Result<ModelReply> {
+/// Sends `call` and parses the reply. A message on `abort_rx` stops the
+/// request; whether it is charged follows the same `sent` rule as any other
+/// failure.
+pub async fn send(
+    client: &HttpClient,
+    call: &PreparedCall,
+    abort_rx: Option<tokio::sync::broadcast::Receiver<()>>,
+) -> Result<ModelReply> {
     let mut headers = vec![
         ("content-type".to_string(), "application/json".to_string()),
         ("accept".to_string(), "application/json".to_string()),
@@ -260,20 +273,19 @@ pub async fn send(client: &HttpClient, call: &PreparedCall) -> Result<ModelReply
     };
     let never_sent = std::sync::atomic::AtomicBool::new(false);
     let response =
-        crate::fetch::execute_fetch_tracked(client, &call.endpoint, options, None, &never_sent)
+        crate::fetch::execute_fetch_tracked(client, &call.endpoint, options, abort_rx, &never_sent)
             .await
             .map_err(|err| {
                 let message = match err {
                     VaernError::Fetch { stage, message, .. } => format!("{stage}: {message}"),
                     other => other.to_string(),
                 };
-                let failed = model_error(
-                    "connect",
-                    &call.endpoint,
-                    0,
-                    message,
-                    "Check that the model server is running and baseUrl is right.",
-                );
+                let action = if message.contains(ABORTED) {
+                    ABORTED_ACTION
+                } else {
+                    "Check that the model server is running and baseUrl is right."
+                };
+                let failed = model_error("connect", &call.endpoint, 0, message, action);
                 if never_sent.load(std::sync::atomic::Ordering::Relaxed) {
                     unsent(failed)
                 } else {
