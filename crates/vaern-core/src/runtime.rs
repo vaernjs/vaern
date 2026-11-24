@@ -6522,7 +6522,39 @@ mod tests {
     /// memory runs short and only its result has to fit. Filling first made
     /// the request itself depend on what the fill happened to leave, which
     /// differs by platform: on macOS the call could fail before sending.
-    fn with_full_heap(imports: &str, block: usize, spare: usize, call: &str) -> String {
+    ///
+    /// With `room`, the heap is left with that many bytes free instead. What
+    /// the fill leaves depends on the C allocator QuickJS is built with; a
+    /// result whose size is near it could fit on one platform and leave the
+    /// script no heap of its own on another. So twice `room` is set aside
+    /// before the fill and given back after it, which frees what it took on
+    /// any allocator, and the space then free is measured and padded down to
+    /// `room`. The run exits 6, naming the space it found, should there still
+    /// be less than `room`.
+    fn with_full_heap(
+        imports: &str,
+        block: usize,
+        spare: usize,
+        room: Option<usize>,
+        call: &str,
+    ) -> String {
+        let (set_aside, pin) = match room {
+            None => (String::new(), String::new()),
+            Some(room) => (
+                format!("\n            let aside = new ArrayBuffer(2 * {room});"),
+                format!(
+                    r#"
+            aside = null;
+            let left = 0;
+            for (let high = ({spare} + 2) * {block} + 2 * {room}; high - left > 64; ) {{
+                const mid = Math.floor((left + high) / 2);
+                try {{ new ArrayBuffer(mid); left = mid; }} catch {{ high = mid; }}
+            }}
+            const short = left < {room};
+            if (!short) hold.push(new ArrayBuffer(left - {room}));"#
+                ),
+            ),
+        };
         format!(
             r#"
             {imports}
@@ -6531,10 +6563,10 @@ mod tests {
             const hold = [];
             const fill = (size) => {{
                 try {{ for (;;) hold.push(new ArrayBuffer(size)); }} catch {{}}
-            }};
+            }};{set_aside}
             fill(8 * 1024 * 1024);
             fill({block});
-            hold.length = Math.max(0, hold.length - {spare});
+            hold.length = Math.max(0, hold.length - {spare});{pin}
             let outcome;
             try {{
                 await pending;
@@ -6544,6 +6576,10 @@ mod tests {
             }}
             hold.length = 0;
             process.exitCode = outcome === "rejected" ? 0 : outcome === "resolved" ? 4 : 5;
+            if (typeof short !== "undefined" && short) {{
+                console.log(`heap test: the fill left ${{left}} bytes, fewer than the room asked for`);
+                process.exitCode = 6;
+            }}
         "#
         )
     }
@@ -6551,12 +6587,13 @@ mod tests {
     #[test]
     fn test_fetch_result_that_does_not_fit_the_heap_rejects() {
         // The body is two bytes. The headers are built in the heap, where
-        // 128 KiB is left for 320 KiB of them.
+        // 32 KiB is left for 320 KiB of them.
         let (port, server) = wide_reply();
         let code = with_full_heap(
             "",
             64 * 1024,
             2,
+            Some(32 * 1024),
             &format!(r#"fetch("http://127.0.0.1:{port}/")"#),
         );
         let result = eval_within("fetch_oom.js", code);
@@ -6580,6 +6617,7 @@ mod tests {
             r#"import { model } from "vaern:ai";"#,
             8 * 1024 * 1024,
             2,
+            None,
             &format!(
                 r#"model({{ baseUrl: "http://127.0.0.1:{port}/v1", model: "m" }})
                     .chat({{ messages: [{{ role: "user", content: "x" }}], maxTokens: 8 }})"#
