@@ -2881,7 +2881,7 @@ impl QuickJsRuntime {
     /// promise would never settle and the run could end with status 0.
     /// Returns what to report when even that fails.
     fn reject_undelivered(ctx: &Ctx<'_>, hook: &str, what: &str, req_id: u32) -> Option<String> {
-        let exception = ctx.catch();
+        let exception = Self::undelivered_error(ctx, ctx.catch(), what);
         let rejected = ctx
             .globals()
             .get::<_, Function>(hook)
@@ -2892,6 +2892,36 @@ impl QuickJsRuntime {
                 "{what} {req_id} failed while its result was delivered"
             )),
             Err(err) => Some(format!("{what} {req_id} could not be rejected: {err}")),
+        }
+    }
+
+    /// The error a script sees for a result that could not be delivered.
+    /// When the heap ran out while the result was being built, QuickJS may
+    /// have had no room left for the error either and leaves `null`, or an
+    /// error without its message. The half-built result is gone by now, so
+    /// a proper `InternalError` is built in its place.
+    fn undelivered_error<'js>(ctx: &Ctx<'js>, caught: Value<'js>, what: &str) -> Value<'js> {
+        let described = caught
+            .as_exception()
+            .and_then(|exc| exc.message())
+            .is_some_and(|message| !message.is_empty());
+        if described {
+            return caught;
+        }
+        let message =
+            format!("out of memory: the {what} result does not fit in the JavaScript heap");
+        let built = ctx
+            .globals()
+            .get::<_, rquickjs::function::Constructor>("InternalError")
+            .and_then(|internal| internal.construct::<_, Value>((message,)));
+        match built {
+            Ok(error) => error,
+            Err(_) => {
+                // Still no room: hand on what was caught, which the script
+                // can at least catch.
+                let _ = ctx.catch();
+                caught
+            }
         }
     }
 
@@ -6476,14 +6506,17 @@ mod tests {
                 head.push_str(&format!("x-pad-{i}: {}\r\n", "h".repeat(4000)));
             }
             head.push_str("\r\nok");
-            reader.get_mut().write_all(head.as_bytes()).unwrap();
+            // The runtime closes the connection once the headers fail to
+            // fit, which can reset it before the last bytes are taken; the
+            // test is about the script's side, not this write.
+            let _ = reader.get_mut().write_all(head.as_bytes());
         });
         (port, server)
     }
 
     /// A script that starts `call`, then fills the heap, ending with blocks
     /// of `block` bytes, frees `spare` of those, awaits the call, and exits
-    /// 0 only if it rejected.
+    /// 0 only if it rejected with an error that says what went wrong.
     ///
     /// The call starts while the heap has room, so its request is out before
     /// memory runs short and only its result has to fit. Filling first made
@@ -6507,10 +6540,10 @@ mod tests {
                 await pending;
                 outcome = "resolved";
             }} catch (err) {{
-                outcome = "rejected";
+                outcome = err instanceof Error && err.message ? "rejected" : "rejected without an error";
             }}
             hold.length = 0;
-            process.exitCode = outcome === "rejected" ? 0 : 4;
+            process.exitCode = outcome === "rejected" ? 0 : outcome === "resolved" ? 4 : 5;
         "#
         )
     }
