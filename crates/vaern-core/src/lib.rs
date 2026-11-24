@@ -16,6 +16,7 @@ pub mod event;
 pub mod fetch;
 pub mod fs;
 pub mod journal;
+pub mod mcp;
 pub mod module_loader;
 pub mod replay;
 pub mod runtime;

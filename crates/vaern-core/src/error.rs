@@ -116,6 +116,18 @@ pub enum VaernError {
         sent: bool,
     },
 
+    /// An MCP server could not be started, agreed with, or called. `stage`
+    /// is `config`, `spawn`, `negotiate`, `call`, `exited`, `timeout` or
+    /// `protocol`; `code` names the case, such as `UNSUPPORTED_VERSION`.
+    #[error("MCP server '{server}' failed at stage '{stage}' ({code}): {message}. {action}")]
+    Mcp {
+        stage: String,
+        code: String,
+        server: String,
+        message: String,
+        action: String,
+    },
+
     /// A budget refused a reservation or could not be opened. `code` is
     /// `RESERVE_EXCEEDS_REMAINING` (with `unit`, `reserve` and `remaining`
     /// in nano-USD or tokens), `LEDGER_BUSY`, `INVALID` or `LEDGER`.
