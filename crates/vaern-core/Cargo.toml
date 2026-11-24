@@ -9,8 +9,9 @@ description = "Core execution engine and type stripper for the Vaern JavaScript/
 # Error definition
 thiserror = "2.0"
 
-# Async runtime
-tokio = { version = "1.44", features = ["rt", "rt-multi-thread", "time", "sync", "macros", "net", "io-util", "signal"] }
+# Async runtime. `process` spawns `vaern mcp serve` children for
+# vaern:mcp's connect(); it is a feature of tokio, not another crate.
+tokio = { version = "1.44", features = ["rt", "rt-multi-thread", "time", "sync", "macros", "net", "io-util", "signal", "process"] }
 
 # JavaScript engine
 rquickjs = { version = "0.14", features = ["loader", "classes", "properties", "macro"] }

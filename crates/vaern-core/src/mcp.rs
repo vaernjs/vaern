@@ -6,5 +6,6 @@
 //! declarations only, so an MCP call is an effect at a Rust bridge like
 //! `fetch` or a model call, journalled and metered there.
 
+pub mod client;
 pub mod protocol;
 pub mod serve;

@@ -27,6 +27,11 @@ pub const META_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
 pub const META_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
 pub const META_CLIENT: &str = "io.modelcontextprotocol/clientInfo";
 pub const META_SERVER: &str = "io.modelcontextprotocol/serverInfo";
+/// Vendor keys a vaern server adds to `_meta`, ignored by other clients:
+/// its run id on the discover and initialize results, and its cumulative
+/// spend on each `tools/call` result.
+pub const META_RUN: &str = "dev.vaern/run";
+pub const META_SPENT: &str = "dev.vaern/spent";
 
 pub const PARSE_ERROR: i64 = -32700;
 pub const INVALID_REQUEST: i64 = -32600;
@@ -274,6 +279,8 @@ pub struct Negotiated {
     pub era: Era,
     pub server: Value,
     pub instructions: Option<String>,
+    /// The server's run id, when it is a vaern server keeping a journal.
+    pub run: Option<String>,
 }
 
 fn negotiate_error(server: &str, code: &str, message: String) -> VaernError {
@@ -384,6 +391,7 @@ where
                     era: Era::Modern,
                     server: result["_meta"][META_SERVER].clone(),
                     instructions: result["instructions"].as_str().map(str::to_string),
+                    run: result["_meta"][META_RUN].as_str().map(str::to_string),
                 });
             }
             if !versions.iter().any(|v| v == VERSION_N1) {
@@ -454,6 +462,7 @@ where
         era: Era::Legacy,
         server: result["serverInfo"].clone(),
         instructions: result["instructions"].as_str().map(str::to_string),
+        run: result["_meta"][META_RUN].as_str().map(str::to_string),
     })
 }
 
