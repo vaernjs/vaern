@@ -12,8 +12,10 @@
 //! `initialize` switches the process to 2025-11-25 for requests that do not.
 
 use super::protocol::{
-    self, Era, INVALID_PARAMS, MAX_MESSAGE_BYTES, META_VERSION, METHOD_NOT_FOUND, Message, RpcError,
+    self, Era, INVALID_PARAMS, MAX_MESSAGE_BYTES, META_RUN, META_SPENT, META_VERSION,
+    METHOD_NOT_FOUND, Message, RpcError,
 };
+use crate::budget::Amount;
 use crate::event::{EventSender, LoopEvent};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -25,7 +27,7 @@ pub enum Host {
     Off,
     /// `vaern mcp serve`, before the script has called `server()`.
     Waiting,
-    Serving(Served),
+    Serving(Box<Served>),
 }
 
 /// What a line of input asks the runtime to do.
@@ -55,6 +57,12 @@ pub struct Served {
     legacy: bool,
     calls: HashMap<u32, Pending>,
     next_call: u32,
+    /// This run's id, sent with the discover and initialize results so a
+    /// vaern client can name the server's journal.
+    pub run: Option<String>,
+    /// This run's charges so far, sent with each tool list and call result
+    /// when the run has caps: a vaern client settles its grant from it.
+    pub spent: Option<Amount>,
 }
 
 impl Served {
@@ -68,6 +76,21 @@ impl Served {
             legacy: false,
             calls: HashMap::new(),
             next_call: 1,
+            run: None,
+            spent: None,
+        }
+    }
+
+    /// Adds the vaern `_meta` keys this result carries, when known.
+    fn stamp(&self, result: &mut Value, key: &str) {
+        let value = match key {
+            META_RUN => self.run.as_ref().map(|run| json!(run)),
+            _ => self
+                .spent
+                .map(|spent| json!({ "nano_usd": spent.nano, "tokens": spent.tokens })),
+        };
+        if let Some(value) = value {
+            result["_meta"][key] = value;
         }
     }
 
@@ -101,7 +124,8 @@ impl Served {
         };
         if method == "initialize" {
             self.legacy = true;
-            let result = protocol::initialize_result(&self.info, self.instructions.as_deref());
+            let mut result = protocol::initialize_result(&self.info, self.instructions.as_deref());
+            self.stamp(&mut result, META_RUN);
             return Step::Reply(Message::Result { id, result });
         }
         let era = if self.legacy && params["_meta"].get(META_VERSION).is_none() {
@@ -113,13 +137,20 @@ impl Served {
         };
         let result = match method.as_str() {
             "server/discover" => {
-                protocol::discover_result(&self.info, self.instructions.as_deref())
+                let mut result =
+                    protocol::discover_result(&self.info, self.instructions.as_deref());
+                self.stamp(&mut result, META_RUN);
+                result
             }
-            "tools/list" => match era {
-                Era::Modern => json!({ "resultType": "complete", "tools": self.tools,
-                                       "ttlMs": 0, "cacheScope": "private" }),
-                Era::Legacy => json!({ "tools": self.tools }),
-            },
+            "tools/list" => {
+                let mut result = match era {
+                    Era::Modern => json!({ "resultType": "complete", "tools": self.tools,
+                                           "ttlMs": 0, "cacheScope": "private" }),
+                    Era::Legacy => json!({ "tools": self.tools }),
+                };
+                self.stamp(&mut result, META_SPENT);
+                result
+            }
             "ping" if era == Era::Legacy => json!({}),
             "tools/call" => {
                 let name = params["name"].as_str().unwrap_or_default();
@@ -168,6 +199,7 @@ impl Served {
             if era == Era::Modern {
                 result["resultType"] = "complete".into();
             }
+            self.stamp(&mut result, META_SPENT);
             return Some(Message::Result { id, result });
         }
         let value = &outcome["value"];
@@ -187,6 +219,7 @@ impl Served {
         if era == Era::Modern {
             result["resultType"] = "complete".into();
         }
+        self.stamp(&mut result, META_SPENT);
         Some(Message::Result { id, result })
     }
 }
@@ -267,6 +300,31 @@ mod tests {
             Step::Reply(Message::Error { error, .. }) => error.code,
             other => panic!("expected an error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_a_vaern_client_is_told_the_run_id_and_the_spend_so_far() {
+        let mut served = calc();
+        let plain = result(served.handle(&modern(1, "server/discover", json!({}))));
+        assert!(plain["_meta"].get(META_RUN).is_none());
+        served.run = Some("20261125-000000-abcdef".into());
+        served.spent = Some(Amount { nano: 7, tokens: 3 });
+        let discovered = result(served.handle(&modern(2, "server/discover", json!({}))));
+        assert_eq!(discovered["_meta"][META_RUN], "20261125-000000-abcdef");
+        let initialized = result(served.handle(&legacy(3, "initialize", json!({}))));
+        assert_eq!(initialized["_meta"][META_RUN], "20261125-000000-abcdef");
+        let spent = json!({ "nano_usd": 7, "tokens": 3 });
+        let listed = result(served.handle(&modern(4, "tools/list", json!({}))));
+        assert_eq!(listed["_meta"][META_SPENT], spent);
+        let call = served.handle(&modern(5, "tools/call", json!({ "name": "add" })));
+        let Step::Call { req_id, .. } = call else {
+            panic!("{call:?}")
+        };
+        let ok = served.finish(req_id, &json!({ "ok": true, "value": 1 }));
+        let Some(Message::Result { result, .. }) = ok else {
+            panic!("{ok:?}")
+        };
+        assert_eq!(result["_meta"][META_SPENT], spent);
     }
 
     #[test]

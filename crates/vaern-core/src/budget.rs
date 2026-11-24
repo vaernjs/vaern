@@ -326,6 +326,8 @@ pub struct RunBudget {
     run: Option<String>,
     dispatched: bool,
     open: HashMap<(&'static str, u32), (u64, Amount)>,
+    /// What this run's settled effects were charged.
+    charged: Amount,
     /// Set for a replay: each named ledger's balance when the recorded run
     /// opened it.
     replayed: Option<HashMap<String, Amount>>,
@@ -364,6 +366,13 @@ impl RunBudget {
     /// The caps from the command line.
     pub fn caps(&self) -> Limits {
         self.caps
+    }
+
+    /// What this run's settled effects were charged, earlier runs on the
+    /// same ledger aside. A server reports it to the client that granted
+    /// its caps.
+    pub fn charged(&self) -> Amount {
+        self.charged
     }
 
     /// Applies a `budget()` call and returns what remains. Limits only go
@@ -482,8 +491,13 @@ impl RunBudget {
             return Ok(());
         };
         let run = self.run_id(journal.as_deref());
+        let charge = charge.unwrap_or(reserved);
+        self.charged = Amount {
+            nano: self.charged.nano.saturating_add(charge.nano),
+            tokens: self.charged.tokens.saturating_add(charge.tokens),
+        };
         match self.budget.as_mut() {
-            Some(budget) => budget.settle(journal, &run, rid, charge.unwrap_or(reserved)),
+            Some(budget) => budget.settle(journal, &run, rid, charge),
             None => Ok(()),
         }
     }

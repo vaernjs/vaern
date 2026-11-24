@@ -354,6 +354,12 @@ fn track_effect(
     );
 }
 
+/// What a server reports it has spent: only a run with caps reports, since
+/// only a vaern client's grant sets them and settles from the report.
+fn served_spend(budget: &crate::budget::RunBudget) -> Option<crate::budget::Amount> {
+    (budget.caps() != crate::budget::Limits::default()).then(|| budget.charged())
+}
+
 /// 128 bits from the operating system for a journalled run's `Math.random`.
 fn random_seed() -> std::result::Result<[u32; 4], String> {
     use ring::rand::SecureRandom;
@@ -1254,6 +1260,7 @@ impl QuickJsRuntime {
             // client closes stdin.
             let mcp_declare = Rc::clone(&self.mcp);
             let state_mcp = Rc::clone(&state);
+            let journal_mcp = Rc::clone(&self.journal);
             let declare_fn = Function::new(ctx.clone(), move |json: String| -> Option<String> {
                 use crate::mcp::serve::{Host, Served};
                 let refusal = |code: &str, message: &str| {
@@ -1281,7 +1288,9 @@ impl QuickJsRuntime {
                         if let Err(err) = crate::mcp::serve::read_input(tx) {
                             return refusal("STDIN", &format!("stdin cannot be read: {err}"));
                         }
-                        *host = Host::Serving(Served::declare(&declaration));
+                        let mut served = Served::declare(&declaration);
+                        served.run = journal_mcp.borrow().as_ref().map(|j| j.run_id().to_string());
+                        *host = Host::Serving(Box::new(served));
                         state_mcp.borrow_mut().active_servers += 1;
                         None
                     }
@@ -1291,8 +1300,10 @@ impl QuickJsRuntime {
                 reason: format!("failed to create MCP declare bridge: {err}"),
             })?;
             let mcp_reply = Rc::clone(&self.mcp);
+            let budget_reply = Rc::clone(&self.budget);
             let reply_fn = Function::new(ctx.clone(), move |req_id: u32, json: String| {
                 if let crate::mcp::serve::Host::Serving(served) = &mut *mcp_reply.borrow_mut() {
+                    served.spent = served_spend(&budget_reply.borrow());
                     let outcome = serde_json::from_str(&json).unwrap_or_default();
                     if let Some(message) = served.finish(req_id, &outcome) {
                         crate::mcp::serve::emit(&message);
@@ -3347,7 +3358,10 @@ impl QuickJsRuntime {
     fn dispatch_mcp_input(&self, line: &[u8]) {
         use crate::mcp::serve::{Host, Step};
         let step = match &mut *self.mcp.borrow_mut() {
-            Host::Serving(served) => served.handle(line),
+            Host::Serving(served) => {
+                served.spent = served_spend(&self.budget.borrow());
+                served.handle(line)
+            }
             _ => Step::Nothing,
         };
         match step {
