@@ -46,6 +46,9 @@ pub enum LoopEvent {
     StreamChunkSent(StreamChunkSent),
     ServerRequest(ServerIncomingRequest),
     ServerClosed(u32),
+    /// A line a client wrote to `vaern mcp serve`'s stdin; `None` once
+    /// stdin has closed.
+    McpInput(Option<Vec<u8>>),
 }
 
 /// Sending half of the event loop channel.

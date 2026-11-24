@@ -7,3 +7,4 @@
 //! `fetch` or a model call, journalled and metered there.
 
 pub mod protocol;
+pub mod serve;

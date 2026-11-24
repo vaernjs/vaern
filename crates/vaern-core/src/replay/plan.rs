@@ -142,6 +142,15 @@ impl Plan {
                 eid,
             ) {
                 ("run.start", _) => {
+                    if r.get("mcp").and_then(Value::as_str) == Some("serve") {
+                        return Err(VaernError::Replay {
+                            code: "MCP_SERVED".into(),
+                            message: "the run served MCP clients, and their requests arrived on stdin, which the journal does not hold"
+                                .into(),
+                            action: "Replay the client run that called this server; its MCP calls are recorded there."
+                                .into(),
+                        });
+                    }
                     plan.script = text(&r, "script");
                     plan.argv = r["argv"]
                         .as_array()

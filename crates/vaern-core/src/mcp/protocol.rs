@@ -183,6 +183,12 @@ pub async fn read_line<R: AsyncBufRead + Unpin>(
         .take(limit as u64 + 2)
         .read_until(b'\n', &mut line)
         .await?;
+    trim_line(line, read, limit)
+}
+
+/// The end of a line read: `read` bytes of `line`, at most `limit + 2` of
+/// them, with the line ending removed. `Ok(None)` when nothing was read.
+pub fn trim_line(mut line: Vec<u8>, read: usize, limit: usize) -> std::io::Result<Option<Vec<u8>>> {
     if read == 0 {
         return Ok(None);
     }

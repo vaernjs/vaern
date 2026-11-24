@@ -112,7 +112,7 @@ impl Resolver for VaernModuleResolver {
         name: &str,
         _attributes: Option<ImportAttributes<'js>>,
     ) -> rquickjs::Result<String> {
-        if name == "vaern:http" || name == "vaern:fs" || name == "vaern:ai" {
+        if name == "vaern:http" || name == "vaern:fs" || name == "vaern:ai" || name == "vaern:mcp" {
             return Ok(name.to_string());
         }
         let referrer_path = if base.is_empty() {
@@ -227,6 +227,15 @@ impl Loader for VaernModuleLoader {
                      globalThis.__vaern_ai;\n\
                  export { model, ModelError, tool, ToolError, agent, AgentError, budget, BudgetError };\n\
                  export default { model, ModelError, tool, ToolError, agent, AgentError, budget, BudgetError };",
+            );
+        }
+        if name == "vaern:mcp" {
+            return Module::declare(
+                ctx.clone(),
+                name,
+                "const { server, McpError } = globalThis.__vaern_mcp;\n\
+                 export { server, McpError };\n\
+                 export default { server, McpError };",
             );
         }
         let content = FsModuleLoader
@@ -509,6 +518,8 @@ pub struct QuickJsRuntime {
     /// The run's budget, shared with the bridges that reserve and settle.
     budget: BudgetSlot,
     replay: ReplaySlot,
+    /// Whether this run serves MCP, and the declared server once it does.
+    mcp: Rc<RefCell<crate::mcp::serve::Host>>,
     _tokio_rt: tokio::runtime::Runtime,
 }
 
@@ -598,6 +609,7 @@ impl QuickJsRuntime {
             journal: Rc::new(RefCell::new(None)),
             budget: Rc::new(RefCell::new(crate::budget::RunBudget::default())),
             replay: Rc::new(RefCell::new(None)),
+            mcp: Rc::new(RefCell::new(crate::mcp::serve::Host::Off)),
             _tokio_rt: tokio_rt,
         };
 
@@ -647,9 +659,13 @@ impl QuickJsRuntime {
             // never lacks output the terminal showed.
             let journal_print = Rc::clone(&self.journal);
             let replay_print = Rc::clone(&self.replay);
+            let mcp_print = Rc::clone(&self.mcp);
             let print_fn = Function::new(
                 ctx.clone(),
                 move |ctx: Ctx<'_>, target: i32, msg: String| -> rquickjs::Result<()> {
+                    // Serving MCP, stdout carries the protocol only.
+                    let serving = !matches!(*mcp_print.borrow(), crate::mcp::serve::Host::Off);
+                    let target = if serving { 1 } else { target };
                     let fd = if target == 0 { 1 } else { 2 };
                     // A replay prints only what matches the transcript.
                     if let Some(replay) = replay_print.borrow_mut().as_mut()
@@ -1231,6 +1247,65 @@ impl QuickJsRuntime {
                     .map_err(|err| VaernError::EngineInit {
                         reason: format!("failed to register {name}: {err}"),
                     })?;
+            }
+
+            // vaern:mcp server bridges. Declaring starts the stdin reader,
+            // which keeps the loop alive like a listening server until the
+            // client closes stdin.
+            let mcp_declare = Rc::clone(&self.mcp);
+            let state_mcp = Rc::clone(&state);
+            let declare_fn = Function::new(ctx.clone(), move |json: String| -> Option<String> {
+                use crate::mcp::serve::{Host, Served};
+                let refusal = |code: &str, message: &str| {
+                    let action = "Start the script with `vaern mcp serve <file>`, and call server() once.";
+                    let err = VaernError::Mcp {
+                        stage: "config".into(),
+                        code: code.into(),
+                        server: String::new(),
+                        message: message.into(),
+                        action: action.into(),
+                    };
+                    let info = serde_json::json!({
+                        "stage": "config", "code": code, "server": "",
+                        "message": err.to_string(), "action": action,
+                    });
+                    Some(info.to_string())
+                };
+                let mut host = mcp_declare.borrow_mut();
+                match *host {
+                    Host::Off => refusal("NOT_SERVING", "server() runs only under `vaern mcp serve`"),
+                    Host::Serving(_) => refusal("DECLARED", "server() was already called"),
+                    Host::Waiting => {
+                        let declaration = serde_json::from_str(&json).unwrap_or_default();
+                        let tx = state_mcp.borrow().events_tx.clone();
+                        if let Err(err) = crate::mcp::serve::read_input(tx) {
+                            return refusal("STDIN", &format!("stdin cannot be read: {err}"));
+                        }
+                        *host = Host::Serving(Served::declare(&declaration));
+                        state_mcp.borrow_mut().active_servers += 1;
+                        None
+                    }
+                }
+            })
+            .map_err(|err| VaernError::EngineInit {
+                reason: format!("failed to create MCP declare bridge: {err}"),
+            })?;
+            let mcp_reply = Rc::clone(&self.mcp);
+            let reply_fn = Function::new(ctx.clone(), move |req_id: u32, json: String| {
+                if let crate::mcp::serve::Host::Serving(served) = &mut *mcp_reply.borrow_mut() {
+                    let outcome = serde_json::from_str(&json).unwrap_or_default();
+                    if let Some(message) = served.finish(req_id, &outcome) {
+                        crate::mcp::serve::emit(&message);
+                    }
+                }
+            })
+            .map_err(|err| VaernError::EngineInit {
+                reason: format!("failed to create MCP reply bridge: {err}"),
+            })?;
+            for (name, bridge) in [("__vaern_mcp_declare", declare_fn), ("__vaern_mcp_reply", reply_fn)] {
+                globals.set(name, bridge).map_err(|err| VaernError::EngineInit {
+                    reason: format!("failed to register {name}: {err}"),
+                })?;
             }
 
             // Native abort signal bridge
@@ -2705,6 +2780,10 @@ impl QuickJsRuntime {
                 .map_err(|err| VaernError::EngineInit {
                     reason: format!("failed to initialize vaern:ai: {err}"),
                 })?;
+            ctx.eval::<(), _>(include_str!("js/mcp.js"))
+                .map_err(|err| VaernError::EngineInit {
+                    reason: format!("failed to initialize vaern:mcp: {err}"),
+                })?;
             ctx.eval::<(), _>(include_str!("js/random.js"))
                 .map_err(|err| VaernError::EngineInit {
                     reason: format!("failed to initialize the seeded Math.random: {err}"),
@@ -3214,6 +3293,11 @@ impl QuickJsRuntime {
                     }
                 }
             }
+            LoopEvent::McpInput(Some(line)) => self.dispatch_mcp_input(&line),
+            LoopEvent::McpInput(None) => {
+                let mut s = self.state.borrow_mut();
+                s.active_servers = s.active_servers.saturating_sub(1);
+            }
             LoopEvent::ServerClosed(closed_server_id) => {
                 if self.state.borrow().active_servers > 0 {
                     self.state.borrow_mut().active_servers -= 1;
@@ -3226,6 +3310,35 @@ impl QuickJsRuntime {
                     }
                 });
             }
+        }
+    }
+
+    /// Answers one line from an MCP client, or starts the tool it calls.
+    fn dispatch_mcp_input(&self, line: &[u8]) {
+        use crate::mcp::serve::{Host, Step};
+        let step = match &mut *self.mcp.borrow_mut() {
+            Host::Serving(served) => served.handle(line),
+            _ => Step::Nothing,
+        };
+        match step {
+            Step::Reply(message) => crate::mcp::serve::emit(&message),
+            Step::Call { req_id, name, args } => {
+                let started = self.context.with(|ctx| {
+                    let call: rquickjs::Result<Function> = ctx.globals().get("__vaern_mcp_call");
+                    call.and_then(|call| call.call::<_, ()>((req_id, name, args)))
+                        .map_err(|err| format!("{err}"))
+                });
+                if let Err(reason) = started {
+                    let outcome =
+                        serde_json::json!({ "ok": false, "kind": "tool", "message": reason });
+                    if let Host::Serving(served) = &mut *self.mcp.borrow_mut()
+                        && let Some(message) = served.finish(req_id, &outcome)
+                    {
+                        crate::mcp::serve::emit(&message);
+                    }
+                }
+            }
+            Step::Nothing => {}
         }
     }
 
@@ -3427,6 +3540,17 @@ impl QuickJsRuntime {
 
     /// Caps the run's budget (from `--budget-usd` and `--budget-tokens`)
     /// and sets where named budget ledgers live.
+    /// Makes this run an MCP server: `server()` is accepted, and stdout is
+    /// left to the protocol. Call before `run_file`.
+    pub fn serve_mcp(&mut self) {
+        *self.mcp.borrow_mut() = crate::mcp::serve::Host::Waiting;
+    }
+
+    /// Whether the script declared a server with `server()`.
+    pub fn mcp_declared(&self) -> bool {
+        matches!(*self.mcp.borrow(), crate::mcp::serve::Host::Serving(_))
+    }
+
     pub fn set_budget(&mut self, caps: crate::budget::Limits, home: Option<PathBuf>) {
         self.reserved_homes.borrow_mut()[1].clone_from(&home);
         self.budget.borrow_mut().configure(caps, home);
@@ -3473,6 +3597,9 @@ impl QuickJsRuntime {
         start.insert("script".into(), script.into());
         start.insert("script_sha256".into(), digest.clone().into());
         start.insert("argv".into(), self.options.argv.clone().into());
+        if !matches!(*self.mcp.borrow(), crate::mcp::serve::Host::Off) {
+            start.insert("mcp".into(), "serve".into());
+        }
         let caps = self.budget.borrow().caps();
         start.insert(
             "budget_caps".into(),

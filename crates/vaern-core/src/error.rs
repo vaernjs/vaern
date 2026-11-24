@@ -161,7 +161,7 @@ pub enum VaernError {
     },
 
     /// `vaern replay` cannot start or go on. `code` is `UNSEALED`,
-    /// `MALFORMED`, `TRUNCATED` or `UNSUPPORTED`.
+    /// `MALFORMED`, `TRUNCATED`, `UNSUPPORTED` or `MCP_SERVED`.
     #[error("replay {code}: {message}. {action}")]
     Replay {
         code: String,
