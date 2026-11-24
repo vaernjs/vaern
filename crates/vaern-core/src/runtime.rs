@@ -6481,14 +6481,20 @@ mod tests {
         (port, server)
     }
 
-    /// A script that fills the heap, ending with blocks of `block` bytes,
-    /// frees `spare` of those, awaits `call`, and exits 0 only if that
-    /// promise rejected.
+    /// A script that starts `call`, then fills the heap, ending with blocks
+    /// of `block` bytes, frees `spare` of those, awaits the call, and exits
+    /// 0 only if it rejected.
+    ///
+    /// The call starts while the heap has room, so its request is out before
+    /// memory runs short and only its result has to fit. Filling first made
+    /// the request itself depend on what the fill happened to leave, which
+    /// differs by platform: on macOS the call could fail before sending.
     fn with_full_heap(imports: &str, block: usize, spare: usize, call: &str) -> String {
         format!(
             r#"
             {imports}
             process.exitCode = 3;
+            const pending = {call};
             const hold = [];
             const fill = (size) => {{
                 try {{ for (;;) hold.push(new ArrayBuffer(size)); }} catch {{}}
@@ -6498,7 +6504,7 @@ mod tests {
             hold.length = Math.max(0, hold.length - {spare});
             let outcome;
             try {{
-                await {call};
+                await pending;
                 outcome = "resolved";
             }} catch (err) {{
                 outcome = "rejected";
