@@ -5,14 +5,20 @@
 //! protocol cannot see: stdout carries nothing but protocol lines, both
 //! supported versions are served by the same binary, an older version is
 //! refused with the spec's error, and closing stdin ends the server cleanly.
+//!
+//! Every child is started through [`spawn`], one at a time. Where pipes are
+//! not created close-on-exec in one step (macOS), a child forked while
+//! another test is making its pipes inherits that test's stdin writer, and
+//! the other server then never sees end of input.
 
 use serde_json::{Value, json};
 use std::error::Error;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
+use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -30,6 +36,23 @@ fn journal_home(test: &str) -> Result<PathBuf, Box<dyn Error>> {
     Ok(dir)
 }
 
+static SPAWN: Mutex<()> = Mutex::new(());
+
+/// Starts `command`, with no other child of this test binary starting at
+/// the same time.
+fn spawn(command: &mut Command) -> Result<Child, Box<dyn Error>> {
+    let _one_at_a_time = SPAWN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    Ok(command.spawn()?)
+}
+
+/// Runs `command` to the end, started through [`spawn`].
+fn output(command: &mut Command) -> Result<Output, Box<dyn Error>> {
+    let child = spawn(command.stdout(Stdio::piped()).stderr(Stdio::piped()))?;
+    Ok(child.wait_with_output()?)
+}
+
 fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).replace("\r\n", "\n")
 }
@@ -43,14 +66,15 @@ struct Server {
 
 impl Server {
     fn start(home: &std::path::Path) -> Result<Server, Box<dyn Error>> {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_vaern"))
-            .args(["mcp", "serve", "mcp_server.ts"])
-            .current_dir(sandbox_dir())
-            .env("VAERN_HOME", home)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        let mut child = spawn(
+            Command::new(env!("CARGO_BIN_EXE_vaern"))
+                .args(["mcp", "serve", "mcp_server.ts"])
+                .current_dir(sandbox_dir())
+                .env("VAERN_HOME", home)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )?;
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().ok_or("no stdout")?;
         let (tx, lines) = channel();
@@ -86,8 +110,23 @@ impl Server {
     }
 
     /// Closes stdin, as a client does at shutdown, and collects the rest.
+    /// A server still running 20 s later fails the test rather than
+    /// leaving it to hang.
     fn finish(mut self) -> Result<(Output, Vec<String>), Box<dyn Error>> {
         drop(self.stdin.take());
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while self.child.try_wait()?.is_none() {
+            if Instant::now() > deadline {
+                self.child.kill()?;
+                let output = self.child.wait_with_output()?;
+                return Err(format!(
+                    "the server was still running 20 s after its stdin closed; stderr: {}",
+                    text(&output.stderr)
+                )
+                .into());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let output = self.child.wait_with_output()?;
         Ok((output, self.lines.try_iter().collect()))
     }
@@ -195,11 +234,12 @@ fn an_older_protocol_version_is_refused_with_the_supported_list() -> TestResult 
 #[test]
 fn server_is_refused_outside_mcp_serve() -> TestResult {
     let home = journal_home("plain")?;
-    let output = Command::new(env!("CARGO_BIN_EXE_vaern"))
-        .args(["run", "mcp_server.ts"])
-        .current_dir(sandbox_dir())
-        .env("VAERN_HOME", &home)
-        .output()?;
+    let output = output(
+        Command::new(env!("CARGO_BIN_EXE_vaern"))
+            .args(["run", "mcp_server.ts"])
+            .current_dir(sandbox_dir())
+            .env("VAERN_HOME", &home),
+    )?;
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(text(&output.stdout), "");
     let stderr = text(&output.stderr);
@@ -211,12 +251,13 @@ fn server_is_refused_outside_mcp_serve() -> TestResult {
 #[test]
 fn serving_a_script_that_declares_nothing_fails() -> TestResult {
     let home = journal_home("nothing")?;
-    let output = Command::new(env!("CARGO_BIN_EXE_vaern"))
-        .args(["mcp", "serve", "hello.ts"])
-        .current_dir(sandbox_dir())
-        .env("VAERN_HOME", &home)
-        .stdin(Stdio::null())
-        .output()?;
+    let output = output(
+        Command::new(env!("CARGO_BIN_EXE_vaern"))
+            .args(["mcp", "serve", "hello.ts"])
+            .current_dir(sandbox_dir())
+            .env("VAERN_HOME", &home)
+            .stdin(Stdio::null()),
+    )?;
     assert_eq!(output.status.code(), Some(1));
     let stderr = text(&output.stderr);
     assert!(stderr.contains("without calling server()"), "{stderr}");
@@ -229,11 +270,12 @@ fn a_served_run_is_not_replayed() -> TestResult {
     let mut server = Server::start(&home)?;
     server.ask(1, "tools/list", modern(json!({}), N))?;
     server.finish()?;
-    let replayed = Command::new(env!("CARGO_BIN_EXE_vaern"))
-        .args(["replay", "latest"])
-        .current_dir(sandbox_dir())
-        .env("VAERN_HOME", &home)
-        .output()?;
+    let replayed = output(
+        Command::new(env!("CARGO_BIN_EXE_vaern"))
+            .args(["replay", "latest"])
+            .current_dir(sandbox_dir())
+            .env("VAERN_HOME", &home),
+    )?;
     assert_eq!(replayed.status.code(), Some(1));
     let stderr = text(&replayed.stderr);
     assert!(stderr.contains("MCP_SERVED"), "{stderr}");
