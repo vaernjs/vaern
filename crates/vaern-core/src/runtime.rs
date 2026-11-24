@@ -828,7 +828,8 @@ impl QuickJsRuntime {
                             &headers,
                             body.as_deref(),
                         );
-                        replay.dispatch("fetch", req_id, &req, None);
+                        let eid = replay.dispatch("fetch", req_id, &req, None);
+                        replay.watch_abort(eid, abort_id);
                         state_fetch.borrow_mut().pending_fetches += 1;
                         return Ok(());
                     }
@@ -1007,7 +1008,9 @@ impl QuickJsRuntime {
                     let Some(client) = client else {
                         let req = crate::ai::request_record(&call);
                         let eid = replay_ai.borrow_mut().as_mut().map(|replay| {
-                            replay.dispatch("model.call", req_id, &req, Some(call))
+                            let eid = replay.dispatch("model.call", req_id, &req, Some(call));
+                            replay.watch_abort(eid, abort_id);
+                            eid
                         });
                         let mut s = state_ai.borrow_mut();
                         if let Some(eid) = eid {
@@ -1232,7 +1235,11 @@ impl QuickJsRuntime {
 
             // Native abort signal bridge
             let state_abort = Rc::clone(&state);
+            let replay_abort = Rc::clone(&self.replay);
             let abort_fn = Function::new(ctx.clone(), move |abort_id: u32| {
+                if let Some(replay) = replay_abort.borrow_mut().as_mut() {
+                    replay.note_abort(abort_id);
+                }
                 if let Some(sender) = state_abort.borrow().abort_senders.get(&abort_id) {
                     let _ = sender.send(());
                 }
@@ -5806,6 +5813,65 @@ mod tests {
         let plan = crate::replay::Plan::load(&path)?;
         let argv = plan.argv.clone();
         QuickJsRuntime::new(RuntimeOptions { argv })?.replay(plan)
+    }
+
+    #[test]
+    fn test_calls_stopped_by_a_timer_abort_replay_with_the_scripts_reason() {
+        use std::io::Read;
+        // Takes two requests and answers neither; each is held until its
+        // client goes away.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stub = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                std::thread::spawn(move || {
+                    let mut reader = read_request(stream);
+                    let _ = reader
+                        .get_mut()
+                        .set_read_timeout(Some(Duration::from_secs(20)));
+                    let _ = reader.read(&mut [0; 64]);
+                });
+            }
+        });
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join(".vaern");
+        let main = root.path().join("main.js");
+        let script = r#"
+            import { model } from "vaern:ai";
+            const base = "http://127.0.0.1:PORT";
+            const m = model({ baseUrl: base + "/v1", model: "m", timeoutMs: 20000 });
+            const stopped = (promise, ms, why) => {
+                const controller = new AbortController();
+                setTimeout(() => controller.abort(new Error(why)), ms);
+                return promise(controller.signal).then(
+                    () => "resolved", (err) => err.name + ": " + err.message);
+            };
+            const fetched = stopped((signal) => fetch(base + "/slow", { signal }), 150, "fetch stop");
+            const asked = stopped((signal) => m.chat({ messages: [{ role: "user", content: "x" }], signal }),
+                                  300, "model stop");
+            console.log(await fetched);
+            console.log(await asked);
+            "#
+        .replace("PORT", &port.to_string());
+        std::fs::write(&main, script).unwrap();
+        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+        runtime.set_journal_home(Some(home.clone()));
+        assert_eq!(runtime.run_file(&main).unwrap(), 0);
+        drop(runtime);
+        stub.join().unwrap();
+
+        let summary = replay_latest(&home).unwrap();
+        assert_eq!((summary.console, summary.exit_code), (2, 0));
+        let printed: Vec<_> = journal_records(&home)
+            .into_iter()
+            .filter(|r| r["kind"] == "console")
+            .map(|r| r["text"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            printed,
+            ["AbortError: fetch stop\n", "AbortError: model stop\n"]
+        );
     }
 
     #[test]

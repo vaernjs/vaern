@@ -13,6 +13,11 @@
 //! Not recorded, so read live: `Date.now()`, `performance.now()`,
 //! `process.env`, and the order of timers against effects. A script whose
 //! output depends on them can diverge, and the replay reports where.
+//!
+//! One timer-driven order is kept: an effect the script stopped with an
+//! `AbortSignal` is held until the script aborts that signal again, since
+//! handing its recorded failure back sooner would reject the call with a
+//! default reason before the script's own abort ran.
 
 pub mod plan;
 
@@ -24,7 +29,7 @@ use crate::error::{Result, VaernError};
 use crate::event::{FetchCompletion, FsCompletion, LoopEvent, ModelCompletion};
 use plan::text;
 use serde_json::Value;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// How much of each side a divergence shows.
 const SHOWN_BYTES: usize = 200;
@@ -50,6 +55,10 @@ pub struct Replay {
     batch: Option<Option<u64>>,
     printed: usize,
     divergence: Option<VaernError>,
+    /// The abort signal each started effect was given, by `eid`.
+    signals: HashMap<u64, u32>,
+    /// Signals the script has aborted during this replay.
+    aborted: HashSet<u32>,
 }
 
 /// `text` cut to [`SHOWN_BYTES`] on a character boundary, as a JSON string.
@@ -188,7 +197,36 @@ impl Replay {
             batch: None,
             printed: 0,
             divergence: None,
+            signals: HashMap::new(),
+            aborted: HashSet::new(),
         }
+    }
+
+    /// Notes that effect `eid` was started with abort signal `signal`; 0 is
+    /// none.
+    pub fn watch_abort(&mut self, eid: u64, signal: u32) {
+        if signal != 0 {
+            self.signals.insert(eid, signal);
+        }
+    }
+
+    /// Notes that the script aborted `signal`.
+    pub fn note_abort(&mut self, signal: u32) {
+        self.aborted.insert(signal);
+    }
+
+    /// Whether effect `eid` failed by abort in the recording and the
+    /// script has not yet aborted its signal in this replay.
+    fn held(&self, eid: u64) -> bool {
+        let Some(signal) = self.signals.get(&eid) else {
+            return false;
+        };
+        let stopped = self.plan.effects.get(&eid).is_some_and(|rec| {
+            rec.record["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(crate::ai::ABORTED))
+        });
+        stopped && !self.aborted.contains(signal)
     }
 
     pub fn plan(&self) -> &Plan {
@@ -280,6 +318,9 @@ impl Replay {
             return None;
         }
         let eid = *self.plan.completions.get(self.cursor)?;
+        if self.held(eid) {
+            return None;
+        }
         let turn = self.plan.effects.get(&eid)?.record["turn"].as_u64();
         if self
             .batch
@@ -312,7 +353,7 @@ impl Replay {
                 .plan
                 .completions
                 .get(self.cursor)
-                .is_some_and(|eid| self.dispatched.contains_key(eid))
+                .is_some_and(|eid| self.dispatched.contains_key(eid) && !self.held(*eid))
     }
 
     /// Records that the script is waiting with nothing left to run.
