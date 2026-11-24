@@ -5307,7 +5307,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let stub = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
+            let stream = accept_within(&listener);
             let mut reader = std::io::BufReader::new(stream);
             let mut length = 0;
             loop {
@@ -5391,7 +5391,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let stub = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
+            let stream = accept_within(&listener);
             let mut reader = read_request(stream);
             let held = Instant::now();
             reader
@@ -5477,7 +5477,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let stub = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
+            let stream = accept_within(&listener);
             let mut reader = read_request(stream);
             let stream = reader.get_mut();
             let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
@@ -5531,7 +5531,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let stub = std::thread::spawn(move || {
             for answer in [true, false] {
-                let (stream, _) = listener.accept().unwrap();
+                let stream = accept_within(&listener);
                 let mut reader = std::io::BufReader::new(stream);
                 let mut length = 0;
                 loop {
@@ -5888,6 +5888,46 @@ mod tests {
     /// replies. Each group's connections are all accepted first, then
     /// answered in the group's order, 30 ms apart, so a request sent later
     /// can complete first, in a later event-loop turn.
+    /// How long a test's fake server waits for the runtime to connect.
+    const ACCEPT_DEADLINE: Duration = Duration::from_secs(30);
+
+    /// The next connection to a test's fake server. A runtime that fails
+    /// before sending its request never connects; this panics, so the test
+    /// fails with that reason instead of blocking in `join()` for good.
+    fn accept_within(listener: &std::net::TcpListener) -> std::net::TcpStream {
+        listener.set_nonblocking(true).unwrap();
+        let started = std::time::Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    listener.set_nonblocking(false).unwrap();
+                    return stream;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        started.elapsed() < ACCEPT_DEADLINE,
+                        "no request reached the test server within {ACCEPT_DEADLINE:?}"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) => panic!("accept failed: {err}"),
+            }
+        }
+    }
+
+    /// Runs `code` on a runtime of its own thread and fails the test if it
+    /// has not finished within 60 s, naming the script, rather than hang.
+    fn eval_within(name: &'static str, code: String) -> Result<i32> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
+            let _ = tx.send(runtime.eval(name, &code));
+        });
+        rx.recv_timeout(Duration::from_secs(60))
+            .unwrap_or_else(|_| panic!("{name} did not finish within 60 s"))
+    }
+
     fn canned_http(
         groups: Vec<Vec<(&'static str, &'static str, String)>>,
     ) -> (u16, std::thread::JoinHandle<()>) {
@@ -5898,7 +5938,7 @@ mod tests {
             for group in groups {
                 let mut waiting = Vec::new();
                 for _ in 0..group.len() {
-                    let (stream, _) = listener.accept().unwrap();
+                    let stream = accept_within(&listener);
                     let mut reader = std::io::BufReader::new(stream);
                     let mut request_line = String::new();
                     reader.read_line(&mut request_line).unwrap();
@@ -5951,7 +5991,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let stub = std::thread::spawn(move || {
             for _ in 0..2 {
-                let (stream, _) = listener.accept().unwrap();
+                let stream = accept_within(&listener);
                 std::thread::spawn(move || {
                     let mut reader = read_request(stream);
                     let _ = reader
@@ -6416,7 +6456,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
+            let stream = accept_within(&listener);
             let mut reader = std::io::BufReader::new(stream);
             let mut length = 0;
             loop {
@@ -6480,8 +6520,7 @@ mod tests {
             2,
             &format!(r#"fetch("http://127.0.0.1:{port}/")"#),
         );
-        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
-        let result = runtime.eval("fetch_oom.js", &code);
+        let result = eval_within("fetch_oom.js", code);
         server.join().unwrap();
         assert_eq!(result.unwrap(), 0);
     }
@@ -6507,8 +6546,7 @@ mod tests {
                     .chat({{ messages: [{{ role: "user", content: "x" }}], maxTokens: 8 }})"#
             ),
         );
-        let mut runtime = QuickJsRuntime::new(RuntimeOptions::default()).unwrap();
-        let result = runtime.eval("model_oom.js", &code);
+        let result = eval_within("model_oom.js", code);
         server.join().unwrap();
         assert_eq!(result.unwrap(), 0);
     }
