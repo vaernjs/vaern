@@ -1944,6 +1944,7 @@ name = "vaern-cli"
 version = "0.0.7"
 dependencies = [
  "clap",
+ "serde_json",
  "tokio",
  "vaern-core",
 ]

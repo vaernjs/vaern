@@ -52,6 +52,57 @@ const aiOffline =
   "42\n" +
   "args arguments at $.n: expected integer, found string\n";
 
+// One client session on stdin: the tool call goes last, as its reply is
+// the only one that waits on the script.
+const lines = (messages) => messages.map((m) => JSON.stringify(m) + "\n").join("");
+const mcpMeta = (version) => ({
+  "io.modelcontextprotocol/protocolVersion": version,
+  "io.modelcontextprotocol/clientCapabilities": {},
+});
+const mcpRequests = lines([
+  { jsonrpc: "2.0", id: 1, method: "tools/list", params: { _meta: mcpMeta("2026-07-28") } },
+  { jsonrpc: "2.0", id: 2, method: "tools/list", params: { _meta: mcpMeta("2024-11-05") } },
+  {
+    jsonrpc: "2.0", id: 3, method: "tools/call",
+    params: { name: "add", arguments: { a: 2, b: 3 }, _meta: mcpMeta("2026-07-28") },
+  },
+]);
+const mcpReplies = lines([
+  {
+    jsonrpc: "2.0", id: 1,
+    result: {
+      resultType: "complete",
+      tools: [
+        {
+          name: "add", description: "Adds two numbers",
+          inputSchema: {
+            type: "object",
+            properties: { a: { type: "number" }, b: { type: "number" } },
+            required: ["a", "b"],
+          },
+        },
+        { name: "fail", description: "", inputSchema: { type: "object", properties: {} } },
+      ],
+      ttlMs: 0,
+      cacheScope: "private",
+    },
+  },
+  {
+    jsonrpc: "2.0", id: 2,
+    error: {
+      code: -32022, message: "Unsupported protocol version",
+      data: { supported: ["2026-07-28", "2025-11-25"], requested: "2024-11-05" },
+    },
+  },
+  {
+    jsonrpc: "2.0", id: 3,
+    result: {
+      content: [{ type: "text", text: '{"sum":5}' }],
+      isError: false, structuredContent: { sum: 5 }, resultType: "complete",
+    },
+  },
+]);
+
 const cases = [
   {
     name: "--version reports 0.0.7",
@@ -257,6 +308,15 @@ const cases = [
     stdout: "",
     stderrIncludes: ["'no-such-run' is not a run id", "or `latest`"],
   },
+  {
+    name: "mcp serve answers N, refuses an older version and calls a tool",
+    args: ["mcp", "serve", "mcp_server.ts"],
+    env: { VAERN_HOME: "out/home" },
+    input: mcpRequests,
+    code: 0,
+    stdout: mcpReplies,
+    stderr: "adding 2 and 3\n",
+  },
 ];
 
 const norm = (s) => s.replaceAll("\r\n", "\n");
@@ -267,6 +327,7 @@ for (const c of cases) {
     cwd: sandbox,
     encoding: "utf8",
     env: { ...process.env, ...c.env },
+    input: c.input ?? "",
   });
   const stdout = norm(r.stdout ?? "");
   const stderr = norm(r.stderr ?? "");

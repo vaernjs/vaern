@@ -22,3 +22,7 @@ tokio = { version = "1.44", features = ["rt", "macros"] }
 
 # Core engine and type stripper
 vaern-core = { path = "../vaern-core" }
+
+[dev-dependencies]
+# Already in the tree through vaern-core; the MCP tests read and write JSON-RPC.
+serde_json = "1.0"

@@ -54,6 +54,34 @@ enum Commands {
         #[command(subcommand)]
         command: JournalCommand,
     },
+    /// Model Context Protocol servers
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum McpCommand {
+    /// Serve the tools a script declares with server() to one MCP client
+    /// over stdin and stdout; console output goes to stderr
+    Serve {
+        /// Do not write a journal for this run
+        #[arg(long)]
+        no_journal: bool,
+        /// Most the server may reserve for model calls and priced tools, in
+        /// estimated USD
+        #[arg(long, value_name = "USD", value_parser = parse_usd)]
+        budget_usd: Option<u64>,
+        /// Most the server may reserve in model tokens
+        #[arg(long, value_name = "TOKENS")]
+        budget_tokens: Option<u64>,
+        /// Script that calls server() from vaern:mcp
+        file: PathBuf,
+        /// Arguments passed to the script
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -88,7 +116,13 @@ fn parse_usd(text: &str) -> Result<u64, String> {
     }
 }
 
-fn run(no_journal: bool, caps: budget::Limits, file: PathBuf, args: Vec<String>) -> ExitCode {
+fn run(
+    no_journal: bool,
+    caps: budget::Limits,
+    serve: bool,
+    file: PathBuf,
+    args: Vec<String>,
+) -> ExitCode {
     let mut argv = vec!["vaern".to_string(), file.display().to_string()];
     argv.extend(args);
 
@@ -105,8 +139,18 @@ fn run(no_journal: bool, caps: budget::Limits, file: PathBuf, args: Vec<String>)
     }
     // Named budget ledgers live under the same home, journal or not.
     runtime.set_budget(caps, Some(journal_home()));
+    if serve {
+        runtime.serve_mcp();
+    }
 
     match runtime.run_file(&file) {
+        Ok(0) if serve && !runtime.mcp_declared() => {
+            eprintln!(
+                "{}: the script ended without calling server() from vaern:mcp, so there was nothing to serve. Declare the tools with server({{ name, version, tools }}).",
+                file.display()
+            );
+            ExitCode::FAILURE
+        }
         Ok(0) => ExitCode::SUCCESS,
         Ok(code) => ExitCode::from(code as u8),
         Err(err) => {
@@ -183,7 +227,23 @@ fn main() -> ExitCode {
                 nano: budget_usd,
                 tokens: budget_tokens,
             };
-            run(no_journal, caps, file, args)
+            run(no_journal, caps, false, file, args)
+        }
+        Commands::Mcp {
+            command:
+                McpCommand::Serve {
+                    no_journal,
+                    budget_usd,
+                    budget_tokens,
+                    file,
+                    args,
+                },
+        } => {
+            let caps = budget::Limits {
+                nano: budget_usd,
+                tokens: budget_tokens,
+            };
+            run(no_journal, caps, true, file, args)
         }
         Commands::Replay { id } => replay(&id),
         Commands::Journal {
