@@ -317,6 +317,16 @@ const cases = [
     stdout: mcpReplies,
     stderr: "adding 2 and 3\n",
   },
+  {
+    // The server's console goes to its stderr, which the client keeps for
+    // its errors and does not print.
+    name: "connect() starts mcp_server.ts and calls its tools",
+    args: ["run", "mcp_client.ts"],
+    env: { VAERN_HOME: "out/home" },
+    code: 0,
+    stdout: 'calc 2026-07-28 add,fail\n{"sum":5}\nToolError run: Error: no luck\n',
+    stderr: "",
+  },
 ];
 
 const norm = (s) => s.replaceAll("\r\n", "\n");

@@ -49,6 +49,8 @@ pub enum LoopEvent {
     /// A line a client wrote to `vaern mcp serve`'s stdin; `None` once
     /// stdin has closed.
     McpInput(Option<Vec<u8>>),
+    /// What a `vaern:mcp` connection to a server reports.
+    Mcp(Box<crate::mcp::client::McpEvent>),
 }
 
 /// Sending half of the event loop channel.

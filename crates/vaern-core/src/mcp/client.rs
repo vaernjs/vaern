@@ -48,6 +48,8 @@ pub struct Hello {
     pub tools: Vec<Value>,
     /// The server's own run id, when it keeps a journal.
     pub run: Option<String>,
+    /// What the server had spent once its script's top level had run.
+    pub spent: Option<Amount>,
 }
 
 /// A failed start or call, with what the server left behind.
@@ -270,21 +272,19 @@ pub async fn run(
         instructions: agreed.instructions,
         tools: listed["tools"].as_array().cloned().unwrap_or_default(),
         run: agreed.run,
+        spent: spent_of(&listed),
     };
+    let spent = hello.spent;
     send(McpEvent::Connected {
         conn_id,
         result: Ok(hello),
     });
-    let ended = serve_calls(
-        &mut stdout,
-        &mut stdin,
+    let peer = Peer {
         era,
-        &client,
-        &server,
-        commands,
-        &send,
-    )
-    .await;
+        client: &client,
+        server: &server,
+    };
+    let ended = serve_calls(&mut stdout, &mut stdin, &peer, spent, commands, &send).await;
     let exit_code = shut(&mut child, stdin).await;
     // A call still in flight learns why the server went away, and is never
     // sent again: a tool need not be safe to run twice.
@@ -357,6 +357,13 @@ where
     }
 }
 
+/// Who a connection talks to, and in which era.
+struct Peer<'a> {
+    era: Era,
+    client: &'a Value,
+    server: &'a str,
+}
+
 /// How [`serve_calls`] ended.
 struct Ended {
     /// The server's output ended without a close being asked for.
@@ -370,9 +377,8 @@ struct Ended {
 async fn serve_calls<R, W>(
     reader: &mut R,
     writer: &mut W,
-    era: Era,
-    client: &Value,
-    server: &str,
+    peer: &Peer<'_>,
+    mut spent: Option<Amount>,
     mut commands: UnboundedReceiver<Command>,
     send: &impl Fn(McpEvent),
 ) -> Ended
@@ -382,7 +388,6 @@ where
 {
     let mut in_flight: HashMap<u64, u32> = HashMap::new();
     let mut next_id = LIST_ID + 1;
-    let mut spent = None;
     let ended = |exited: bool, in_flight: HashMap<u64, u32>, spent: Option<Amount>| Ended {
         exited,
         in_flight: in_flight.into_values().collect(),
@@ -394,9 +399,9 @@ where
                 Some(Command::Call { req_id, tool, args }) => {
                     let id = next_id;
                     next_id += 1;
-                    let call = params(era, client, json!({ "name": tool, "arguments": args }));
+                    let call = params(peer.era, peer.client, json!({ "name": tool, "arguments": args }));
                     let message = Message::Request { id: id.into(), method: "tools/call".into(), params: call };
-                    match protocol::write(writer, &message, server).await {
+                    match protocol::write(writer, &message, peer.server).await {
                         Ok(()) => {
                             in_flight.insert(id, req_id);
                         }
@@ -432,7 +437,7 @@ where
                     Err(error) => {
                         let message = format!("the server refused the call: {} ({})", error.message, error.code);
                         let action = "Check the tool's name and arguments against connection.tools().";
-                        let refusal = mcp_error("call", "REFUSED", server, message, action);
+                        let refusal = mcp_error("call", "REFUSED", peer.server, message, action);
                         Err(Failure { rpc: Some(error.code), ..Failure::new(refusal, true) })
                     }
                 };
@@ -510,16 +515,13 @@ mod tests {
         }
         let (events_tx, events_rx) = mpsc::channel();
         let send = move |event: McpEvent| events_tx.send(event).unwrap();
-        let ended = serve_calls(
-            &mut reader,
-            &mut client_write,
-            Era::Modern,
-            &client(),
-            "fake",
-            rx,
-            &send,
-        )
-        .await;
+        let client = client();
+        let peer = Peer {
+            era: Era::Modern,
+            client: &client,
+            server: "fake",
+        };
+        let ended = serve_calls(&mut reader, &mut client_write, &peer, None, rx, &send).await;
         drop(tx);
         drop(client_write);
         let asked = fake.await.unwrap();

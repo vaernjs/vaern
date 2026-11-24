@@ -1,7 +1,10 @@
-// JavaScript half of vaern:mcp, evaluated once at startup. The native side
-// owns stdin, stdout, framing and version negotiation; this file checks a
-// server declaration and runs the tools it names.
+// JavaScript half of vaern:mcp, evaluated once at startup, after vaern:ai.
+// The native side owns every pipe, the framing, version negotiation and
+// each server's process; this file checks a server declaration and runs the
+// tools it names, and shapes connections and tool handles for a client.
 (() => {
+    const { ToolError, BudgetError } = globalThis.__vaern_ai;
+
     class McpError extends Error {
         constructor(info) {
             super(info.message);
@@ -10,6 +13,9 @@
             this.code = info.code;
             this.server = info.server;
             this.action = info.action;
+            if (info.tool !== undefined) this.tool = info.tool;
+            if (info.exit_code !== undefined) this.exitCode = info.exit_code;
+            if (info.stderr !== undefined) this.stderr = info.stderr;
         }
     }
 
@@ -72,5 +78,156 @@
             );
     };
 
-    globalThis.__vaern_mcp = Object.freeze({ server, McpError });
+    // Client side. Connects, calls and closes share one request id space;
+    // a connection is named by the id of the connect() that opened it.
+    const pending = new Map();
+    let nextReqId = 1;
+    const failure = (info) => (info.budget ? new BudgetError(info) : new McpError(info));
+
+    // start(reqId) returns null once the native side has the request, or
+    // the JSON of what stopped it; { done: true } means nothing was needed.
+    function request(start) {
+        const reqId = nextReqId++;
+        return new Promise((resolve, reject) => {
+            pending.set(reqId, { resolve, reject });
+            let refused;
+            try {
+                refused = start(reqId);
+            } catch (err) {
+                pending.delete(reqId);
+                reject(err);
+                return;
+            }
+            if (!refused) return;
+            pending.delete(reqId);
+            const info = JSON.parse(refused);
+            if (info.done) resolve(info);
+            else reject(failure(info));
+        });
+    }
+
+    globalThis.__vaern_dispatch_mcp = (json) => {
+        const info = JSON.parse(json);
+        const waiter = pending.get(info.reqId);
+        if (!waiter) return;
+        // Built before the waiter is removed, so a throw here leaves it for
+        // __vaern_reject_mcp.
+        const error = info.ok ? null : failure(info);
+        pending.delete(info.reqId);
+        if (info.ok) waiter.resolve(info);
+        else waiter.reject(error);
+    };
+
+    globalThis.__vaern_reject_mcp = (reqId, err) => {
+        const waiter = pending.get(reqId);
+        if (!waiter) return false;
+        pending.delete(reqId);
+        waiter.reject(err);
+        return true;
+    };
+
+    const usdOf = (where, value) => {
+        if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+            throw new TypeError(`${where} must be a number, 0 or more`);
+        }
+        return Math.round(value * 1e9);
+    };
+
+    // What a call resolves to: the structured result when there is one,
+    // else the text of its text blocks, else the content list as sent.
+    function valueOf(result) {
+        if (result.structuredContent !== undefined && result.structuredContent !== null) {
+            return result.structuredContent;
+        }
+        const content = Array.isArray(result.content) ? result.content : [];
+        const texts = content.filter((block) => block && block.type === "text");
+        return texts.length > 0 ? texts.map((block) => block.text).join("") : content;
+    }
+
+    function handle(connId, serverName, definition, costUsd) {
+        const name = definition.name;
+        const costNano = Math.round(costUsd * 1e9);
+        // A refusal of the arguments goes back to an agent's model to
+        // correct, as a local tool's would; a failed run is the tool's.
+        async function call(args) {
+            let info;
+            try {
+                info = await request((reqId) =>
+                    __vaern_mcp_call_tool(reqId, connId, name, JSON.stringify(args ?? {}), costNano));
+            } catch (err) {
+                if (err instanceof McpError && err.code === "REFUSED") {
+                    throw new ToolError(name, "args", err.message, { server: serverName });
+                }
+                throw err;
+            }
+            const result = info.result;
+            if (result.isError) {
+                const text = valueOf({ content: result.content });
+                const message = typeof text === "string" && text !== "" ? text : "the tool reported an error";
+                throw new ToolError(name, "run", message, { server: serverName });
+            }
+            return valueOf(result);
+        }
+        return Object.freeze({
+            name,
+            description: typeof definition.description === "string" ? definition.description : "",
+            parameters: definition.inputSchema ?? { type: "object", properties: {} },
+            cost: Object.freeze({ usd: costUsd }),
+            server: serverName,
+            call,
+        });
+    }
+
+    // connect({ script, budget?, cost? }) starts `vaern mcp serve script`,
+    // agrees a revision and resolves to the connection. budget is what the
+    // server may spend, reserved here and given to it as its caps; cost is
+    // what each tool's call is charged here, by tool name.
+    function connect(options) {
+        if (options === null || typeof options !== "object") {
+            return Promise.reject(new TypeError("connect: options must be an object"));
+        }
+        const { script } = options;
+        let grantNano;
+        let grantTokens;
+        let costs;
+        try {
+            if (typeof script !== "string" || script === "") {
+                throw new TypeError("connect: script must be the path of a server script");
+            }
+            const budget = options.budget ?? {};
+            grantNano = usdOf("connect: budget.usd", budget.usd ?? 0);
+            grantTokens = budget.tokens ?? 0;
+            if (!Number.isSafeInteger(grantTokens) || grantTokens < 0) {
+                throw new TypeError("connect: budget.tokens must be a whole number, 0 or more");
+            }
+            costs = new Map();
+            for (const [tool, cost] of Object.entries(options.cost ?? {})) {
+                usdOf(`connect: cost.${tool}.usd`, cost?.usd);
+                costs.set(tool, cost.usd);
+            }
+        } catch (err) {
+            return Promise.reject(err);
+        }
+        return request((reqId) => __vaern_mcp_connect(reqId, script, grantNano, grantTokens))
+            .then((info) => {
+                const connId = info.connId;
+                const serverName = info.server?.name ?? script;
+                const tools = Object.freeze((info.tools ?? []).map((definition) =>
+                    handle(connId, serverName, definition, costs.get(definition.name) ?? 0)));
+                let closing = null;
+                return Object.freeze({
+                    name: serverName,
+                    version: info.server?.version,
+                    protocolVersion: info.protocolVersion,
+                    instructions: info.instructions ?? undefined,
+                    tools: () => Promise.resolve(tools),
+                    close: () => {
+                        closing ??= request((reqId) => __vaern_mcp_close(reqId, connId)).then(() => undefined);
+                        return closing;
+                    },
+                });
+            });
+    }
+
+    globalThis.__vaern_mcp = Object.freeze({ server, connect, McpError });
 })();

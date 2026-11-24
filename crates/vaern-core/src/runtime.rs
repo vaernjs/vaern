@@ -27,6 +27,8 @@ use std::sync::Arc;
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
+mod mcp_host;
+
 /// Configuration options for initializing a Vaern runtime instance.
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeOptions {
@@ -233,9 +235,9 @@ impl Loader for VaernModuleLoader {
             return Module::declare(
                 ctx.clone(),
                 name,
-                "const { server, McpError } = globalThis.__vaern_mcp;\n\
-                 export { server, McpError };\n\
-                 export default { server, McpError };",
+                "const { server, connect, McpError } = globalThis.__vaern_mcp;\n\
+                 export { server, connect, McpError };\n\
+                 export default { server, connect, McpError };",
             );
         }
         let content = FsModuleLoader
@@ -526,6 +528,8 @@ pub struct QuickJsRuntime {
     replay: ReplaySlot,
     /// Whether this run serves MCP, and the declared server once it does.
     mcp: Rc<RefCell<crate::mcp::serve::Host>>,
+    /// The MCP servers this run has connected to.
+    mcp_clients: Rc<RefCell<mcp_host::McpClients>>,
     _tokio_rt: tokio::runtime::Runtime,
 }
 
@@ -616,6 +620,7 @@ impl QuickJsRuntime {
             budget: Rc::new(RefCell::new(crate::budget::RunBudget::default())),
             replay: Rc::new(RefCell::new(None)),
             mcp: Rc::new(RefCell::new(crate::mcp::serve::Host::Off)),
+            mcp_clients: Rc::default(),
             _tokio_rt: tokio_rt,
         };
 
@@ -1318,6 +1323,7 @@ impl QuickJsRuntime {
                     reason: format!("failed to register {name}: {err}"),
                 })?;
             }
+            self.register_mcp_client(&ctx, &globals, &tokio_handle)?;
 
             // Native abort signal bridge
             let state_abort = Rc::clone(&state);
@@ -3335,6 +3341,7 @@ impl QuickJsRuntime {
                 }
             }
             LoopEvent::McpInput(Some(line)) => self.dispatch_mcp_input(&line),
+            LoopEvent::Mcp(event) => self.dispatch_mcp_event(*event),
             LoopEvent::McpInput(None) => {
                 let mut s = self.state.borrow_mut();
                 s.active_servers = s.active_servers.saturating_sub(1);
@@ -3456,6 +3463,7 @@ impl QuickJsRuntime {
                 let pending_fetches = s.pending_fetches > 0
                     || s.pending_fs > 0
                     || s.pending_models > 0
+                    || self.mcp_clients.borrow().pending > 0
                     || !s.stream_sends_waiting.is_empty();
                 let active_timers = !s.timers.is_empty();
                 let active_servers = s.active_servers > 0;
@@ -3564,11 +3572,13 @@ impl QuickJsRuntime {
 impl Runtime for QuickJsRuntime {
     fn run_file(&mut self, path: &Path) -> Result<i32> {
         let outcome = self.run_file_inner(path);
+        self.close_mcp_connections();
         self.seal_journal(outcome)
     }
 
     fn eval(&mut self, filename: &str, source: &str) -> Result<i32> {
         let outcome = self.eval_inner(filename, source);
+        self.close_mcp_connections();
         self.seal_journal(outcome)
     }
 }
