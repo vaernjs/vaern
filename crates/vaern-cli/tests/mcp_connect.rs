@@ -197,3 +197,71 @@ fn a_refused_connect_starts_nothing() -> TestResult {
     assert!(kinds(&runs[0].1, &["mcp."]).is_empty());
     Ok(())
 }
+
+fn replay(dir: &Path, run_id: &str) -> Result<Output, Box<dyn Error>> {
+    let _one_at_a_time = RUN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    Ok(Command::new(env!("CARGO_BIN_EXE_vaern"))
+        .args(["replay", run_id])
+        .current_dir(dir)
+        .env("VAERN_HOME", dir.join("home"))
+        .output()?)
+}
+
+#[test]
+fn a_replay_starts_no_server_and_diverges_when_the_script_changes() -> TestResult {
+    let dir = workspace(
+        "replay",
+        r#"
+        import { connect } from "vaern:mcp";
+        import { budget } from "vaern:ai";
+        const calc = await connect({ script: "./mcp_server.ts", budget: { usd: 0.25 } });
+        const [add, fail] = await calc.tools();
+        console.log(calc.name, calc.protocolVersion, calc.instructions ?? "", JSON.stringify(budget.remaining()));
+        console.log(JSON.stringify(await add.call({ a: 4, b: 5 })));
+        try { await fail.call({}); } catch (err) { console.log(`${err.name} ${err.stage}: ${err.message}`); }
+        const left = await connect({ script: "./mcp_server.ts" });
+        console.log((await left.tools()).length);
+        await calc.close();
+        console.log(JSON.stringify(budget.remaining()));
+        "#,
+    )?;
+    let recorded = run(&dir, &["--budget-usd", "1"])?;
+    assert_eq!(
+        recorded.status.code(),
+        Some(0),
+        "{}",
+        text(&recorded.stderr)
+    );
+    let before = runs(&dir)?;
+    assert_eq!(before.len(), 3, "one caller and two server runs");
+    let caller = before[0].0.clone();
+
+    let replayed = replay(&dir, &caller)?;
+    assert_eq!(
+        replayed.status.code(),
+        Some(0),
+        "{}",
+        text(&replayed.stderr)
+    );
+    assert_eq!(text(&replayed.stdout), text(&recorded.stdout));
+    assert!(
+        text(&replayed.stderr).contains("reproduced: 5 console records, exit code 0"),
+        "{}",
+        text(&replayed.stderr)
+    );
+    assert_eq!(runs(&dir)?.len(), 3, "the replay started no server");
+
+    // The server script is pinned by its digest: a changed server is a
+    // divergence at the connect, not a silent replay of a stale answer.
+    let server = dir.join("mcp_server.ts");
+    let source = std::fs::read_to_string(&server)?;
+    std::fs::write(&server, format!("{source}\n// changed\n"))?;
+    let diverged = replay(&dir, &caller)?;
+    assert_eq!(diverged.status.code(), Some(1));
+    assert_eq!(text(&diverged.stdout), "");
+    let stderr = text(&diverged.stderr);
+    assert!(stderr.contains("diverged at record"), "{stderr}");
+    assert!(stderr.contains("expected mcp.connect"), "{stderr}");
+    assert_eq!(runs(&dir)?.len(), 3, "a diverged replay started no server");
+    Ok(())
+}

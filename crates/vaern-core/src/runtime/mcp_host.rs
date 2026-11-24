@@ -8,8 +8,11 @@
 //! A connection's budget is its grant: the server's caps, reserved in this
 //! run when it starts and settled at what the server reports it spent.
 //! When the server is lost, its spend is unknown and the grant is kept.
+//!
+//! A replay starts no server. Each effect is matched against its record and
+//! its recorded outcome is handed back, so a connection has no channel.
 
-use super::{QuickJsRuntime, model_error_info, track_effect};
+use super::{JournalSlot, QuickJsRuntime, ReplaySlot, SharedState, model_error_info, track_effect};
 use crate::budget::{Amount, Limits};
 use crate::effect_record::Outcome;
 use crate::error::{Result, VaernError};
@@ -17,8 +20,10 @@ use crate::event::LoopEvent;
 use crate::mcp::client::{self, Command, Failure, Launch, McpEvent};
 use rquickjs::{Ctx, Function, Object};
 use serde_json::{Value, json};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -28,7 +33,8 @@ const AUTO_CLOSE_IDS: u32 = 1 << 31;
 
 /// One connection, from `connect()` until its server has exited.
 struct Conn {
-    commands: UnboundedSender<Command>,
+    /// `None` in a replay, where no server runs.
+    commands: Option<UnboundedSender<Command>>,
     /// The server script's path, which names the server in errors.
     server: String,
     opened: bool,
@@ -102,6 +108,23 @@ fn refused(error: &VaernError) -> Option<String> {
     Some(error_info(error).to_string())
 }
 
+/// Starts effect `kind` of request `req_id`: tracked for its journal
+/// record, or, in a replay, matched against the recorded one.
+fn begin_effect(
+    state: &Rc<RefCell<SharedState>>,
+    journal: &JournalSlot,
+    replay: &ReplaySlot,
+    kind: &'static str,
+    req_id: u32,
+    req: Value,
+) {
+    if let Some(replay) = replay.borrow_mut().as_mut() {
+        replay.dispatch(kind, req_id, &req, None);
+    } else if journal.borrow().is_some() {
+        track_effect(state, kind, req_id, req);
+    }
+}
+
 impl QuickJsRuntime {
     /// Registers `__vaern_mcp_connect`, `__vaern_mcp_call_tool` and
     /// `__vaern_mcp_close`. Each returns `null` once its effect is under
@@ -142,10 +165,6 @@ impl QuickJsRuntime {
                         action,
                     ));
                 };
-                if let Some(replay) = replay.borrow_mut().as_mut() {
-                    let message = replay.refuse("connect() from vaern:mcp");
-                    return refused(&mcp_error("config", "REPLAY", &server, message, ""));
-                }
                 let grant = Amount {
                     nano: nano.max(0.0) as u64,
                     tokens: tokens.max(0.0) as u64,
@@ -159,6 +178,25 @@ impl QuickJsRuntime {
                 if let Err(err) = reserved {
                     return Some(model_error_info(err).to_string());
                 }
+                let req = json!({ "script": server, "budget": { "nano_usd": grant.nano, "tokens": grant.tokens },
+                                  "script_sha256": crate::journal::sha256_hex(&source) });
+                let open = |commands| {
+                    let conn = Conn {
+                        commands,
+                        server: server.clone(),
+                        opened: false,
+                        run: None,
+                        closing: None,
+                    };
+                    let mut clients = clients.borrow_mut();
+                    clients.conns.insert(req_id, conn);
+                    clients.pending += 1;
+                };
+                if replay.borrow().is_some() {
+                    begin_effect(&state, &journal, &replay, "mcp.connect", req_id, req);
+                    open(None);
+                    return None;
+                }
                 let program = clients.borrow().program.clone();
                 let Some(program) = program.or_else(|| std::env::current_exe().ok()) else {
                     let _ = budget.borrow_mut().settle(
@@ -170,11 +208,7 @@ impl QuickJsRuntime {
                     let message = "the path of the vaern binary is unknown".to_string();
                     return refused(&mcp_error("spawn", "SPAWN_FAILED", &server, message, ""));
                 };
-                if journal.borrow().is_some() {
-                    let req = json!({ "script": server, "budget": { "nano_usd": grant.nano, "tokens": grant.tokens },
-                                      "script_sha256": crate::journal::sha256_hex(&source) });
-                    track_effect(&state, "mcp.connect", req_id, req);
-                }
+                begin_effect(&state, &journal, &replay, "mcp.connect", req_id, req);
                 let launch = Launch {
                     program,
                     script: path,
@@ -190,24 +224,16 @@ impl QuickJsRuntime {
                     let _ = events.send(LoopEvent::Mcp(Box::new(event)));
                 };
                 tokio_handle.spawn(client::run(launch, req_id, send, rx));
-                let conn = Conn {
-                    commands,
-                    server,
-                    opened: false,
-                    run: None,
-                    closing: None,
-                };
-                let mut clients = clients.borrow_mut();
-                clients.conns.insert(req_id, conn);
-                clients.pending += 1;
+                open(Some(commands));
                 None
             },
         );
 
-        let (state, journal, budget, clients) = (
+        let (state, journal, budget, replay, clients) = (
             self.state.clone(),
             self.journal.clone(),
             self.budget.clone(),
+            self.replay.clone(),
             self.mcp_clients.clone(),
         );
         let call_fn = Function::new(
@@ -238,7 +264,10 @@ impl QuickJsRuntime {
                 }
                 let args: Value = serde_json::from_str(&args).unwrap_or_else(|_| json!({}));
                 let req = json!({ "server": conn.server, "tool": tool, "args": args });
-                let sent = conn.commands.send(Command::Call { req_id, tool, args });
+                let sent = match &conn.commands {
+                    Some(commands) => commands.send(Command::Call { req_id, tool, args }),
+                    None => Ok(()),
+                };
                 if sent.is_err() {
                     let _ = budget.borrow_mut().settle(
                         journal.borrow_mut().as_mut(),
@@ -249,17 +278,16 @@ impl QuickJsRuntime {
                     let message = "the server has stopped".to_string();
                     return refused(&mcp_error("exited", "CLOSED", &conn.server, message, ""));
                 }
-                if journal.borrow().is_some() {
-                    track_effect(&state, "mcp.call", req_id, req);
-                }
+                begin_effect(&state, &journal, &replay, "mcp.call", req_id, req);
                 clients.pending += 1;
                 None
             },
         );
 
-        let (state, journal, clients) = (
+        let (state, journal, replay, clients) = (
             self.state.clone(),
             self.journal.clone(),
+            self.replay.clone(),
             self.mcp_clients.clone(),
         );
         let close_fn = Function::new(ctx.clone(), move |req_id: u32, conn_id: u32| {
@@ -272,11 +300,11 @@ impl QuickJsRuntime {
                 return Some(json!({ "done": true }).to_string());
             };
             conn.closing = Some(req_id);
-            let _ = conn.commands.send(Command::Close);
-            if journal.borrow().is_some() {
-                let req = json!({ "server": conn.server });
-                track_effect(&state, "mcp.close", req_id, req);
+            if let Some(commands) = &conn.commands {
+                let _ = commands.send(Command::Close);
             }
+            let req = json!({ "server": conn.server, "conn": conn_id });
+            begin_effect(&state, &journal, &replay, "mcp.close", req_id, req);
             clients.pending += 1;
             None
         });
@@ -341,7 +369,8 @@ impl QuickJsRuntime {
                             conn.run.clone_from(&hello.run);
                         }
                         let res = json!({ "protocol_version": hello.era.version(), "server": hello.server,
-                                          "tools": hello.tools, "server_run": hello.run });
+                                          "instructions": hello.instructions, "tools": hello.tools,
+                                          "server_run": hello.run });
                         let info = json!({ "ok": true, "protocolVersion": hello.era.version(),
                                            "server": hello.server, "tools": hello.tools,
                                            "instructions": hello.instructions });
@@ -369,11 +398,12 @@ impl QuickJsRuntime {
                 self.mcp_clients.borrow_mut().pending -= 1;
                 let (outcome, mut info, charge) = match result {
                     Ok(result) => {
-                        let spent = client::spent_of(&result).unwrap_or_default();
+                        let spent = client::spent_of(&result);
                         let res = json!({ "content": result["content"],
                                           "structured": result.get("structuredContent"),
                                           "is_error": result["isError"] == true,
-                                          "spent_nano_usd": spent.nano, "spent_tokens": spent.tokens });
+                                          "spent_nano_usd": spent.map(|s| s.nano),
+                                          "spent_tokens": spent.map(|s| s.tokens) });
                         let info = json!({ "ok": true, "result": {
                             "content": result["content"], "isError": result["isError"] == true,
                             "structuredContent": result.get("structuredContent") } });
@@ -410,9 +440,10 @@ impl QuickJsRuntime {
                     return;
                 };
                 self.mcp_clients.borrow_mut().pending -= 1;
-                let spent = closed.spent.unwrap_or_default();
+                let spent = closed.spent;
                 let res = json!({ "server_run": conn.run, "exit_code": closed.exit_code,
-                                  "spent_nano_usd": spent.nano, "spent_tokens": spent.tokens });
+                                  "spent_nano_usd": spent.map(|s| s.nano),
+                                  "spent_tokens": spent.map(|s| s.tokens) });
                 let info = match failed {
                     None => json!({ "ok": true, "exitCode": closed.exit_code }),
                     Some(reason) => json!({ "ok": false, "stage": "budget", "code": "LEDGER",
@@ -428,7 +459,6 @@ impl QuickJsRuntime {
     /// A server that ignores its closed input is killed after the grace
     /// period; one still starting is killed when the runtime drops.
     pub(super) fn close_mcp_connections(&self) {
-        let journal_on = self.journal.borrow().is_some();
         let waiting = {
             let mut clients = self.mcp_clients.borrow_mut();
             let open: Vec<u32> = clients.conns.keys().copied().collect();
@@ -442,18 +472,46 @@ impl QuickJsRuntime {
                     continue;
                 };
                 conn.closing = Some(close_id);
-                let _ = conn.commands.send(Command::Close);
-                if journal_on {
-                    let req = json!({ "server": conn.server, "at": "run.end" });
-                    track_effect(&self.state, "mcp.close", close_id, req);
+                if let Some(commands) = &conn.commands {
+                    let _ = commands.send(Command::Close);
                 }
+                let req = json!({ "server": conn.server, "conn": conn_id, "at": "run.end" });
+                begin_effect(
+                    &self.state,
+                    &self.journal,
+                    &self.replay,
+                    "mcp.close",
+                    close_id,
+                    req,
+                );
                 clients.next_auto_close += 1;
                 clients.pending += 1;
             }
             !clients.conns.is_empty()
         };
+        if !waiting {
+            return;
+        }
+        // A replay hands the recorded closes back; there is nothing to wait on.
+        if self.replay.borrow().is_some() {
+            if let Some(replay) = self.replay.borrow_mut().as_mut() {
+                replay.begin_turn();
+            }
+            loop {
+                let next = self
+                    .replay
+                    .borrow_mut()
+                    .as_mut()
+                    .and_then(|r| r.next_event());
+                match next {
+                    Some(LoopEvent::Mcp(event)) => self.dispatch_mcp_event(*event),
+                    Some(_) => {}
+                    None => return,
+                }
+            }
+        }
         let deadline = Instant::now() + client::EXIT_GRACE + Duration::from_secs(3);
-        while waiting && !self.mcp_clients.borrow().conns.is_empty() {
+        while !self.mcp_clients.borrow().conns.is_empty() {
             let wait = deadline.saturating_duration_since(Instant::now());
             match self.events_rx.recv_timeout(wait) {
                 Ok(LoopEvent::Mcp(event)) => self.dispatch_mcp_event(*event),

@@ -10,6 +10,9 @@
 //! are served the same way. Budgets are recomputed from the caps and ledger
 //! balances the run recorded; no ledger is written.
 //!
+//! An MCP server is never started: `connect()`, its calls and its close are
+//! served from their records, and the server script's SHA-256 must match.
+//!
 //! Not recorded, so read live: `Date.now()`, `performance.now()`,
 //! `process.env`, and the order of timers against effects. A script whose
 //! output depends on them can diverge, and the replay reports where.
@@ -24,9 +27,12 @@ pub mod plan;
 pub use plan::{Plan, RecordedEffect};
 
 use crate::ai::PreparedCall;
+use crate::budget::Amount;
 use crate::effect_record::{bytes_of, headers_of};
 use crate::error::{Result, VaernError};
 use crate::event::{FetchCompletion, FsCompletion, LoopEvent, ModelCompletion};
+use crate::mcp::client::{Closed, Failure, Hello, McpEvent};
+use crate::mcp::protocol::Era;
 use plan::text;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -173,9 +179,87 @@ fn completion_events(
             let reply = crate::ai::parse_reply(&call.endpoint, status, body.into_bytes());
             model_done(req_id, call, reply)
         }
+        "mcp.connect" | "mcp.call" | "mcp.close" => {
+            LoopEvent::Mcp(Box::new(mcp_event(rec, req_id)?))
+        }
         other => return Err(format!("a {other} record has no outcome to replay")),
     };
     Ok(vec![event])
+}
+
+/// What an MCP connection reported, rebuilt from its record.
+fn mcp_event(rec: &RecordedEffect, req_id: u32) -> std::result::Result<McpEvent, String> {
+    let record = &rec.record;
+    let error = &record["error"];
+    let failure = || Failure {
+        error: VaernError::Mcp {
+            stage: text(error, "stage"),
+            code: text(error, "code"),
+            server: text(error, "server"),
+            message: text(error, "message"),
+            action: text(error, "action"),
+        },
+        rpc: error["rpc"].as_i64(),
+        exit_code: error["exit_code"]
+            .as_i64()
+            .and_then(|c| i32::try_from(c).ok()),
+        stderr: text(error, "stderr"),
+        sent: error["sent"].as_bool().unwrap_or(true),
+    };
+    let spent = |res: &Value| {
+        Some(Amount {
+            nano: res["spent_nano_usd"].as_u64()?,
+            tokens: res["spent_tokens"].as_u64()?,
+        })
+    };
+    let res = record.get("res");
+    Ok(match rec.kind.as_str() {
+        "mcp.connect" => McpEvent::Connected {
+            conn_id: req_id,
+            result: match res {
+                Some(res) => Ok(Hello {
+                    era: match res["protocol_version"].as_str() {
+                        Some(crate::mcp::protocol::VERSION_N1) => Era::Legacy,
+                        _ => Era::Modern,
+                    },
+                    server: res["server"].clone(),
+                    instructions: res["instructions"].as_str().map(String::from),
+                    tools: res["tools"].as_array().cloned().unwrap_or_default(),
+                    run: res["server_run"].as_str().map(String::from),
+                    spent: None,
+                }),
+                None => Err(failure()),
+            },
+        },
+        "mcp.call" => McpEvent::Called {
+            req_id,
+            result: match res {
+                Some(res) => {
+                    let mut result = serde_json::json!({ "content": res["content"], "isError": res["is_error"] });
+                    if !res["structured"].is_null() {
+                        result["structuredContent"] = res["structured"].clone();
+                    }
+                    Ok(result)
+                }
+                None => Err(failure()),
+            },
+        },
+        _ => {
+            let conn = record["req"]["conn"]
+                .as_u64()
+                .and_then(|c| u32::try_from(c).ok());
+            let res = res.ok_or("the close has no outcome")?;
+            McpEvent::Closed {
+                conn_id: conn.ok_or("the close names no connection")?,
+                closed: Closed {
+                    exit_code: res["exit_code"]
+                        .as_i64()
+                        .and_then(|c| i32::try_from(c).ok()),
+                    spent: spent(res),
+                },
+            }
+        }
+    })
 }
 
 fn model_done(req_id: u32, call: PreparedCall, result: Result<crate::ai::ModelReply>) -> LoopEvent {
@@ -477,5 +561,71 @@ mod tests {
         );
         let plain = recorded_error("fetch", &serde_json::json!({ "message": "boom" }));
         assert_eq!(plain.to_string(), "boom");
+    }
+
+    #[test]
+    fn test_recorded_mcp_outcomes_come_back_as_the_client_reported_them() {
+        let rec = |kind: &str, record: Value| RecordedEffect {
+            seq: 3,
+            kind: kind.into(),
+            record,
+        };
+        let failed = rec(
+            "mcp.connect",
+            serde_json::json!({ "error": {
+            "stage": "start", "code": "SERVER_EXITED", "server": "./s.ts", "message": "it exited",
+            "action": "Run it.", "sent": true, "exit_code": 2, "stderr": "boom" } }),
+        );
+        let Ok(McpEvent::Connected {
+            conn_id: 7,
+            result: Err(failure),
+        }) = mcp_event(&failed, 7)
+        else {
+            panic!("a failed connect comes back as a failure");
+        };
+        assert_eq!(
+            (failure.exit_code, failure.stderr.as_str()),
+            (Some(2), "boom")
+        );
+        assert!(
+            matches!(failure.error, VaernError::Mcp { ref code, .. } if code == "SERVER_EXITED")
+        );
+
+        let legacy = rec(
+            "mcp.connect",
+            serde_json::json!({ "res": {
+            "protocol_version": crate::mcp::protocol::VERSION_N1, "server": { "name": "s" },
+            "instructions": null, "tools": [], "server_run": "r1" } }),
+        );
+        let Ok(McpEvent::Connected {
+            result: Ok(hello), ..
+        }) = mcp_event(&legacy, 1)
+        else {
+            panic!("a connect comes back as its hello");
+        };
+        assert_eq!((hello.era, hello.run.as_deref()), (Era::Legacy, Some("r1")));
+
+        let call = rec(
+            "mcp.call",
+            serde_json::json!({ "res": {
+            "content": [], "structured": null, "is_error": false } }),
+        );
+        let Ok(McpEvent::Called {
+            result: Ok(result), ..
+        }) = mcp_event(&call, 2)
+        else {
+            panic!("a call comes back as its result");
+        };
+        assert!(result.get("structuredContent").is_none());
+
+        let lost = rec(
+            "mcp.close",
+            serde_json::json!({ "req": { "server": "./s.ts", "conn": 1 },
+            "res": { "exit_code": null, "spent_nano_usd": null, "spent_tokens": null } }),
+        );
+        let Ok(McpEvent::Closed { conn_id: 1, closed }) = mcp_event(&lost, 9) else {
+            panic!("a close comes back for its connection");
+        };
+        assert_eq!((closed.exit_code, closed.spent), (None, None));
     }
 }

@@ -3624,6 +3624,17 @@ impl QuickJsRuntime {
         *self.replay.borrow_mut() = Some(crate::replay::Replay::new(plan));
         self.seed_random(seed)?;
         let outcome = self.run_file_inner(&script);
+        // A replay that has already stopped must not match the run-end
+        // closes, which would report a later record than the one it hit.
+        let stopped = matches!(
+            outcome,
+            Err(VaernError::Replay { .. }
+                | VaernError::ReplayDivergence { .. }
+                | VaernError::ReplaySourceChanged { .. })
+        );
+        if !stopped {
+            self.close_mcp_connections();
+        }
         let mut slot = self.replay.borrow_mut();
         match slot.as_mut() {
             Some(replay) => replay.finish(outcome),
