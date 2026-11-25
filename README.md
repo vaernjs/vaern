@@ -8,12 +8,12 @@ Vaern is an agent-native JavaScript and TypeScript runtime. It is being built so
 
 ## Status
 
-v0.0.7, an early native runtime. `@vaernjs/vaern` on npm ships the `vaern` binary for Linux, macOS and Windows.
+v0.0.8, an early native runtime. `@vaernjs/vaern` on npm ships the `vaern` binary for Linux, macOS and Windows.
 It runs JavaScript and TypeScript files with `console`, timers, `fetch`, an HTTP `serve()`, whole-file reads and writes from `vaern:fs`, `process.argv`, `process.env` and `process.exit()`, and imports ES module packages already installed in `node_modules`.
 TypeScript keeps its line and column numbers in stack traces. Enums, namespaces and decorators are rejected with a `file:line:col` error, because they emit runtime code that type stripping cannot produce.
 `vaern:ai` provides `model()` for OpenAI-compatible chat endpoints, on a cloud service or on your own machine, with `tool()` and `agent()`. Budgets are checked by the runtime: no model call or tool effect is dispatched unless the reserve fits the remaining budget. Amounts are estimates from the prices the script gives; provider billing may drift.
 Runs are replayable: every effect is recorded in a hash-chained journal, and `vaern replay` reproduces the transcript. [docs/journal.md](./docs/journal.md) says what a replay does and does not reproduce.
-On `main` and not yet in a release: `vaern:mcp` declares MCP servers in JavaScript with no SDK install, served over stdio by `vaern mcp serve`. `connect()` starts such a server as a second `vaern` process, and every connect, call and close is journalled and metered in the calling run. MCP Tasks and elicitation are deferred. See [examples/mcp](./examples/mcp).
+`vaern:mcp` declares MCP servers in JavaScript with no SDK install, served over stdio by `vaern mcp serve`. `connect()` starts such a server as a second `vaern` process, and every connect, call and close is journalled and metered in the calling run. MCP Tasks and elicitation are deferred. See [examples/mcp](./examples/mcp).
 Not implemented yet: `node:*` modules, CommonJS packages, capability sandboxing (`vaern.toml`), and MCP over HTTP or with servers that are not vaern scripts.
 [docs/subset.md](./docs/subset.md) lists every API that works, its limits, and what is absent.
 

@@ -1,50 +1,61 @@
 {
-  "version": "0.0.7",
-  "baseline": "0.0.6",
-  "date": "2026-11-09",
+  "version": "0.0.8",
+  "baseline": "0.0.7",
+  "date": "2026-11-26",
   "system": {
     "os": "Microsoft Windows 11 Pro (x86_64)",
     "cpu": "11th Gen Intel(R) Core(TM) i7-11850H @ 2.50GHz (8 cores, 16 threads)",
     "ram": "16 GB RAM"
   },
-  "method": "hyperfine -N, 3 warmups (2 for compute-heavy); 30 runs for startup and fetch, 20 for compute-loop and serve, 10 for compute-heavy; wall time is mean ± σ. Each row is one hyperfine call with 0.0.6 listed first; startup and serve were repeated with 0.0.7 first to check order effects. Peak RSS is the largest PeakWorkingSetSize of 5 runs. Both versions are release builds measured in the same session; the machine was under other load, so σ is wide. 0.0.7 writes a run journal by default; --no-journal rows turn it off.",
+  "method": "hyperfine -N, 3 warmups, 30 runs; wall time is mean ± σ. Startup and loopback fetch were measured against a 0.0.7 release build from the v0.0.7 tag in the same session, once with each version listed first, because the order has moved results by more than the difference being measured. The 0.0.8 build measured was made from main before the version number was set; binarySize is the release build's. Peak RSS is the largest PeakWorkingSetSize of 5 runs. Rows with lastMeasured were not re-run for 0.0.8. A re-run of startup and fetch on 2026-11-11, after the hardening changes, was within noise in both orders and is in README.md.",
   "binarySize": {
     "budget": 15728640,
-    "0.0.6": 16103936,
     "0.0.7": 9891328,
-    "status": "Under budget by 5837312 bytes"
+    "0.0.8": 10335744,
+    "status": "Under budget by 5392896 bytes"
   },
   "benchmarks": [
     {
       "name": "Startup and greeting",
       "command": "vaern run examples/hello.ts",
-      "reproduce": "hyperfine -N --warmup 3 --runs 30 'target/release/vaern run examples/hello.ts' 'target/release/vaern run --no-journal examples/hello.ts' 'node -e 0'",
+      "reproduce": "hyperfine -N --warmup 3 --runs 30 '<0.0.7 binary> run examples/hello.ts' 'target/release/vaern run examples/hello.ts', then again with the two binaries in the other order; add 'run --no-journal' for the second row",
       "wall": {
-        "0.0.7": "26.4 ms ± 3.2",
-        "0.0.7 --no-journal": "19.6 ms ± 3.0",
-        "0.0.6": "19.8 ms ± 1.4",
-        "node -e 0": "80.3 ms ± 12.9"
+        "0.0.8, 0.0.7 listed first": "20.1 ms ± 1.2",
+        "0.0.7, listed first": "18.9 ms ± 1.0",
+        "0.0.8, listed first": "20.1 ms ± 1.4",
+        "0.0.7, listed second": "19.8 ms ± 1.5",
+        "0.0.8 --no-journal": "17.9 ms ± 0.8",
+        "0.0.7 --no-journal": "18.9 ms ± 3.1",
+        "node -e 0": "42.2 ms ± 3.1"
       },
       "peakRss": {
-        "0.0.7": "7.7 MB",
-        "0.0.6": "7.8 MB"
+        "0.0.8": "8.3 MB",
+        "0.0.7": "8.2 MB"
       },
-      "status": "Loss vs 0.0.6 with the journal, +6.6 ms (+4.6 ms with 0.0.7 first); about 3 ms is creating the run directory and file and one sync, the rest is not profiled. Within noise with --no-journal. Win vs Node process start"
+      "status": "Loss vs 0.0.7 with the journal, +1.2 ms with 0.0.7 listed first; +0.3 ms, within noise, the other way round. Not profiled. Within noise with --no-journal. Win vs Node process start"
     },
     {
       "name": "Loopback fetch and JSON parse",
       "command": "vaern run examples/fetch-json.ts",
-      "reproduce": "hyperfine -N --warmup 3 --runs 30 'target/release/vaern run examples/fetch-json.ts'",
+      "reproduce": "hyperfine -N --warmup 3 --runs 30 '<0.0.7 binary> run examples/fetch-json.ts' 'target/release/vaern run examples/fetch-json.ts', then again in the other order",
       "wall": {
-        "0.0.7": "32.6 ms ± 4.1",
-        "0.0.7 --no-journal": "29.0 ms ± 5.8",
-        "0.0.6": "30.9 ms ± 8.6"
+        "0.0.8, 0.0.7 listed first": "29.9 ms ± 8.9",
+        "0.0.7, listed first": "27.8 ms ± 8.4",
+        "0.0.8, listed first": "28.1 ms ± 8.0",
+        "0.0.7, listed second": "27.8 ms ± 5.3"
       },
-      "peakRss": {
-        "0.0.7": "9.6 MB",
-        "0.0.6": "10.3 MB"
+      "status": "Within noise of 0.0.7 in both orders"
+    },
+    {
+      "name": "MCP connect, one call, close",
+      "command": "vaern run bench/mcp-connect.ts",
+      "reproduce": "hyperfine -N --warmup 3 --runs 30 'target/release/vaern run examples/hello.ts' 'target/release/vaern run bench/mcp-connect.ts' 'target/release/vaern run --no-journal bench/mcp-connect.ts'",
+      "wall": {
+        "0.0.8": "47.6 ms ± 4.0",
+        "0.0.8 --no-journal": "40.1 ms ± 2.7",
+        "0.0.8 hello.ts, same call": "21.3 ms ± 1.2"
       },
-      "status": "Within noise of 0.0.6"
+      "status": "New in 0.0.8, not a regression: starting a server script as a second vaern process, one tool call and a close add 26.3 ms to a run with the journal (18.8 ms with --no-journal on caller and server)"
     },
     {
       "name": "Arithmetic loop (1M)",
@@ -59,7 +70,8 @@
         "0.0.7": "8.0 MB",
         "0.0.6": "8.1 MB"
       },
-      "status": "+7.5 ms vs 0.0.6, within σ; about the journal's startup cost. Win vs Node; Node startup dominates at this size"
+      "status": "+7.5 ms vs 0.0.6, within σ; about the journal's startup cost. Win vs Node; Node startup dominates at this size",
+      "lastMeasured": "Not re-run for 0.0.8; no change touched this path. Values are 0.0.7 against 0.0.6, measured 2026-11-09."
     },
     {
       "name": "Arithmetic loop (50M)",
@@ -70,7 +82,8 @@
         "0.0.6": "2.254 s ± 0.124",
         "node": "0.435 s ± 0.050"
       },
-      "status": "Loss vs Node, 5.4x slower; QuickJS interprets bytecode and V8 compiles the loop. Within noise of 0.0.6"
+      "status": "Loss vs Node, 5.4x slower; QuickJS interprets bytecode and V8 compiles the loop. Within noise of 0.0.6",
+      "lastMeasured": "Not re-run for 0.0.8; no change touched this path. Values are 0.0.7 against 0.0.6, measured 2026-11-09."
     },
     {
       "name": "Parallel HTTP (100 requests)",
@@ -84,7 +97,8 @@
         "0.0.7": "17.1 MB",
         "0.0.6": "17.7 MB"
       },
-      "status": "+7.7 ms vs 0.0.6 (+3.7 ms with 0.0.7 first), within σ; about the journal's startup cost"
+      "status": "+7.7 ms vs 0.0.6 (+3.7 ms with 0.0.7 first), within σ; about the journal's startup cost",
+      "lastMeasured": "Not re-run for 0.0.8; no change touched this path. Values are 0.0.7 against 0.0.6, measured 2026-11-09."
     },
     {
       "name": "Idle HTTP server CPU (3 s window)",
@@ -94,7 +108,8 @@
         "0.0.7": "0.0 ms (0.00% of one core)",
         "0.0.6": "0.0 ms (0.00% of one core)"
       },
-      "status": "Unchanged; Windows reports CPU time in 15.6 ms steps"
+      "status": "Unchanged; Windows reports CPU time in 15.6 ms steps",
+      "lastMeasured": "Not re-run for 0.0.8; no change touched this path. Values are 0.0.7 against 0.0.6, measured 2026-11-09."
     }
   ]
 }

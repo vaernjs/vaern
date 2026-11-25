@@ -105,10 +105,10 @@ const mcpReplies = lines([
 
 const cases = [
   {
-    name: "--version reports 0.0.7",
+    name: "--version reports 0.0.8",
     args: ["--version"],
     code: 0,
-    stdout: "vaern 0.0.7\n",
+    stdout: "vaern 0.0.8\n",
   },
   {
     name: "hello.ts strips types and prints",

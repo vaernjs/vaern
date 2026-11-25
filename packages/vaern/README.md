@@ -1,12 +1,12 @@
 # vaern
 
-**An agent-native JavaScript & TypeScript runtime.** Vaern runs TypeScript directly, with `fetch` and an HTTP server built in, on an embedded QuickJS-ng engine driven by Rust and Tokio. Model calls, tools, budgets and replayable runs are part of the runtime. Capability sandboxing and MCP are not built yet.
+**An agent-native JavaScript & TypeScript runtime.** Vaern runs TypeScript directly, with `fetch` and an HTTP server built in, on an embedded QuickJS-ng engine driven by Rust and Tokio. Model calls, tools, budgets, replayable runs and MCP servers declared in JavaScript are part of the runtime. Capability sandboxing is not built yet.
 
 [VaernJS](https://vaernjs.tech) is a [DevLogix](https://devlogix.com.pk) project · licensed MIT
 
 ---
 
-> ### Status: v0.0.7, early native runtime
+> ### Status: v0.0.8, early native runtime
 >
 > This release ships the native `vaern` binary for Linux, macOS and Windows.
 > The API surface is small and will change before v1.0.
@@ -24,13 +24,14 @@
 - `model()`, `tool()` and `agent()` from `vaern:ai`, against any OpenAI-compatible endpoint, on a cloud service or on your own machine, with streaming and schema-checked structured output
 - Budgets in tokens and estimated USD: no model call or tool effect is dispatched unless the reserve fits the remaining budget. Provider billing may drift from the estimate
 - Replayable runs: every effect is recorded in a hash-chained journal; `vaern journal verify` checks it and `vaern replay` reproduces the transcript
+- MCP servers in JavaScript, no SDK install: `server()` from `vaern:mcp` declares one, `vaern mcp serve` serves it over stdio, and `connect()` starts it as a second `vaern` process whose tools an `agent()` can call, journalled and metered in the calling run
 - Uncaught exceptions, unhandled rejections and throwing timers exit non-zero with a `file:line:col` location
 
 **Not implemented yet**
 
 - `node:*` modules, CommonJS packages and downloading packages
 - Capability sandboxing (`vaern.toml`)
-- MCP
+- MCP over HTTP, connecting to MCP servers that are not vaern scripts, MCP Tasks and elicitation
 
 TypeScript `enum`, `namespace` and decorators are rejected with a located error, because they emit runtime code that type stripping cannot produce.
 

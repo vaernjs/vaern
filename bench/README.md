@@ -1,7 +1,53 @@
 # Benchmarks
 
-Measurements for Vaern 0.0.7 against 0.0.6, including the runs Vaern loses.
+Measurements for Vaern 0.0.8 against 0.0.7, including the runs Vaern loses.
+0.0.8 repeated only the benchmarks its changes could move: startup and
+loopback fetch, after the hardening and again after `vaern:mcp`, plus a new
+row for starting an MCP server. The arithmetic loops, parallel HTTP and idle
+server CPU were last measured for 0.0.7, in the 0.0.7 section below.
 Machine data and raw values are in [bench.json](bench.json).
+
+All runs: Microsoft Windows 11 Pro (x86_64), 11th Gen Intel(R) Core(TM) i7-11850H @ 2.50GHz (8 cores, 16 threads), 16 GB RAM. The 0.0.8 builds measured were made from `main` before the version number was set; the binary size below is the release build's. For the `vaern:mcp` re-run, the 0.0.7 binary was built from the `v0.0.7` tag in the same session, and its size matches the release's; the hardening re-run used the 0.0.7 build measured in the 0.0.7 section.
+
+## 0.0.8 against 0.0.7, after `vaern:mcp` (2026-11-26)
+
+Every run now registers the MCP bridges and its event loop checks for MCP work, so startup and loopback fetch were repeated. Each row is one hyperfine call, `-N`, 3 warmups, 30 runs, with the journal on unless noted. `node -e 0` took 42.2 ms ± 3.1 in this session.
+
+| Benchmark | 0.0.8 | 0.0.7 | Order | Status |
+|---|---|---|---|---|
+| Startup and greeting | 20.1 ms ± 1.2 | 18.9 ms ± 1.0 | 0.0.7 first | **Loss, +1.2 ms** |
+| Startup and greeting | 20.1 ms ± 1.4 | 19.8 ms ± 1.5 | 0.0.8 first | +0.3 ms, within noise |
+| Startup and greeting, `--no-journal` | 17.9 ms ± 0.8 | 18.9 ms ± 3.1 | 0.0.7 first | Within noise |
+| Loopback fetch and JSON parse | 29.9 ms ± 8.9 | 27.8 ms ± 8.4 | 0.0.7 first | Within noise |
+| Loopback fetch and JSON parse | 28.1 ms ± 8.0 | 27.8 ms ± 5.3 | 0.0.8 first | Within noise |
+
+0.0.8 read 20.1 ms in both startup calls, against 18.9 and 19.8 ms for 0.0.7, so startup with the journal is reported as a loss of up to 1.2 ms. It has not been profiled; the startup prelude and the bridges registered at every start grew with `vaern:mcp`. Peak RSS for `hello.ts` is 8.3 MB against 8.2 MB, the largest peak working set over 5 runs each.
+
+A new row, not a regression: starting an MCP server. `bench/mcp-connect.ts` connects to `examples/mcp/calc-server.ts`, calls its tool once and closes it, so it runs two vaern processes. Same binary, one hyperfine call:
+
+| Benchmark | Wall time | Against `hello.ts` (21.3 ms ± 1.2) |
+|---|---|---|
+| MCP connect, one call, close | 47.6 ms ± 4.0 | +26.3 ms |
+| The same, `--no-journal` (caller and server) | 40.1 ms ± 2.7 | +18.8 ms |
+
+Binary size of the 0.0.8 release build, stripped: 10,335,744 bytes (0.0.7: 9,891,328, +444,416, of which 42,496 came with the hardening below), 5,392,896 bytes under the 15 MiB budget. Tokio's `process` feature and the MCP protocol, server and client are the rest.
+
+## 0.0.8 against 0.0.7, after the hardening (2026-11-11)
+
+Measured after the response cap moved to 64 MiB and journal records were limited to 1 MiB of a body. Only the two runs those changes touch were repeated. The 0.0.7 column is the build measured for 0.0.7, below. Each row is one hyperfine call with the journal on.
+
+| Benchmark | 0.0.8 build | 0.0.7 | Order | Status |
+|---|---|---|---|---|
+| Startup and greeting | 19.4 ms ± 1.1 | 19.7 ms ± 1.6 | 0.0.7 first | Within noise |
+| Startup and greeting | 19.8 ms ± 1.9 | 18.9 ms ± 1.3 | 0.0.8 build first | Within noise |
+| Loopback fetch and JSON parse | 25.6 ms ± 7.6 | 27.5 ms ± 8.0 | 0.0.7 first | Within noise |
+| Loopback fetch and JSON parse | 28.7 ms ± 8.1 | 24.5 ms ± 5.7 | 0.0.8 build first | Within noise |
+
+Whichever build ran second was faster in all four calls, so the differences are an effect of order, not of the build. The journal's startup cost reported for 0.0.7 is unchanged.
+
+Binary size at that point, stripped: 9,933,824 bytes (0.0.7: 9,891,328, +42,496).
+
+## 0.0.7 against 0.0.6 (2026-11-09)
 
 All runs: Microsoft Windows 11 Pro (x86_64), 11th Gen Intel(R) Core(TM) i7-11850H @ 2.50GHz (8 cores, 16 threads), 16 GB RAM, 2026-11-09. Wall time is the hyperfine mean ± σ with `-N` and 3 warmups, over 30 runs for startup and fetch, 20 for the others and 10 for the 50M loop. Peak RSS is the largest peak working set over 5 runs. The 0.0.7 build measured was made the day before the release, without its version number and without one later fix that renames a temporary file in the journal; the binary size below is the release build's. The 0.0.6 binary was built from the `v0.0.6` tag in the same session. Since 0.0.6, every `vaern run` writes a journal. Each row is one hyperfine call with 0.0.6 listed first, and startup and parallel HTTP were repeated with 0.0.7 first. The machine was busier than on 2026-11-07 (`node -e 0` took 80 ms, against 39 ms then), so σ is wider; compare within a row only. The journal goes to `$VAERN_HOME` on the local system disk.
 
@@ -17,44 +63,6 @@ All runs: Microsoft Windows 11 Pro (x86_64), 11th Gen Intel(R) Core(TM) i7-11850
 The journal costs about 5 ms per run on this machine. Creating a run directory and file takes about 1.5 ms here and syncing one record about 1.8 ms more, measured on their own; the journal syncs once, at `run.end`, so that accounts for about 3 ms. The rest has not been profiled. `vaern run --no-journal` removes the cost.
 
 Binary size, stripped: 9,891,328 bytes (0.0.6: 16,103,936; the LTO build below: 9,427,456, +463,872 for the journal, `vaern:ai` and replay), 5,837,312 bytes under the 15 MiB budget.
-
-## Unreleased hardening against 0.0.7
-
-Re-run on 2026-11-11 on the same machine, after the response cap moved to 64 MiB and journal records were limited to 1 MiB of a body. Only the two runs those changes touch were repeated. The 0.0.7 column is the build measured above. Each row is one hyperfine call with the journal on.
-
-| Benchmark | Unreleased | 0.0.7 | Order | Status |
-|---|---|---|---|---|
-| Startup and greeting | 19.4 ms ± 1.1 | 19.7 ms ± 1.6 | 0.0.7 first | Within noise |
-| Startup and greeting | 19.8 ms ± 1.9 | 18.9 ms ± 1.3 | new build first | Within noise |
-| Loopback fetch and JSON parse | 25.6 ms ± 7.6 | 27.5 ms ± 8.0 | 0.0.7 first | Within noise |
-| Loopback fetch and JSON parse | 28.7 ms ± 8.1 | 24.5 ms ± 5.7 | new build first | Within noise |
-
-Whichever build ran second was faster in all four calls, so the differences are an effect of order, not of the build. The journal's startup cost reported above is unchanged.
-
-Binary size, stripped: 9,933,824 bytes (0.0.7: 9,891,328, +42,496), 5,794,816 bytes under the 15 MiB budget.
-
-## Unreleased `vaern:mcp` against 0.0.7
-
-Re-run on 2026-11-26 on the same machine, after `vaern:mcp` was added: every run now registers the MCP bridges and its event loop checks for MCP work, so startup and loopback fetch were repeated. The 0.0.7 binary was built from the `v0.0.7` tag in the same session; its size matches the release's. Each row is one hyperfine call, `-N`, 3 warmups, 30 runs, with the journal on unless noted. `node -e 0` took 42.2 ms ± 3.1 in this session.
-
-| Benchmark | Unreleased | 0.0.7 | Order | Status |
-|---|---|---|---|---|
-| Startup and greeting | 20.1 ms ± 1.2 | 18.9 ms ± 1.0 | 0.0.7 first | **Loss, +1.2 ms** |
-| Startup and greeting | 20.1 ms ± 1.4 | 19.8 ms ± 1.5 | new build first | +0.3 ms, within noise |
-| Startup and greeting, `--no-journal` | 17.9 ms ± 0.8 | 18.9 ms ± 3.1 | 0.0.7 first | Within noise |
-| Loopback fetch and JSON parse | 29.9 ms ± 8.9 | 27.8 ms ± 8.4 | 0.0.7 first | Within noise |
-| Loopback fetch and JSON parse | 28.1 ms ± 8.0 | 27.8 ms ± 5.3 | new build first | Within noise |
-
-The new build read 20.1 ms in both startup calls, against 18.9 and 19.8 ms for 0.0.7, so startup with the journal is reported as a loss of up to 1.2 ms. It has not been profiled; the startup prelude and the bridges registered at every start grew with `vaern:mcp`. Peak RSS for `hello.ts` is 8.3 MB against 8.2 MB, the largest peak working set over 5 runs each.
-
-A new row, not a regression: starting an MCP server. `bench/mcp-connect.ts` connects to `examples/mcp/calc-server.ts`, calls its tool once and closes it, so it runs two vaern processes. Same binary, one hyperfine call:
-
-| Benchmark | Wall time | Against `hello.ts` (21.3 ms ± 1.2) |
-|---|---|---|
-| MCP connect, one call, close | 47.6 ms ± 4.0 | +26.3 ms |
-| The same, `--no-journal` (caller and server) | 40.1 ms ± 2.7 | +18.8 ms |
-
-Binary size, stripped: 10,335,744 bytes (0.0.7: 9,891,328, +444,416, of which 42,496 came with the hardening above), 5,392,896 bytes under the 15 MiB budget. Tokio's `process` feature and the MCP protocol, server and client are the rest.
 
 ## Earlier measurements
 
