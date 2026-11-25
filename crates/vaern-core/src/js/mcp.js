@@ -126,6 +126,13 @@
         return true;
     };
 
+    // What an aborted call rejects with, built as fetch builds it.
+    const abortReason = (signal) => {
+        const err = signal.reason || new Error("The operation was aborted");
+        err.name = "AbortError";
+        return err;
+    };
+
     const usdOf = (where, value) => {
         if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
             throw new TypeError(`${where} must be a number, 0 or more`);
@@ -148,12 +155,31 @@
         const name = definition.name;
         const costNano = Math.round(costUsd * 1e9);
         // A refusal of the arguments goes back to an agent's model to
-        // correct, as a local tool's would; a failed run is the tool's.
-        async function call(args) {
+        // correct, as a local tool's would; a failed run is the tool's. An
+        // aborted signal rejects the call at once, as fetch does; the server
+        // is told to stop it, and the call is recorded and charged as sent.
+        async function call(args, options) {
+            const signal = options?.signal ?? undefined;
+            if (signal !== undefined && !(signal instanceof AbortSignal)) {
+                throw new TypeError(`${name}.call: signal must be an AbortSignal`);
+            }
+            if (signal?.aborted) throw abortReason(signal);
             let info;
             try {
-                info = await request((reqId) =>
-                    __vaern_mcp_call_tool(reqId, connId, name, JSON.stringify(args ?? {}), costNano));
+                info = await request((reqId) => {
+                    const refused = __vaern_mcp_call_tool(reqId, connId, name,
+                        JSON.stringify(args ?? {}), costNano, signal ? signal._id : 0);
+                    if (!refused && signal) {
+                        signal.addEventListener("abort", () => {
+                            const waiter = pending.get(reqId);
+                            if (!waiter) return;
+                            pending.delete(reqId);
+                            __vaern_mcp_cancel(reqId);
+                            waiter.reject(abortReason(signal));
+                        });
+                    }
+                    return refused;
+                });
             } catch (err) {
                 if (err instanceof McpError && err.code === "REFUSED") {
                     throw new ToolError(name, "args", err.message, { server: serverName });
@@ -178,10 +204,13 @@
         });
     }
 
-    // connect({ script, budget?, cost? }) starts `vaern mcp serve script`,
-    // agrees a revision and resolves to the connection. budget is what the
-    // server may spend, reserved here and given to it as its caps; cost is
-    // what each tool's call is charged here, by tool name.
+    // connect({ script, budget?, timeoutMs?, cost? }) starts `vaern mcp
+    // serve script`, agrees a revision and resolves to the connection.
+    // budget is what the server may spend, reserved here and given to it as
+    // its caps; timeoutMs is how long each call may wait, default 60000;
+    // cost is what each tool's call is charged here, by tool name. A server
+    // that exits on its own is started again by the next call, at most 3
+    // times; restarts counts them.
     function connect(options) {
         if (options === null || typeof options !== "object") {
             return Promise.reject(new TypeError("connect: options must be an object"));
@@ -190,6 +219,7 @@
         let grantNano;
         let grantTokens;
         let costs;
+        let timeoutMs;
         try {
             if (typeof script !== "string" || script === "") {
                 throw new TypeError("connect: script must be the path of a server script");
@@ -200,6 +230,10 @@
             if (!Number.isSafeInteger(grantTokens) || grantTokens < 0) {
                 throw new TypeError("connect: budget.tokens must be a whole number, 0 or more");
             }
+            timeoutMs = options.timeoutMs ?? 60000;
+            if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 2 ** 31) {
+                throw new TypeError("connect: timeoutMs must be a whole number of milliseconds, 1 or more");
+            }
             costs = new Map();
             for (const [tool, cost] of Object.entries(options.cost ?? {})) {
                 usdOf(`connect: cost.${tool}.usd`, cost?.usd);
@@ -208,7 +242,7 @@
         } catch (err) {
             return Promise.reject(err);
         }
-        return request((reqId) => __vaern_mcp_connect(reqId, script, grantNano, grantTokens))
+        return request((reqId) => __vaern_mcp_connect(reqId, script, grantNano, grantTokens, timeoutMs))
             .then((info) => {
                 const connId = info.connId;
                 const serverName = info.server?.name ?? script;
@@ -220,6 +254,9 @@
                     version: info.server?.version,
                     protocolVersion: info.protocolVersion,
                     instructions: info.instructions ?? undefined,
+                    get restarts() {
+                        return __vaern_mcp_restarts(connId);
+                    },
                     tools: () => Promise.resolve(tools),
                     close: () => {
                         closing ??= request((reqId) => __vaern_mcp_close(reqId, connId)).then(() => undefined);

@@ -12,6 +12,8 @@
 //!
 //! An MCP server is never started: `connect()`, its calls and its close are
 //! served from their records, and the server script's SHA-256 must match.
+//! A server's recorded exit is no script's effect; it is taken as started
+//! once the effects before it have been, and handed back in its place.
 //!
 //! Not recorded, so read live: `Date.now()`, `performance.now()`,
 //! `process.env`, and the order of timers against effects. A script whose
@@ -179,7 +181,7 @@ fn completion_events(
             let reply = crate::ai::parse_reply(&call.endpoint, status, body.into_bytes());
             model_done(req_id, call, reply)
         }
-        "mcp.connect" | "mcp.call" | "mcp.close" => {
+        "mcp.connect" | "mcp.call" | "mcp.close" | "mcp.exit" => {
             LoopEvent::Mcp(Box::new(mcp_event(rec, req_id)?))
         }
         other => return Err(format!("a {other} record has no outcome to replay")),
@@ -215,7 +217,7 @@ fn mcp_event(rec: &RecordedEffect, req_id: u32) -> std::result::Result<McpEvent,
     let res = record.get("res");
     Ok(match rec.kind.as_str() {
         "mcp.connect" => McpEvent::Connected {
-            conn_id: req_id,
+            start: req_id,
             result: match res {
                 Some(res) => Ok(Hello {
                     era: match res["protocol_version"].as_str() {
@@ -245,12 +247,16 @@ fn mcp_event(rec: &RecordedEffect, req_id: u32) -> std::result::Result<McpEvent,
             },
         },
         _ => {
-            let conn = record["req"]["conn"]
-                .as_u64()
-                .and_then(|c| u32::try_from(c).ok());
+            // A close names the start of the server it ended when that is
+            // not the connection's first; an exit always does.
+            let req = &record["req"];
+            let start = req.get("start").unwrap_or(&req["conn"]).as_u64();
+            let start = start.and_then(|c| u32::try_from(c).ok());
             let res = res.ok_or("the close has no outcome")?;
             McpEvent::Closed {
-                conn_id: conn.ok_or("the close names no connection")?,
+                start: start.ok_or("the close names no connection")?,
+                // A replay hands back each unanswered call's own record.
+                unanswered: Vec::new(),
                 closed: Closed {
                     exit_code: res["exit_code"]
                         .as_i64()
@@ -338,6 +344,7 @@ impl Replay {
         req: &Value,
         call: Option<PreparedCall>,
     ) -> u64 {
+        self.take_exits();
         let eid = self.next_eid;
         self.next_eid += 1;
         let Some(rec) = self.plan.effects.get(&eid) else {
@@ -356,6 +363,19 @@ impl Replay {
             self.dispatched.insert(eid, (req_id, call));
         }
         eid
+    }
+
+    /// Takes each recorded server exit that is next in line as started. No
+    /// script call starts one; the run recorded it when the server went away.
+    fn take_exits(&mut self) {
+        while let Some(rec) = self.plan.effects.get(&self.next_eid)
+            && rec.kind == "mcp.exit"
+        {
+            let start = rec.record["req"]["start"].as_u64();
+            let start = start.and_then(|s| u32::try_from(s).ok()).unwrap_or(0);
+            self.dispatched.insert(self.next_eid, (start, None));
+            self.next_eid += 1;
+        }
     }
 
     /// Checks one console write against the transcript. `false` means it
@@ -401,6 +421,7 @@ impl Replay {
         if self.divergence.is_some() {
             return None;
         }
+        self.take_exits();
         let eid = *self.plan.completions.get(self.cursor)?;
         if self.held(eid) {
             return None;
@@ -577,7 +598,7 @@ mod tests {
             "action": "Run it.", "sent": true, "exit_code": 2, "stderr": "boom" } }),
         );
         let Ok(McpEvent::Connected {
-            conn_id: 7,
+            start: 7,
             result: Err(failure),
         }) = mcp_event(&failed, 7)
         else {
@@ -623,7 +644,10 @@ mod tests {
             serde_json::json!({ "req": { "server": "./s.ts", "conn": 1 },
             "res": { "exit_code": null, "spent_nano_usd": null, "spent_tokens": null } }),
         );
-        let Ok(McpEvent::Closed { conn_id: 1, closed }) = mcp_event(&lost, 9) else {
+        let Ok(McpEvent::Closed {
+            start: 1, closed, ..
+        }) = mcp_event(&lost, 9)
+        else {
             panic!("a close comes back for its connection");
         };
         assert_eq!((closed.exit_code, closed.spent), (None, None));

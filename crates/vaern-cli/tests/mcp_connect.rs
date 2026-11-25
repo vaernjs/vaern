@@ -4,7 +4,12 @@
 //! These pin down that each connect, call and close is an effect in the
 //! caller's journal, that the server's grant is reserved before it starts
 //! and settled at what it reported, that a connection left open is closed
-//! when the run ends, and that a refused connect starts nothing.
+//! when the run ends, and that a refused connect starts nothing. The
+//! lifecycle tests pin down that a crash fails the call in flight with a
+//! typed error and is recorded, that the next call restarts the server at
+//! most three times, and that a late or aborted call is cancelled while the
+//! connection carries on. Each of these runs also replays without starting
+//! a server.
 
 use serde_json::Value;
 use std::error::Error;
@@ -19,12 +24,23 @@ type Run = (String, Vec<Value>);
 /// One run at a time; see `mcp_serve.rs` for why children are started so.
 static RUN: Mutex<()> = Mutex::new(());
 
+/// A server whose tools exit the process, answer late, or answer at once.
+const FLAKY: &str = r#"
+import { tool } from "vaern:ai";
+import { server } from "vaern:mcp";
+const crash = tool({ name: "crash", run: () => { console.error("going down"); process.exit(3); } });
+const slow = tool({ name: "slow", run: () => new Promise((done) => setTimeout(() => done({ late: true }), 1000)) });
+const ping = tool({ name: "ping", run: () => ({ pong: true }) });
+server({ name: "flaky", version: "1.0.0", tools: [crash, slow, ping] });
+"#;
+
 fn workspace(test: &str, client: &str) -> Result<PathBuf, Box<dyn Error>> {
     let dir = std::env::temp_dir().join(format!("vaern-connect-{}-{test}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
     let sandbox = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/sandbox_run");
     std::fs::copy(sandbox.join("mcp_server.ts"), dir.join("mcp_server.ts"))?;
+    std::fs::write(dir.join("flaky.ts"), FLAKY)?;
     std::fs::write(dir.join("client.ts"), client)?;
     Ok(dir)
 }
@@ -264,4 +280,139 @@ fn a_replay_starts_no_server_and_diverges_when_the_script_changes() -> TestResul
     assert!(stderr.contains("expected mcp.connect"), "{stderr}");
     assert_eq!(runs(&dir)?.len(), 3, "a diverged replay started no server");
     Ok(())
+}
+
+/// Replays the caller's run and checks it reproduced without a server.
+fn replays_alone(dir: &Path, recorded: &Output) -> TestResult {
+    let before = runs(dir)?;
+    let replayed = replay(dir, &before[0].0)?;
+    assert_eq!(
+        replayed.status.code(),
+        Some(0),
+        "{}",
+        text(&replayed.stderr)
+    );
+    assert_eq!(text(&replayed.stdout), text(&recorded.stdout));
+    assert_eq!(
+        runs(dir)?.len(),
+        before.len(),
+        "the replay started no server"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_crashed_server_fails_its_call_and_restarts_at_most_three_times() -> TestResult {
+    let dir = workspace(
+        "crash",
+        r#"
+        import { connect } from "vaern:mcp";
+        const flaky = await connect({ script: "./flaky.ts" });
+        const [crash, , ping] = await flaky.tools();
+        try { await crash.call({}); } catch (err) {
+            console.log(err.name, err.stage, err.code, err.exitCode, JSON.stringify(err.stderr));
+        }
+        console.log(JSON.stringify(await ping.call({})), flaky.restarts);
+        for (let i = 0; i < 3; i++) { try { await crash.call({}); } catch (err) { console.log(err.code, flaky.restarts); } }
+        try { await ping.call({}); } catch (err) { console.log(err.name, err.stage, err.code, err.exitCode); }
+        await flaky.close();
+        "#,
+    )?;
+    let output = run(&dir, &[])?;
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert_eq!(
+        text(&output.stdout),
+        concat!(
+            "McpError exited SERVER_EXITED 3 \"going down\\n\"\n",
+            "{\"pong\":true} 1\n",
+            "SERVER_EXITED 1\nSERVER_EXITED 2\nSERVER_EXITED 3\n",
+            "McpError exited RESTART_LIMIT 3\n",
+        )
+    );
+    let runs = runs(&dir)?;
+    assert_eq!(runs.len(), 5, "one caller and four server starts");
+    let effects = kinds(&runs[0].1, &["mcp."]);
+    let shape: Vec<&str> = effects
+        .iter()
+        .map(|r| r["kind"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            "mcp.connect",
+            "mcp.call",
+            "mcp.exit",
+            "mcp.connect",
+            "mcp.call",
+            "mcp.call",
+            "mcp.exit",
+            "mcp.connect",
+            "mcp.call",
+            "mcp.exit",
+            "mcp.connect",
+            "mcp.call",
+            "mcp.exit",
+            "mcp.close"
+        ]
+    );
+    // The call in flight is never sent again, and counts as sent.
+    assert_eq!(effects[1]["error"]["code"], "SERVER_EXITED");
+    assert_eq!(effects[1]["error"]["sent"], true);
+    assert_eq!(effects[2]["res"]["exit_code"], 3);
+    let restarts: Vec<&Value> = effects
+        .iter()
+        .filter(|r| r["kind"] == "mcp.connect")
+        .map(|r| &r["req"]["restart"])
+        .collect();
+    assert_eq!(restarts, [&Value::Null, &1.into(), &2.into(), &3.into()]);
+    // The fifth call was refused before anything started, so it has no record.
+    assert_eq!(effects[13]["res"]["exit_code"], 3);
+    replays_alone(&dir, &output)
+}
+
+#[test]
+fn a_late_or_aborted_call_is_cancelled_and_the_connection_carries_on() -> TestResult {
+    let dir = workspace(
+        "late",
+        r#"
+        import { connect } from "vaern:mcp";
+        const flaky = await connect({ script: "./flaky.ts", timeoutMs: 200 });
+        const [, slow, ping] = await flaky.tools();
+        try { await slow.call({}); } catch (err) { console.log(err.name, err.stage, err.code); }
+        const stop = new AbortController();
+        const aborted = slow.call({}, { signal: stop.signal });
+        setTimeout(() => stop.abort(), 20);
+        try { await aborted; } catch (err) { console.log(err.name); }
+        console.log(JSON.stringify(await ping.call({})), flaky.restarts);
+        await flaky.close();
+        "#,
+    )?;
+    let output = run(&dir, &[])?;
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert_eq!(
+        text(&output.stdout),
+        "McpError timeout TIMEOUT
+AbortError
+{\"pong\":true} 0
+"
+    );
+    let runs = runs(&dir)?;
+    let calls = kinds(&runs[0].1, &["mcp.call"]);
+    let failed: Vec<(&Value, &Value)> = calls
+        .iter()
+        .map(|r| (&r["error"]["code"], &r["error"]["sent"]))
+        .collect();
+    assert_eq!(
+        failed,
+        [
+            (&"TIMEOUT".into(), &true.into()),
+            (&"ABORTED".into(), &true.into()),
+            (&Value::Null, &Value::Null)
+        ]
+    );
+    assert_eq!(
+        runs[0].1.iter().filter(|r| r["kind"] == "mcp.exit").count(),
+        0
+    );
+    replays_alone(&dir, &output)
 }

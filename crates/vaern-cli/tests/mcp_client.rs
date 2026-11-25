@@ -27,6 +27,7 @@ async fn the_client_starts_lists_calls_and_closes_a_served_script() {
         script,
         home: None,
         grant: Limits::default(),
+        call_timeout: std::time::Duration::from_secs(30),
     };
     let (commands, rx) = unbounded_channel();
     let (tx, mut events) = unbounded_channel();
@@ -41,7 +42,7 @@ async fn the_client_starts_lists_calls_and_closes_a_served_script() {
 
     let hello = match next(&mut events).await {
         McpEvent::Connected {
-            conn_id: 1,
+            start: 1,
             result: Ok(hello),
         } => hello,
         other => panic!("expected a connection, got {other:?}"),
@@ -77,7 +78,9 @@ async fn the_client_starts_lists_calls_and_closes_a_served_script() {
 
     commands.send(Command::Close).unwrap();
     match next(&mut events).await {
-        McpEvent::Closed { conn_id: 1, closed } => assert_eq!(closed.exit_code, Some(0)),
+        McpEvent::Closed {
+            start: 1, closed, ..
+        } => assert_eq!(closed.exit_code, Some(0)),
         other => panic!("expected the close, got {other:?}"),
     }
     task.await.unwrap();

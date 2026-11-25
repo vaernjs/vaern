@@ -3,9 +3,15 @@
 //!
 //! In v0 a script can start only servers that are scripts run by this same
 //! binary under `vaern mcp serve`, so each server carries its own journal,
-//! home guard and budget cap. A connection is one Tokio task that owns the
-//! child process and its pipes. The JavaScript thread sends it commands and
-//! hears back through a callback, so nothing here touches the engine.
+//! home guard and budget cap. Each start of a server is one Tokio task that
+//! owns the child process and its pipes. The JavaScript thread sends it
+//! commands and hears back through a callback, so nothing here touches the
+//! engine.
+//!
+//! A call that is not answered within the connection's timeout, or that the
+//! script aborts, is given up here: the server is sent
+//! `notifications/cancelled` for it and the call fails. The server may still
+//! have run it, so it counts as sent.
 
 use super::protocol::{self, Era, MAX_MESSAGE_BYTES, META_SPENT, Message};
 use crate::budget::{Amount, Limits};
@@ -19,6 +25,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncReadExt, AsyncWrite, BufReader};
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::time::Instant;
 
 /// How long a server has to answer `server/discover` or `initialize`.
 const NEGOTIATE_WAIT: Duration = Duration::from_secs(10);
@@ -37,6 +44,8 @@ pub struct Launch {
     pub home: Option<PathBuf>,
     /// The most the server may spend, passed as its `--budget-*` caps.
     pub grant: Limits,
+    /// How long each call may wait for its answer.
+    pub call_timeout: Duration,
 }
 
 /// What a connection learned while starting.
@@ -77,7 +86,7 @@ impl Failure {
 }
 
 /// How a connection ended.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Closed {
     pub exit_code: Option<i32>,
     /// The last spend the server reported; `None` if it never did.
@@ -91,15 +100,20 @@ pub enum Command {
         tool: String,
         args: Value,
     },
+    /// Stops waiting on call `req_id`, which the script aborted.
+    Cancel {
+        req_id: u32,
+    },
     Close,
 }
 
-/// What a connection reports, in order: `Connected`, any `Called`, then
-/// `Closed` once (also after a failed start).
+/// What a server's task reports, in order: `Connected`, any `Called`, then
+/// `Closed` once (also after a failed start). `start` is the request id of
+/// the `connect()` or restart that started this server.
 #[derive(Debug)]
 pub enum McpEvent {
     Connected {
-        conn_id: u32,
+        start: u32,
         result: std::result::Result<Hello, Failure>,
     },
     /// The result of `tools/call`: the server's `CallToolResult`.
@@ -107,9 +121,12 @@ pub enum McpEvent {
         req_id: u32,
         result: std::result::Result<Value, Failure>,
     },
+    /// The server has gone. Calls it never answered come with it, so the
+    /// connection is seen as gone in the same step that fails them.
     Closed {
-        conn_id: u32,
+        start: u32,
         closed: Closed,
+        unanswered: Vec<(u32, Failure)>,
     },
 }
 
@@ -176,12 +193,13 @@ fn exited(server: &str, message: String) -> VaernError {
     )
 }
 
-/// Runs connection `conn_id` until it is closed, its commands end or the
-/// server exits, reporting through `send`. The child never outlives it:
-/// it is killed if the grace period runs out, or when this task drops.
+/// Runs the server started by request `start` until it is closed, its
+/// commands end or it exits, reporting through `send`. The child never
+/// outlives it: it is killed if the grace period runs out, or when this
+/// task drops.
 pub async fn run(
     launch: Launch,
-    conn_id: u32,
+    start: u32,
     send: impl Fn(McpEvent),
     commands: UnboundedReceiver<Command>,
 ) {
@@ -198,10 +216,15 @@ pub async fn run(
             spent: None,
         };
         send(McpEvent::Connected {
-            conn_id,
+            start,
             result: Err(failure),
         });
-        send(McpEvent::Closed { conn_id, closed });
+        let unanswered = Vec::new();
+        send(McpEvent::Closed {
+            start,
+            closed,
+            unanswered,
+        });
     };
     let mut process = tokio::process::Command::new(&launch.program);
     process.arg("mcp").arg("serve");
@@ -276,18 +299,20 @@ pub async fn run(
     };
     let spent = hello.spent;
     send(McpEvent::Connected {
-        conn_id,
+        start,
         result: Ok(hello),
     });
     let peer = Peer {
         era,
         client: &client,
         server: &server,
+        timeout: launch.call_timeout,
     };
     let ended = serve_calls(&mut stdout, &mut stdin, &peer, spent, commands, &send).await;
     let exit_code = shut(&mut child, stdin).await;
     // A call still in flight learns why the server went away, and is never
     // sent again: a tool need not be safe to run twice.
+    let mut unanswered = Vec::new();
     for req_id in ended.in_flight {
         let message = match (ended.exited, exit_code) {
             (true, Some(code)) => format!("the server exited with code {code} during the call"),
@@ -298,16 +323,17 @@ pub async fn run(
             sent: true,
             ..failed(exited(&server, message), exit_code)
         };
-        send(McpEvent::Called {
-            req_id,
-            result: Err(failure),
-        });
+        unanswered.push((req_id, failure));
     }
     let closed = Closed {
         exit_code,
         spent: ended.spent,
     };
-    send(McpEvent::Closed { conn_id, closed });
+    send(McpEvent::Closed {
+        start,
+        closed,
+        unanswered,
+    });
 }
 
 /// `tools/list`, the one request made while starting.
@@ -362,6 +388,20 @@ struct Peer<'a> {
     era: Era,
     client: &'a Value,
     server: &'a str,
+    timeout: Duration,
+}
+
+/// Tells the server to stop request `id`. Its answer, if one still comes,
+/// is dropped because the id is no longer in flight.
+async fn cancel<W: AsyncWrite + Unpin>(writer: &mut W, peer: &Peer<'_>, id: u64, reason: &str) {
+    let params = json!({ "requestId": id, "reason": reason });
+    let note = Message::Notification {
+        method: "notifications/cancelled".into(),
+        params: self::params(peer.era, peer.client, params),
+    };
+    // A server that cannot be written to has gone; its exit is reported
+    // when its output ends.
+    let _ = protocol::write(writer, &note, peer.server).await;
 }
 
 /// How [`serve_calls`] ended.
@@ -386,14 +426,15 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut in_flight: HashMap<u64, u32> = HashMap::new();
+    let mut in_flight: HashMap<u64, (u32, Instant)> = HashMap::new();
     let mut next_id = LIST_ID + 1;
-    let ended = |exited: bool, in_flight: HashMap<u64, u32>, spent: Option<Amount>| Ended {
+    let ended = |exited: bool, in_flight: HashMap<u64, (u32, Instant)>, spent| Ended {
         exited,
-        in_flight: in_flight.into_values().collect(),
+        in_flight: in_flight.into_values().map(|(req_id, _)| req_id).collect(),
         spent,
     };
     loop {
+        let due = in_flight.values().map(|(_, due)| *due).min();
         tokio::select! {
             command = commands.recv() => match command {
                 Some(Command::Call { req_id, tool, args }) => {
@@ -403,13 +444,36 @@ where
                     let message = Message::Request { id: id.into(), method: "tools/call".into(), params: call };
                     match protocol::write(writer, &message, peer.server).await {
                         Ok(()) => {
-                            in_flight.insert(id, req_id);
+                            in_flight.insert(id, (req_id, Instant::now() + peer.timeout));
                         }
                         Err(error) => send(McpEvent::Called { req_id, result: Err(Failure::new(error, false)) }),
                     }
                 }
+                Some(Command::Cancel { req_id }) => {
+                    let found = in_flight.iter().find(|(_, (call, _))| *call == req_id).map(|(id, _)| *id);
+                    // Already answered: the answer stands.
+                    let Some(id) = found else { continue };
+                    in_flight.remove(&id);
+                    cancel(writer, peer, id, crate::ai::ABORTED).await;
+                    let message = format!("the call was {}", crate::ai::ABORTED);
+                    let error = mcp_error("call", "ABORTED", peer.server, message, crate::ai::ABORTED_ACTION);
+                    send(McpEvent::Called { req_id, result: Err(Failure::new(error, true)) });
+                }
                 Some(Command::Close) | None => return ended(false, in_flight, spent),
             },
+            () = tokio::time::sleep_until(due.unwrap_or_else(Instant::now)), if due.is_some() => {
+                let now = Instant::now();
+                let late: Vec<u64> = in_flight.iter().filter(|(_, (_, due))| *due <= now).map(|(id, _)| *id).collect();
+                for id in late {
+                    let Some((req_id, _)) = in_flight.remove(&id) else { continue };
+                    let waited = peer.timeout.as_millis();
+                    cancel(writer, peer, id, &format!("no answer within {waited} ms")).await;
+                    let message = format!("no answer within {waited} ms; the server was told to stop the call");
+                    let action = "Raise timeoutMs in connect(), or make the tool answer sooner.";
+                    let error = mcp_error("timeout", "TIMEOUT", peer.server, message, action);
+                    send(McpEvent::Called { req_id, result: Err(Failure::new(error, true)) });
+                }
+            }
             line = protocol::read_line(reader, MAX_MESSAGE_BYTES) => {
                 let Ok(Some(line)) = line else {
                     return ended(true, in_flight, spent);
@@ -419,7 +483,7 @@ where
                     Ok(Message::Error { id, error }) => (id, Err(error)),
                     _ => continue,
                 };
-                let Some(req_id) = id.as_u64().and_then(|id| in_flight.remove(&id)) else {
+                let Some((req_id, _)) = id.as_u64().and_then(|id| in_flight.remove(&id)) else {
                     continue;
                 };
                 let result = match answer {
@@ -520,6 +584,7 @@ mod tests {
             era: Era::Modern,
             client: &client,
             server: "fake",
+            timeout: Duration::from_secs(30),
         };
         let ended = serve_calls(&mut reader, &mut client_write, &peer, None, rx, &send).await;
         drop(tx);
@@ -600,6 +665,82 @@ mod tests {
         assert_eq!(ended.in_flight, [2]);
     }
 
+    #[tokio::test]
+    async fn test_a_late_or_aborted_call_fails_and_the_server_is_told_to_stop_it() {
+        let (client_end, server_end) = tokio::io::duplex(64 * 1024);
+        // The fake server reads everything and answers nothing.
+        let fake = tokio::spawn(async move {
+            let mut reader = BufReader::new(server_end);
+            let mut heard = Vec::new();
+            while let Ok(Some(line)) = protocol::read_line(&mut reader, 1 << 20).await {
+                if let Ok(message) = Message::parse(&line) {
+                    heard.push(message);
+                }
+            }
+            heard
+        });
+        let (client_read, mut client_write) = tokio::io::split(client_end);
+        let mut reader = BufReader::new(client_read);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        for command in [
+            call(1, "slow"),
+            call(2, "stopped"),
+            Command::Cancel { req_id: 2 },
+        ] {
+            tx.send(command).unwrap();
+        }
+        let close = tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let _ = close.send(Command::Close);
+        });
+        let (events_tx, events_rx) = mpsc::channel();
+        let send = move |event: McpEvent| events_tx.send(event).unwrap();
+        let client = client();
+        let peer = Peer {
+            era: Era::Legacy,
+            client: &client,
+            server: "fake",
+            timeout: Duration::from_millis(50),
+        };
+        let ended = serve_calls(&mut reader, &mut client_write, &peer, None, rx, &send).await;
+        // The fake reads until both halves of its pipe are gone.
+        drop((tx, client_write, reader));
+        let failed: Vec<(u32, String, bool)> = events_rx
+            .try_iter()
+            .map(|event| match event {
+                McpEvent::Called {
+                    req_id,
+                    result: Err(failure),
+                } => (req_id, format!("{}", failure.error), failure.sent),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(failed.len(), 2, "{failed:?}");
+        assert_eq!(failed[0].0, 2);
+        assert!(failed[0].1.contains(crate::ai::ABORTED), "{}", failed[0].1);
+        assert_eq!(failed[1].0, 1);
+        assert!(
+            failed[1].1.contains("no answer within 50 ms"),
+            "{}",
+            failed[1].1
+        );
+        assert!(failed.iter().all(|(_, _, sent)| *sent));
+        assert!(!ended.exited && ended.in_flight.is_empty());
+        let cancelled: Vec<Value> = fake
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|message| match message {
+                Message::Notification { method, params } if method == "notifications/cancelled" => {
+                    Some(params["requestId"].clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cancelled, [json!(5), json!(4)]);
+    }
+
     #[test]
     fn test_caps_are_written_as_exact_usd_and_the_stderr_tail_is_bounded() {
         assert_eq!(usd_arg(0), "0.000000000");
@@ -619,6 +760,7 @@ mod tests {
             script: PathBuf::from("calc.ts"),
             home: None,
             grant: Limits::default(),
+            call_timeout: Duration::from_secs(1),
         };
         let (events_tx, events_rx) = mpsc::channel();
         let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -627,10 +769,12 @@ mod tests {
         match &events[..] {
             [
                 McpEvent::Connected {
-                    conn_id: 5,
+                    start: 5,
                     result: Err(failure),
                 },
-                McpEvent::Closed { conn_id: 5, closed },
+                McpEvent::Closed {
+                    start: 5, closed, ..
+                },
             ] => {
                 assert!(matches!(&failure.error, VaernError::Mcp { stage, code, .. }
                     if stage == "spawn" && code == "SPAWN_FAILED"));

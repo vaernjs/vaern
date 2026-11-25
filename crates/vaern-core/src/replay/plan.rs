@@ -17,8 +17,8 @@ use std::path::Path;
 pub struct RecordedEffect {
     /// Where it is in the journal.
     pub seq: u64,
-    /// `fetch`, `fs`, `model.call`, `tool.call`, `mcp.connect`, `mcp.call`
-    /// or `mcp.close`.
+    /// `fetch`, `fs`, `model.call`, `tool.call`, `mcp.connect`, `mcp.call`,
+    /// `mcp.close` or `mcp.exit`.
     pub kind: String,
     pub record: Value,
 }
@@ -190,7 +190,7 @@ impl Plan {
                 }
                 (
                     kind @ ("fetch" | "fs" | "model.call" | "tool.call" | "mcp.connect"
-                    | "mcp.call" | "mcp.close"),
+                    | "mcp.call" | "mcp.close" | "mcp.exit"),
                     Some(eid),
                 ) => {
                     if crate::effect_record::outcome_is_truncated(&r) {
