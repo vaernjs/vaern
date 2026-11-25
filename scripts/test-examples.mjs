@@ -86,10 +86,9 @@ for (const t of tests) {
   }
 }
 
-// agent-budget-replay.ts needs an OpenAI-compatible server. This stub asks
-// for the add tool once, then answers. The run is then replayed with the
-// stub closed: the replay must print the same output without a server.
-async function agentBudgetReplay() {
+// The agent examples need an OpenAI-compatible server. This stub asks for
+// the add tool once, then answers.
+async function startStub() {
   const server = http.createServer((req, res) => {
     let body = "";
     req.on("data", (chunk) => (body += chunk));
@@ -107,7 +106,13 @@ async function agentBudgetReplay() {
     });
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const baseUrl = `http://127.0.0.1:${server.address().port}/v1`;
+  return { server, baseUrl: `http://127.0.0.1:${server.address().port}/v1` };
+}
+
+// Each agent example is run, then replayed with the stub closed: the replay
+// must print the same output without a server.
+async function agentBudgetReplay() {
+  const { server, baseUrl } = await startStub();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "vaern-examples-"));
   const options = { cwd: repoRoot, env: { ...process.env, VAERN_HOME: home }, encoding: "utf8", timeout: 10000 };
   const run = promisify(execFile);
@@ -130,15 +135,57 @@ async function agentBudgetReplay() {
   }
 }
 
-try {
-  await agentBudgetReplay();
-  console.log("OK    agent-budget-replay.ts (run, then replay with the server closed)");
-} catch (err) {
-  console.error(`FAIL  agent-budget-replay.ts: ${err.message}`);
-  failed += 1;
+// mcp/agent.ts also starts mcp/calc-server.ts as a second vaern process,
+// which keeps its own journal. The replay names the calling run: the
+// server's run cannot be replayed on its own, and no server is started.
+async function mcpAgent() {
+  const { server, baseUrl } = await startStub();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "vaern-examples-"));
+  const options = { cwd: repoRoot, env: { ...process.env, VAERN_HOME: home }, encoding: "utf8", timeout: 10000 };
+  const run = promisify(execFile);
+  try {
+    const demo = path.join(repoRoot, "examples", "mcp", "agent.ts");
+    const recorded = await run(binary, ["run", demo, baseUrl, "stub"], options);
+    server.closeAllConnections();
+    server.close();
+    const expected = "answer: 17 + 25 = 42.\nsteps: model > tool > model\nleft: ";
+    if (!recorded.stdout.startsWith(expected)) {
+      throw new Error(`expected output starting "${expected}", received:\n${recorded.stdout}`);
+    }
+    const runsDir = path.join(home, "runs");
+    const runs = fs.readdirSync(runsDir).filter((id) => fs.existsSync(path.join(runsDir, id, "journal.jsonl")));
+    const first = (id) => JSON.parse(fs.readFileSync(path.join(runsDir, id, "journal.jsonl"), "utf8").split("\n")[0]).r;
+    const callers = runs.filter((id) => first(id).mcp === undefined);
+    if (runs.length !== 2 || callers.length !== 1) {
+      throw new Error(`expected one caller and one server run, found ${runs.join(", ")}`);
+    }
+    const replayed = await run(binary, ["replay", callers[0]], options);
+    if (replayed.stdout !== recorded.stdout || !replayed.stderr.includes("reproduced")) {
+      throw new Error(`replay printed:\n${replayed.stdout}${replayed.stderr}`);
+    }
+    if (fs.readdirSync(runsDir).filter((id) => id !== "latest").length !== 2) {
+      throw new Error("the replay started a server");
+    }
+  } finally {
+    server.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 }
 
-const total = tests.length + 1;
+for (const [name, demo] of [
+  ["agent-budget-replay.ts", agentBudgetReplay],
+  ["mcp/agent.ts", mcpAgent],
+]) {
+  try {
+    await demo();
+    console.log(`OK    ${name} (run, then replay with the server closed)`);
+  } catch (err) {
+    console.error(`FAIL  ${name}: ${err.message}`);
+    failed += 1;
+  }
+}
+
+const total = tests.length + 2;
 if (failed > 0) {
   console.error(`\ntest-examples: ${failed} of ${total} test(s) failed.`);
   process.exit(1);

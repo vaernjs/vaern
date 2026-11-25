@@ -49,7 +49,7 @@ numbers.
 
 | kind | fields |
 |---|---|
-| `run.start` | `vaern` (version), `script`, `script_sha256`, `argv`, `budget_caps` {`nano_usd`, `tokens`} (from `--budget-usd` and `--budget-tokens`; `null` when not given), `random_seed` (32 hex digits: the four 32-bit words, in order, that seed `Math.random`) |
+| `run.start` | `vaern` (version), `script`, `script_sha256`, `argv`, `budget_caps` {`nano_usd`, `tokens`} (from `--budget-usd` and `--budget-tokens`; `null` when not given), `random_seed` (32 hex digits: the four 32-bit words, in order, that seed `Math.random`), and `mcp`: `"serve"` for a run started by `vaern mcp serve` |
 | `module.load` | `path`, `sha256` of the source as read. One per module evaluated, the entry script first |
 | `console` | `fd` (1 stdout, 2 stderr), `text`: exactly what was written, newline included. A write over 1 MiB keeps its first 1 MiB and adds `truncated` |
 | `fetch` | `eid`, `dur_us`, `turn`, `req` {`method`, `url`, `headers`, `body`}, then `res` {`status`, `status_text`, `url` (after redirects), `headers`, `body`} or `error` {`stage`, `url`, `message`, `action`} |
@@ -57,7 +57,11 @@ numbers.
 | `model.call` | `eid`, `dur_us`, `turn`, `req` {`base_url`, `model`, `body`: the request body as sent}, then `res` {`status`, `body`: the response text as received (for a streamed call, the event stream as received), `usage` {`input_tokens`, `output_tokens`}, `charged_nano_usd`} or `error` {`stage`, `url`, `status`, `message`, `action`, `sent` (false when the call failed before any of the request was written), `charged_nano_usd` (the reserve the failure kept, 0 when nothing was sent)}. A call refused before dispatch (`stage` `config`) is not recorded |
 | `tool.call` | `eid`, `req` {`name`, `args`}. Written when the tool starts, so the effects it makes follow it |
 | `tool.result` | `eid` (the same as its `tool.call`), `dur_us`, `req` {`name`}, then `res` {`value`} or `error` {`stage`, `message`} |
-| `budget.reserve` | `rid`, `run`, `for` (`model.call` or `tool.call`), `nano_usd`, `tokens`, `remaining_nano_usd`, `remaining_tokens` (before this reserve; `null` without a limit). Synced to disk before the call is sent |
+| `mcp.connect` | `eid`, `dur_us`, `turn`, `req` {`script` (the path resolved against the calling module), `budget` {`nano_usd`, `tokens`} (the server's grant), `timeout_ms`, `script_sha256`; a restart adds `conn` (the request id of the first connect) and `restart` (1 to 3)}, then `res` {`protocol_version`, `server` {`name`, `version`}, `instructions`, `tools` (the list as received), `server_run` (the server's own run id; `null` when the caller keeps no journal)} or `error` {`stage`, `code`, `server`, `message`, `action`, `sent`, and `exit_code` and `stderr` (its last 4 KiB) when the server left them} |
+| `mcp.call` | `eid`, `dur_us`, `turn`, `req` {`server`, `tool`, `args`}, then `res` {`content`, `structured`, `is_error`, `spent_nano_usd`, `spent_tokens` (what the server reported it had spent so far; `null` when it reported nothing)} or `error` {`stage`, `code`, `server`, `message`, `action`, `sent`, and `exit_code`, `stderr` and `rpc` (the JSON-RPC error code) when known} |
+| `mcp.close` | `eid`, `dur_us`, `turn`, `req` {`server`, `conn`, `start` (the request id of the server's start, when it was restarted), `at`: `"run.end"` for a connection the script left open}, then `res` {`server_run`, `exit_code`, `spent_nano_usd`, `spent_tokens`} |
+| `mcp.exit` | `eid`, `dur_us`, `turn`, `req` {`server`, `conn`, `start`}, then `res` {`server_run`, `exit_code`}: a server that exited without being closed. No script call starts it; its `eid` is taken when the exit is seen |
+| `budget.reserve` | `rid`, `run`, `for` (`model.call`, `tool.call`, `mcp.connect` for a server's grant, or `mcp.call` for a handle's declared cost), `nano_usd`, `tokens`, `remaining_nano_usd`, `remaining_tokens` (before this reserve; `null` without a limit). Synced to disk before the call is sent |
 | `ledger.open` | `name`, `spent_nano_usd`, `spent_tokens`: a named ledger's balance when this run opened it, unsettled reserves included |
 | `budget.settle` | `rid`, `run`, `nano_usd`, `tokens`: the amount charged for that reserve |
 | `run.end` | `exit_code`, `error` (when the run failed), `records` (count including this one), `transcript_sha256` |
@@ -65,7 +69,8 @@ numbers.
 The transcript is the run's `console` records in order. `transcript_sha256`
 is SHA-256 over, for each of them, `<fd>:<UTF-8 byte length of text>:<text>`.
 
-Effects (`fetch`, `fs`, `model.call`, and a tool call's two records):
+Effects (`fetch`, `fs`, `model.call`, a tool call's two records, and the
+`mcp.*` records):
 - `eid` numbers effects in the order the script started them. The record
   is written when the effect completes, so records appear in completion
   order.
@@ -105,6 +110,14 @@ Effects (`fetch`, `fs`, `model.call`, and a tool call's two records):
 Tool arguments that do not match the tool's `parameters` are refused before the tool starts and are not recorded. Effects made inside a tool's `run` are recorded as usual; nothing in their records links them to the tool call.
 
 Incoming `serve()` requests are not recorded.
+
+A server started by `connect()` from `vaern:mcp` keeps its own journal, in
+the same home, as a run of its own with `mcp` `"serve"` in its `run.start`.
+The tools it serves are recorded there as `tool.call` and `tool.result`;
+the requests that asked for them arrived on stdin and are not. The calling
+run records what it sent and got back as `mcp.*` effects, and names the
+server's run in `server_run`. `runs/latest` names the run started last, so
+after a `connect()` it names a server's run.
 
 A named budget's ledger, `<home>/budgets/<name>.jsonl`, uses the same line format and the same two record kinds, without `remaining_*`. `vaern journal verify` takes run ids only; the ledger is verified each time a run loads it.
 
@@ -181,3 +194,13 @@ signal again, so the call rejects with the script's own reason, in the
 recorded order. A replay in which the script never aborts it waits on it
 and diverges there. `serve()` stops a replay,
 because incoming requests are not recorded.
+
+`connect()` starts no server under `vaern replay`. Each `mcp.connect`,
+`mcp.call` and `mcp.close` is matched like any other effect and its
+recorded outcome handed back, including a call that timed out or was
+aborted. The server script's SHA-256 is part of the matched request, so a
+changed server diverges at its connect. An `mcp.exit` is handed back where
+the run saw it, so the replay restarts the connection at the same calls. A
+run started by `vaern mcp serve` is refused with `replay MCP_SERVED`:
+replay the run that called `connect()`, by its run id, since
+`vaern replay latest` names the server's run there.

@@ -555,6 +555,106 @@ Absent: embeddings, other endpoints, retries, schema keywords
 outside the list above, and checking of replies requested with
 `responseFormat`.
 
+## vaern:mcp
+
+MCP servers in JavaScript, with no SDK install. The transport is stdio, and
+a script can start only servers that are themselves vaern scripts.
+
+### Serving tools
+
+```ts
+import { tool } from "vaern:ai";
+import { server } from "vaern:mcp";
+
+const add = tool({ name: "add", parameters: { type: "object", properties: { a: { type: "number" } } },
+                   run: ({ a }) => ({ twice: a * 2 }) });
+server({ name: "calc", version: "1.0.0", tools: [add] });
+```
+
+- `vaern mcp serve <file>` runs the file, then serves the tools it passed
+  to `server()` to one MCP client over stdin and stdout. It takes
+  `--no-journal`, `--budget-usd` and `--budget-tokens` as `vaern run` does.
+  `console` output goes to stderr, so stdout carries the protocol only. The
+  process exits 0 when the client closes stdin.
+- It speaks MCP 2026-07-28 and 2025-11-25. A request naming an older
+  revision gets JSON-RPC error -32022 with the supported list.
+- `tools/call` runs the tool as its `call()` would: arguments that do not
+  match `parameters` get error -32602, a tool that throws answers with
+  `isError: true` and the message as text. A result goes back as its JSON
+  text, and also as `structuredContent` when it is not a string (2026-07-28)
+  or is an object (2025-11-25). Each call is journalled and metered in the
+  server's own run.
+- `notifications/cancelled` stops the server waiting on that request; its
+  result is not sent.
+- `server()` under `vaern run` throws `McpError`.
+
+### Connecting
+
+```ts
+import { connect } from "vaern:mcp";
+
+const calc = await connect({ script: "./calc.ts", budget: { usd: 0.05, tokens: 20_000 },
+                             timeoutMs: 30_000, cost: { add: { usd: 0.001 } } });
+const [add] = await calc.tools();
+await add.call({ a: 21 });          // { twice: 42 }
+await calc.close();
+```
+
+- `connect()` starts `vaern mcp serve <script>` with this same binary, the
+  path resolved against the calling module's directory, and agrees a
+  revision with it. The server keeps its journal in the caller's home, or
+  none when the caller keeps none.
+- The connection has `name`, `version`, `protocolVersion`, `instructions`,
+  `restarts`, `tools()` and `close()`. `close()` closes the server's stdin,
+  waits 2 s for it to exit, then kills it. Connections left open are
+  closed the same way when the run ends.
+- A handle has `name`, `description`, `parameters` (the server's
+  `inputSchema`, not checked against the schema subset), `cost` {`usd`},
+  `server` and `call(args, { signal }?)`. It resolves to the result's
+  `structuredContent`, else the text of its text blocks, else its content
+  list. `agent()` takes handles and `tool()` values in one list.
+- Failures: arguments the server refuses throw `ToolError` stage `args`,
+  and a result with `isError` throws `ToolError` stage `run`, as a local
+  tool does. Everything else throws `McpError` with `stage` (`config`,
+  `spawn`, `negotiate`, `call`, `exited`, `timeout`), `code`, `server`,
+  `exitCode` and `stderr` (its last 4 KiB) when known, and `action`.
+- `timeoutMs` (default 60000) bounds each call. A call past it throws
+  `McpError` stage `timeout`; an aborted `signal` rejects it with the
+  signal's `AbortError`, as `fetch` does. Either way the server is sent
+  `notifications/cancelled`, and the call is charged as sent, since the
+  server may have run it.
+- A server that exits while calls are in flight fails each with `McpError`
+  stage `exited`, carrying its exit code and stderr tail. Those calls are
+  never sent again. The connection's next call starts the server again, at
+  most 3 times; after that calls throw `McpError` code `RESTART_LIMIT`.
+
+### Budgets and the journal
+
+- `budget` is what the server may spend: reserved in the caller's budget
+  before the server starts, and passed to it as its `--budget-usd` and
+  `--budget-tokens` caps, which its script cannot raise. It defaults to
+  nothing in both units, so a server that calls models needs `usd` and
+  `tokens` granted. A `BudgetError` refuses the connect when the grant
+  does not fit, and nothing is started.
+- The server reports its spend in each result's `_meta`
+  (`dev.vaern/spent`). At `close()` the grant is settled at the last spend
+  reported; a server that exited on its own keeps the whole grant charged,
+  since its spend is unknown. A restart reserves a new grant.
+- `cost` is reserved and charged per call in the caller's budget, as a
+  `tool()`'s `cost` is. The default is 0, which reserves nothing.
+- A raw `fetch()` to a model's URL, in the caller or in a server, is
+  journalled but not metered, as anywhere else in this release.
+- Each connect, call, close and unrequested exit is a record in the
+  caller's journal: `mcp.connect`, `mcp.call`, `mcp.close` and `mcp.exit`
+  (see [journal.md](journal.md)). `vaern replay` of the caller starts no
+  server and serves them from there.
+
+Deferred: MCP Tasks and elicitation.
+
+Absent: resources, prompts and completions, sampling, roots,
+`subscriptions/listen`, HTTP and other remote transports, OAuth, servers
+that are not vaern scripts, and an `outputSchema` from `tool()`.
+
 ## Limits
 
 - The JavaScript heap is capped at 256 MiB. Exceeding it throws
