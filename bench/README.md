@@ -33,6 +33,29 @@ Whichever build ran second was faster in all four calls, so the differences are 
 
 Binary size, stripped: 9,933,824 bytes (0.0.7: 9,891,328, +42,496), 5,794,816 bytes under the 15 MiB budget.
 
+## Unreleased `vaern:mcp` against 0.0.7
+
+Re-run on 2026-11-26 on the same machine, after `vaern:mcp` was added: every run now registers the MCP bridges and its event loop checks for MCP work, so startup and loopback fetch were repeated. The 0.0.7 binary was built from the `v0.0.7` tag in the same session; its size matches the release's. Each row is one hyperfine call, `-N`, 3 warmups, 30 runs, with the journal on unless noted. `node -e 0` took 42.2 ms ± 3.1 in this session.
+
+| Benchmark | Unreleased | 0.0.7 | Order | Status |
+|---|---|---|---|---|
+| Startup and greeting | 20.1 ms ± 1.2 | 18.9 ms ± 1.0 | 0.0.7 first | **Loss, +1.2 ms** |
+| Startup and greeting | 20.1 ms ± 1.4 | 19.8 ms ± 1.5 | new build first | +0.3 ms, within noise |
+| Startup and greeting, `--no-journal` | 17.9 ms ± 0.8 | 18.9 ms ± 3.1 | 0.0.7 first | Within noise |
+| Loopback fetch and JSON parse | 29.9 ms ± 8.9 | 27.8 ms ± 8.4 | 0.0.7 first | Within noise |
+| Loopback fetch and JSON parse | 28.1 ms ± 8.0 | 27.8 ms ± 5.3 | new build first | Within noise |
+
+The new build read 20.1 ms in both startup calls, against 18.9 and 19.8 ms for 0.0.7, so startup with the journal is reported as a loss of up to 1.2 ms. It has not been profiled; the startup prelude and the bridges registered at every start grew with `vaern:mcp`. Peak RSS for `hello.ts` is 8.3 MB against 8.2 MB, the largest peak working set over 5 runs each.
+
+A new row, not a regression: starting an MCP server. `bench/mcp-connect.ts` connects to `examples/mcp/calc-server.ts`, calls its tool once and closes it, so it runs two vaern processes. Same binary, one hyperfine call:
+
+| Benchmark | Wall time | Against `hello.ts` (21.3 ms ± 1.2) |
+|---|---|---|
+| MCP connect, one call, close | 47.6 ms ± 4.0 | +26.3 ms |
+| The same, `--no-journal` (caller and server) | 40.1 ms ± 2.7 | +18.8 ms |
+
+Binary size, stripped: 10,335,744 bytes (0.0.7: 9,891,328, +444,416, of which 42,496 came with the hardening above), 5,392,896 bytes under the 15 MiB budget. Tokio's `process` feature and the MCP protocol, server and client are the rest.
+
 ## Earlier measurements
 
 ### 0.0.6 against 0.0.5 (2026-11-04)
@@ -117,6 +140,12 @@ hyperfine -N --warmup 2 --runs 10 'target/release/vaern run bench/compute-heavy.
 
 ```bash
 hyperfine -N --warmup 3 --runs 20 'target/release/vaern run tests/e2e/serve_concurrent.ts'
+```
+
+### MCP connect
+
+```bash
+hyperfine -N --warmup 3 --runs 30 'target/release/vaern run examples/hello.ts' 'target/release/vaern run bench/mcp-connect.ts' 'target/release/vaern run --no-journal bench/mcp-connect.ts'
 ```
 
 ### Idle server CPU
