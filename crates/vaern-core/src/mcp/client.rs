@@ -12,6 +12,12 @@
 //! script aborts, is given up here: the server is sent
 //! `notifications/cancelled` for it and the call fails. The server may still
 //! have run it, so it counts as sent.
+//!
+//! The whole start, from spawning the server through negotiation to its
+//! `tools/list`, runs under one deadline: the connection's timeout, never
+//! less than [`START_FLOOR`]. A server that stops answering at any step
+//! fails the start there and is killed, rather than leaving `connect()`
+//! pending on a process that will never reply.
 
 use super::protocol::{self, Era, MAX_MESSAGE_BYTES, META_SPENT, Message};
 use crate::budget::{Amount, Limits};
@@ -27,8 +33,12 @@ use tokio::process::{Child, ChildStdin};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::Instant;
 
-/// How long a server has to answer `server/discover` or `initialize`.
+/// How long a server has to answer `server/discover` or `initialize`, each.
+/// The start deadline can cut either short.
 const NEGOTIATE_WAIT: Duration = Duration::from_secs(10);
+/// The least time a start is given, so a short call timeout does not fail
+/// a healthy server that is slow to boot. Starts take tens of milliseconds.
+pub const START_FLOOR: Duration = Duration::from_secs(5);
 /// How long a server has to exit once its input is closed.
 pub const EXIT_GRACE: Duration = Duration::from_secs(2);
 /// How much of a server's stderr is kept for its errors.
@@ -44,7 +54,8 @@ pub struct Launch {
     pub home: Option<PathBuf>,
     /// The most the server may spend, passed as its `--budget-*` caps.
     pub grant: Limits,
-    /// How long each call may wait for its answer.
+    /// How long each call may wait for its answer, and how long the start
+    /// may take in all (at least [`START_FLOOR`]).
     pub call_timeout: Duration,
 }
 
@@ -193,6 +204,47 @@ fn exited(server: &str, message: String) -> VaernError {
     )
 }
 
+/// A step of the start that can run out of time.
+#[derive(Clone, Copy)]
+enum StartStep {
+    Negotiate,
+    ToolsList,
+}
+
+impl StartStep {
+    fn name(self) -> &'static str {
+        match self {
+            StartStep::Negotiate => "negotiate",
+            StartStep::ToolsList => "tools_list",
+        }
+    }
+
+    fn awaited(self) -> &'static str {
+        match self {
+            StartStep::Negotiate => "server/discover or initialize",
+            StartStep::ToolsList => "tools/list",
+        }
+    }
+}
+
+fn start_timeout(server: &str, step: StartStep, waited: Duration) -> VaernError {
+    let message = format!(
+        "the server did not finish starting within {} ms: step {} got no answer to {}",
+        waited.as_millis(),
+        step.name(),
+        step.awaited()
+    );
+    let action =
+        "Raise timeoutMs in connect(), or make the server script finish its top level sooner.";
+    mcp_error("timeout", "TIMEOUT", server, message, action)
+}
+
+/// Whether negotiation gave up on its own, both probes unanswered, before
+/// the start deadline came.
+fn probes_unanswered(error: &VaernError) -> bool {
+    matches!(error, VaernError::Mcp { stage, code, .. } if stage == "negotiate" && code == "TIMEOUT")
+}
+
 /// Runs the server started by request `start` until it is closed, its
 /// commands end or it exits, reporting through `send`. The child never
 /// outlives it: it is killed if the grace period runs out, or when this
@@ -226,6 +278,8 @@ pub async fn run(
             unanswered,
         });
     };
+    let start_wait = launch.call_timeout.max(START_FLOOR);
+    let deadline = Instant::now() + start_wait;
     let mut process = tokio::process::Command::new(&launch.program);
     process.arg("mcp").arg("serve");
     match &launch.home {
@@ -274,16 +328,37 @@ pub async fn run(
     });
     let mut stdout = BufReader::new(stdout);
     let client = json!({ "name": "vaern", "version": env!("CARGO_PKG_VERSION") });
-    let started = async {
-        let agreed =
-            protocol::negotiate(&mut stdout, &mut stdin, &client, NEGOTIATE_WAIT, &server).await?;
-        let listed = list_tools(&mut stdout, &mut stdin, agreed.era, &client, &server).await?;
-        Ok::<_, VaernError>((agreed, listed))
-    };
-    let (agreed, listed) = match started.await {
+    // Each step runs to the same deadline. A step that ran out of time ends
+    // with the server killed (`true`); any other failure lets it exit on its
+    // own, so its exit code and stderr say why.
+    let timed_out = |step| (start_timeout(&server, step, start_wait), true);
+    let outcome = async {
+        let negotiated =
+            protocol::negotiate(&mut stdout, &mut stdin, &client, NEGOTIATE_WAIT, &server);
+        let agreed = match tokio::time::timeout_at(deadline, negotiated).await {
+            Ok(Ok(agreed)) => agreed,
+            Ok(Err(error)) if probes_unanswered(&error) => {
+                let error = start_timeout(&server, StartStep::Negotiate, NEGOTIATE_WAIT * 2);
+                return Err((error, true));
+            }
+            Ok(Err(error)) => return Err((error, false)),
+            Err(_) => return Err(timed_out(StartStep::Negotiate)),
+        };
+        let listed = list_tools(&mut stdout, &mut stdin, agreed.era, &client, &server);
+        match tokio::time::timeout_at(deadline, listed).await {
+            Ok(Ok(listed)) => Ok((agreed, listed)),
+            Ok(Err(error)) => Err((error, false)),
+            Err(_) => Err(timed_out(StartStep::ToolsList)),
+        }
+    }
+    .await;
+    let (agreed, listed) = match outcome {
         Ok(started) => started,
-        Err(error) => {
-            let exit_code = shut(&mut child, stdin).await;
+        Err((error, hung)) => {
+            let exit_code = match hung {
+                true => stop(&mut child).await,
+                false => shut(&mut child, stdin).await,
+            };
             refused(failed(error, exit_code));
             return;
         }
@@ -522,6 +597,14 @@ async fn shut(child: &mut Child, stdin: ChildStdin) -> Option<i32> {
             None
         }
     }
+}
+
+/// Kills a server that stopped answering while starting. Closing its input
+/// first would only add [`EXIT_GRACE`]: a script stuck in a loop never reads
+/// it. A killed server has no exit code worth reporting.
+async fn stop(child: &mut Child) -> Option<i32> {
+    let _ = child.kill().await;
+    None
 }
 
 #[cfg(test)]

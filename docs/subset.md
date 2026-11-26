@@ -618,8 +618,16 @@ await calc.close();
   tool does. Everything else throws `McpError` with `stage` (`config`,
   `spawn`, `negotiate`, `call`, `exited`, `timeout`), `code`, `server`,
   `exitCode` and `stderr` (its last 4 KiB) when known, and `action`.
-- `timeoutMs` (default 60000) bounds each call. A call past it throws
-  `McpError` stage `timeout`; an aborted `signal` rejects it with the
+- `timeoutMs` (default 60000) also bounds the whole start, from launching
+  the server to its tool list, and never to less than 5 s. A server that
+  stops answering while starting is killed, and `connect()` throws
+  `McpError` stage `timeout`, code `TIMEOUT`, whose message names the
+  step: `negotiate` or `tools_list`. A restart runs to the same bound.
+  Each of the two negotiation probes waits at most 10 s, so a server that
+  answers nothing fails after 20 s at most, sooner when `timeoutMs` is
+  shorter.
+- `timeoutMs` bounds each call. A call past it throws `McpError` stage
+  `timeout`; an aborted `signal` rejects it with the
   signal's `AbortError`, as `fetch` does. Either way the server is sent
   `notifications/cancelled`, and the call is charged as sent, since the
   server may have run it.

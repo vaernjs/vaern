@@ -327,21 +327,49 @@ const cases = [
     stdout: 'calc 2026-07-28 add,fail\n{"sum":5}\nToolError run: Error: no luck\n',
     stderr: "",
   },
+  {
+    // The whole start runs to one deadline: timeoutMs, here 6 s.
+    name: "connect() fails a server that stops after the probe at timeoutMs",
+    args: ["run", "mcp_start_timeout.ts", "./mcp_stuck_after_probe.ts", "6000"],
+    env: { VAERN_HOME: "out/home" },
+    code: 0,
+    stdout: "McpError timeout TIMEOUT step tools_list\n",
+    stderr: "",
+    minMs: 6000,
+    maxMs: 9000,
+  },
+  {
+    // A timeoutMs under 5 s still gives the start 5 s.
+    name: "connect() fails a server that never answers at the 5 s floor",
+    args: ["run", "mcp_start_timeout.ts", "./mcp_stuck_before_probe.ts", "1000"],
+    env: { VAERN_HOME: "out/home" },
+    code: 0,
+    stdout: "McpError timeout TIMEOUT step negotiate\n",
+    stderr: "",
+    minMs: 5000,
+    maxMs: 8000,
+  },
 ];
 
 const norm = (s) => s.replaceAll("\r\n", "\n");
 let failed = 0;
 
 for (const c of cases) {
+  const began = performance.now();
   const r = spawnSync(binary, c.args, {
     cwd: sandbox,
     encoding: "utf8",
     env: { ...process.env, ...c.env },
     input: c.input ?? "",
   });
+  const took = performance.now() - began;
   const stdout = norm(r.stdout ?? "");
   const stderr = norm(r.stderr ?? "");
   const problems = [];
+
+  // Cases that pin a time bound give the window the run must end in.
+  if (c.minMs !== undefined && took < c.minMs) problems.push(`ended after ${Math.round(took)} ms, before ${c.minMs} ms`);
+  if (c.maxMs !== undefined && took >= c.maxMs) problems.push(`ended after ${Math.round(took)} ms, not before ${c.maxMs} ms`);
 
   if (r.status !== c.code) problems.push(`exit code ${r.status}, expected ${c.code}`);
   if (c.stdout !== undefined && stdout !== c.stdout) {
